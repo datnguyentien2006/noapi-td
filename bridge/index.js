@@ -119,7 +119,7 @@ async function main() {
           b.touch(conn);
           if (msg.site) b.register(conn, { site: msg.site, url: msg.url });
         } else if (msg.t === "response") {
-          b.respond(conn, msg.id, msg.text);
+          b.respond(conn, msg.id, msg.text, msg.timings);
         } else if (msg.t === "progress") {
           b.progress(msg.id, msg.status);
         } else if (msg.t === "error") {

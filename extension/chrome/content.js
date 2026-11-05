@@ -871,7 +871,7 @@
     }
   }
 
-  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, pre, scope, typedLen }) {
+  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, pre, scope, typedLen, pipelineT0 = null, timings = null }) {
     const t0 = Date.now();
     let lastText = "";
     let stableSince = 0;
@@ -883,7 +883,10 @@
       if (state.cancel) throw new Error("Cancelled.");
 
       const generating = isStopVisible();
-      if (generating) sawActivity = true;
+      if (generating) {
+        sawActivity = true;
+        if (timings) timings.stopSeen = true;
+      }
 
       // If the site swallowed the send (nothing started), recover. Two cases:
       //  - the composer still holds our text  -> click send again
@@ -944,6 +947,7 @@
         continue;
       }
       sawActivity = true;
+      if (timings && !timings.firstText) timings.firstText = Date.now() - (pipelineT0 ?? t0);
 
       if (text === lastText && !generating) {
         if (!stableSince) stableSince = Date.now();
@@ -973,10 +977,17 @@
     lastProgressAt = 0;
     updateStatusUI();
 
+    // Per-stage timings (milliseconds since the request reached this tab). Sent to
+    // the bridge with the final reply so /health and the dashboard can show where
+    // the time goes. Shape: false|0 for "not reached yet". See bridge/state.js.
+    const t0 = Date.now();
+    const timings = { composer: 0, typed: 0, sent: 0, firstText: 0, complete: 0, stopSeen: false, earlyReturn: false };
+
     try {
       setLog("Finding " + SITE.name + " chat input…", true);
       const composer = await waitForComposer();
       if (!composer) throw new Error("Could not find chat input on " + SITE.name + ". Is the chat page fully loaded?");
+      timings.composer = Date.now() - t0;
 
       if (SITE.iconSend) await waitForIdle(40_000);
       const scope =
@@ -998,17 +1009,20 @@
       let composerNow = (await findComposer()) || composer;
       setLog("Typing prompt into " + SITE.name + "…", true);
       composerNow = await ensureTyped(composerNow, prompt);
+      timings.typed = Date.now() - t0;
       if (state.cancel) throw new Error("Cancelled.");
 
       const typedLen = scope.textContent.length;
       setLog("Sending prompt to " + SITE.name + "…", true);
       if (!(await submitComposer(composerNow))) throw new Error("Could not click Send or trigger Enter on " + SITE.name);
+      timings.sent = Date.now() - t0;
 
       setLog("Waiting for " + SITE.name + " to answer…", true);
-      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, pre, scope, typedLen });
+      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, pre, scope, typedLen, pipelineT0: t0, timings });
+      timings.complete = Date.now() - t0;
 
       setLog(`✓ Response captured (${text.length} chars). Sent to OpenCode.`);
-      if (reqId) ext.runtime.sendMessage({ type: "noapi_reply", id: reqId, text }).catch(() => {});
+      if (reqId) ext.runtime.sendMessage({ type: "noapi_reply", id: reqId, text, timings: { ...timings, total: Date.now() - t0 } }).catch(() => {});
       return text;
     } catch (err) {
       setLog("Error: " + err.message);

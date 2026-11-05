@@ -4,10 +4,32 @@
 //  2. HTTP chat completion (streaming)
 //  3. MCP in proxy mode (standalone bridge running, opencode spawns MCP proxy)
 //  4. MCP in local mode (no standalone bridge, opencode spawns bridge + MCP directly)
+//
+// It uses its own port (8797) instead of the default 8787 so it can never talk
+// to a bridge you have running for real — and never type test prompts into the
+// chat tabs of a real browser extension that happens to be connected.
 import { spawn } from "node:child_process";
-import { WsClient } from "../bridge/wsclient.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const PORT = Number(process.env.NOAPI_TEST_PORT || 8797);
+const BASE = `http://127.0.0.1:${PORT}`;
+
+// Track everything we spawn so a failure cannot leave a bridge or a fake tab
+// behind on the test port.
+const children = new Set();
+function start(args, opts = {}) {
+  const p = spawn("node", args, { cwd: process.cwd(), ...opts });
+  children.add(p);
+  return p;
+}
+function stopAll() {
+  for (const p of children) {
+    try {
+      p.kill();
+    } catch {}
+  }
+  children.clear();
+}
 
 async function fetchJson(url, opts) {
   const r = await fetch(url, opts);
@@ -19,38 +41,40 @@ async function fetchJson(url, opts) {
   }
 }
 
+const fakeEnv = (extra = {}) => ({ ...process.env, NOAPI_PORT: String(PORT), ...extra });
+
 async function run() {
   console.log("=== NOAPI? Test Suite ===\n");
 
-  // Step 1: Start standalone bridge
-  console.log("1. Starting standalone bridge on :8787...");
-  const bridgeProc = spawn("node", ["bridge/index.js"], {
-    cwd: process.cwd(),
+  // Step 1: Start standalone bridge on its own port
+  console.log(`1. Starting standalone bridge on :${PORT}...`);
+  const bridgeProc = start(["bridge/index.js", `--port=${PORT}`], {
     stdio: ["ignore", "pipe", "pipe"],
   });
   bridgeProc.stderr.on("data", (d) => process.stderr.write("  [bridge] " + d));
+  bridgeProc.stdout.on("data", (d) => process.stderr.write("  [bridge] " + d));
   await sleep(1000);
 
-  const health1 = await fetchJson("http://127.0.0.1:8787/health");
+  const health1 = await fetchJson(`${BASE}/health`);
   if (!health1.data?.ok) throw new Error("bridge health check failed");
   console.log("   ✓ bridge is listening, health ok");
 
-  // Step 2: Start fake browser extension
+  // Step 2: Start fake browser extension (with simulated typing + streaming)
   console.log("2. Connecting fake browser extension...");
-  const fakeProc = spawn("node", ["tools/fake-extension.js", "chatgpt"], {
-    cwd: process.cwd(),
+  const fakeProc = start(["tools/fake-extension.js", "chatgpt"], {
     stdio: ["ignore", "pipe", "pipe"],
+    env: fakeEnv({ NOAPI_FAKE_FIRST_MS: "400", NOAPI_FAKE_TYPING_MS: "300", NOAPI_FAKE_STREAM_CHUNKS: "4", NOAPI_FAKE_STREAM_STEP_MS: "80" }),
   });
   fakeProc.stdout.on("data", (d) => process.stderr.write("  [fake] " + d));
   await sleep(1500);
 
-  const health2 = await fetchJson("http://127.0.0.1:8787/health");
+  const health2 = await fetchJson(`${BASE}/health`);
   if (!health2.data?.clients?.length) throw new Error("fake browser did not register");
   console.log(`   ✓ fake browser connected (clients: ${health2.data.clients.length})`);
 
   // Step 3: Test HTTP chat completions (non-stream)
   console.log("3. Testing POST /v1/chat/completions (non-stream)...");
-  const comp1 = await fetchJson("http://127.0.0.1:8787/v1/chat/completions", {
+  const comp1 = await fetchJson(`${BASE}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -64,9 +88,24 @@ async function run() {
   }
   console.log(`   ✓ got reply: "${text1.slice(0, 60)}..."`);
 
+  // Step 3b: The bridge must expose per-stage timings in /health
+  console.log("3b. Checking timings in /health...");
+  const health3 = await fetchJson(`${BASE}/health`);
+  const t = health3.data?.timings;
+  if (!t || !t.last || typeof t.last.total !== "number") {
+    throw new Error(`no timings in /health: ${JSON.stringify(t)}`);
+  }
+  if (!t.bySite?.chatgpt?.avg || typeof t.bySite.chatgpt.avg.total !== "number") {
+    throw new Error(`no per-site timings in /health: ${JSON.stringify(t.bySite)}`);
+  }
+  for (const stage of ["composer", "typed", "sent", "firstText", "complete"]) {
+    if (typeof t.last[stage] !== "number") throw new Error(`timing stage ${stage} missing: ${JSON.stringify(t.last)}`);
+  }
+  console.log(`   ✓ timings exposed (total=${t.last.total}ms, firstText=${t.last.firstText}ms, complete=${t.last.complete}ms)`);
+
   // Step 4: Test HTTP chat completions (streaming)
   console.log("4. Testing POST /v1/chat/completions (streaming)...");
-  const streamResp = await fetch("http://127.0.0.1:8787/v1/chat/completions", {
+  const streamResp = await fetch(`${BASE}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -81,11 +120,9 @@ async function run() {
   }
   console.log("   ✓ streaming SSE received chunks + [DONE]");
 
-  // Step 5: Test MCP in PROXY mode (bridge is running on :8787)
+  // Step 5: Test MCP in PROXY mode (bridge is running on the test port)
   console.log("5. Testing MCP stdio in proxy mode (forwarding to running bridge)...");
-  const mcpProxy = spawn("node", ["bridge/index.js", "--mcp"], {
-    cwd: process.cwd(),
-  });
+  const mcpProxy = start(["bridge/index.js", "--mcp", `--port=${PORT}`]);
   const proxyOut = [];
   mcpProxy.stdout.on("data", (d) => {
     for (const line of d.toString("utf8").split("\n")) {
@@ -123,7 +160,7 @@ async function run() {
       jsonrpc: "2.0",
       id: 3,
       method: "tools/call",
-      params: { name: "chat", arguments: { prompt: "test MCP proxy" } },
+      params: { name: "chat", arguments: { prompt: "MCP_TEST proxy", site: "chatgpt" } },
     }) + "\n"
   );
   await sleep(2500);
@@ -131,7 +168,7 @@ async function run() {
   mcpProxy.kill();
   const proxyChat = proxyOut.find((m) => m.id === 3);
   const proxyChatText = proxyChat?.result?.content?.[0]?.text || "";
-  if (!proxyChatText.includes("fake chatgpt")) {
+  if (!proxyChatText.includes("MCP test reply")) {
     throw new Error(`MCP proxy chat failed: ${JSON.stringify(proxyChat)}`);
   }
   console.log(`   ✓ MCP proxy chat reply: "${proxyChatText.slice(0, 60)}..."`);
@@ -143,9 +180,7 @@ async function run() {
 
   // Step 6: Test MCP in LOCAL mode (MCP process starts bridge directly)
   console.log("6. Testing MCP in LOCAL mode (no standalone bridge running)...");
-  const mcpLocal = spawn("node", ["bridge/index.js", "--mcp"], {
-    cwd: process.cwd(),
-  });
+  const mcpLocal = start(["bridge/index.js", "--mcp", `--port=${PORT}`]);
   const localOut = [];
   mcpLocal.stdout.on("data", (d) => {
     for (const line of d.toString("utf8").split("\n")) {
@@ -160,8 +195,8 @@ async function run() {
   await sleep(1000);
 
   // Connect fake browser directly to the MCP process's bridge!
-  const fakeProc2 = spawn("node", ["tools/fake-extension.js", "claude"], {
-    cwd: process.cwd(),
+  const fakeProc2 = start(["tools/fake-extension.js", "claude"], {
+    env: fakeEnv({ NOAPI_FAKE_FIRST_MS: "300" }),
   });
   await sleep(1500);
 
@@ -180,7 +215,7 @@ async function run() {
       jsonrpc: "2.0",
       id: 2,
       method: "tools/call",
-      params: { name: "chat", arguments: { prompt: "test MCP local mode", site: "claude" } },
+      params: { name: "chat", arguments: { prompt: "MCP_TEST local mode", site: "claude" } },
     }) + "\n"
   );
   await sleep(2500);
@@ -190,7 +225,7 @@ async function run() {
 
   const localChat = localOut.find((m) => m.id === 2);
   const localChatText = localChat?.result?.content?.[0]?.text || "";
-  if (!localChatText.includes("fake claude")) {
+  if (!localChatText.includes("MCP test reply")) {
     throw new Error(`MCP local chat failed: ${JSON.stringify(localChat)}`);
   }
   console.log(`   ✓ MCP local chat reply: "${localChatText.slice(0, 60)}..."`);
@@ -198,10 +233,12 @@ async function run() {
   console.log("\n=================================");
   console.log("  ALL TESTS PASSED SUCCESSFULLY!  ");
   console.log("=================================\n");
+  stopAll();
   process.exit(0);
 }
 
 run().catch((err) => {
   console.error("\nTEST FAILED:", err.message);
-  process.exit(1);
+  stopAll();
+  setTimeout(() => process.exit(1), 200);
 });

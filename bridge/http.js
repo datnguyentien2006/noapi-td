@@ -98,11 +98,18 @@ async function render() {
     const siteRows = s.sites.map(x =>
       \`<tr><td><code>\${x.key}</code></td><td>\${x.name}</td><td class="\${x.available ? "ok" : "bad"}">\${x.available ? "available" : "not connected"}</td></tr>\`
     ).join("");
+    const t = s.timings || {};
+    const fmt = v => (v == null ? "" : Math.round(v) + " ms");
+    const timingRows = Object.entries(t.bySite || {}).map(([site, v]) =>
+      \`<tr><td>\${site}</td><td>\${v.avg.count}</td><td>\${fmt(v.last.total)}</td><td>\${fmt(v.last.composer)}</td><td>\${fmt(v.last.typed)}</td><td>\${fmt(v.last.sent)}</td><td>\${fmt(v.last.firstText)}</td><td>\${fmt(v.last.complete)}</td><td>\${fmt(v.avg.total)}</td></tr>\`
+    ).join("") || '<tr><td colspan="9">no completed requests yet</td></tr>';
     el.innerHTML = \`
       <h2>browser clients</h2>
       <table><tr><th>id</th><th>site</th><th>url</th></tr>\${clientRows}</table>
       <h2>pending requests</h2>
       <table><tr><th>id</th><th>site</th><th>chars</th><th>waiting</th></tr>\${pendingRows}</table>
+      <h2>timings (last request per site, and average)</h2>
+      <table><tr><th>site</th><th>n</th><th>total</th><th>composer</th><th>typed</th><th>sent</th><th>first&nbsp;text</th><th>complete</th><th>avg&nbsp;total</th></tr>\${timingRows}</table>
       <h2>models</h2>
       <table><tr><th>id</th><th>name</th><th>status</th></tr>\${siteRows}</table>\`;
   } catch (e) {

@@ -293,7 +293,7 @@
       case "noapi_reply": {
         if (msg.id) {
           state.pending.delete(msg.id);
-          sendWs({ t: "response", id: msg.id, text: msg.text });
+          sendWs({ t: "response", id: msg.id, text: msg.text, timings: msg.timings || null });
           log(`replied to bridge for request ${msg.id}`);
           updateAction();
         }
