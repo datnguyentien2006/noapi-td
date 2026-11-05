@@ -857,21 +857,26 @@
     return nodes.filter((n) => !nodes.some((o) => o !== n && n.contains(o)));
   }
 
-  function snapshotLengths(scope) {
+  // Fallback for sites whose reply selectors match nothing (markup changed).
+  // Sampling the page twice, a moment apart, finds whatever is actively growing
+  // — but only when we are already stuck, instead of snapshotting every element
+  // on the page once per request the way the old code did.
+  const GROW_SAMPLE_MS = 350;
+
+  function elementLengths(scope) {
     const m = new Map();
     const t0 = Date.now();
     for (const el of scope.querySelectorAll("*")) {
       m.set(el, (el.textContent || "").length);
-      if (m.size % 200 === 0 && Date.now() - t0 > 200) break; // long chats: partial snapshot is enough
+      if (m.size % 400 === 0 && Date.now() - t0 > 150) break; // long chats: a partial sample is enough
     }
     return m;
   }
 
-  // Fallback when selectors match nothing: the element that grew the most.
-  function findDeepestGrown(pre, exclude) {
+  function biggestGrower(before, exclude) {
     let best = null;
     let bestGrow = 7;
-    for (const [el, prev] of pre) {
+    for (const [el, prev] of before) {
       if (!el.isConnected) continue;
       if (el === exclude || el.contains?.(exclude) || exclude?.contains?.(el)) continue;
       if (host.contains(el) || el.contains(host)) continue;
@@ -946,7 +951,7 @@
   }
   /* @noapi-shared-end completionDecision */
 
-  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, pre, scope, typedLen, pipelineT0 = null, timings = null }) {
+  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, typedLen, pipelineT0 = null, timings = null }) {
     const t0 = Date.now();
     return new Promise((resolve, reject) => {
       let lastText = "";
@@ -990,7 +995,25 @@
         observer.observe(scope || document.body, { subtree: true, childList: true, characterData: true });
       } catch {}
 
-      const readText = (generating) => {
+      // The stuck-fallback: sample the page, wait, and take the biggest grower.
+      // The node found is reused while it stays connected, so we do not re-sample
+      // on every tick.
+      let grownNode = null;
+      let grownAt = 0;
+      const fallbackText = async () => {
+        const now = Date.now();
+        if (grownNode && grownNode.isConnected && now - grownAt < 2000) {
+          const t = dropEcho(extractText(grownNode), prompt);
+          if (t) return t;
+        }
+        const before = elementLengths(scope || document.body);
+        await sleep(GROW_SAMPLE_MS);
+        grownNode = biggestGrower(before, composer);
+        grownAt = Date.now();
+        return grownNode ? dropEcho(extractText(grownNode), prompt) : "";
+      };
+
+      const readText = async (generating) => {
         const nodes = replyNodes();
         let text = "";
         let fromSelector = false;
@@ -1005,8 +1028,7 @@
           }
         }
         if (!fromSelector && Date.now() - t0 > 8000) {
-          const grown = findDeepestGrown(pre, composer);
-          if (grown) text = dropEcho(extractText(grown), prompt);
+          text = await fallbackText();
         }
         return text;
       };
@@ -1065,7 +1087,7 @@
           if ((dirty || now - lastExtractAt >= UNSEEN_MUTATION_MS) && now - lastExtractAt >= EXTRACT_THROTTLE_MS) {
             dirty = false;
             lastExtractAt = now;
-            const text = readText(generating);
+            const text = await readText(generating);
             if (!text) {
               lastText = "";
               lastTextAt = 0;
@@ -1140,7 +1162,6 @@
             }
           })
           .find(Boolean) || document.body;
-      const pre = snapshotLengths(scope);
       const beforeNodes = replyNodes();
       const before = beforeNodes.length;
       const beforeLast = before ? extractText(beforeNodes[before - 1]) : "";
@@ -1157,7 +1178,7 @@
       timings.sent = Date.now() - t0;
 
       setLog("Waiting for " + SITE.name + " to answer…", true);
-      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, pre, scope, typedLen, pipelineT0: t0, timings });
+      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, typedLen, pipelineT0: t0, timings });
       timings.complete = Date.now() - t0;
 
       setLog(`✓ Response captured (${text.length} chars). Sent to OpenCode.`);
