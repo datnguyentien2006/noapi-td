@@ -144,7 +144,9 @@ Short and in the imperative, for example `Fix DeepSeek send button` or `Retry wh
 
 It also runs the small pure functions lifted out of `content.js` (`tools/test-content-logic.js`), the `TOOL_CALL` protocol without a browser (`tools/test-toolproto.js`), the bridge request queue without a browser (`tools/test-bridge-state.js`), and the security checks (`tools/test-security.js`). Every suite uses its own port, so it can never talk to a bridge you have running or type test prompts into a real chat tab.
 
-`npm run bench` uses the same fake tab to print time-to-first-streamed-content and full round-trip numbers, which is the easiest way to show that a latency change actually helped.
+`npm run bench` runs the same simulated model twice — once with the old behaviour (fixed typing sleeps, no streaming, 2200 ms stability rule) and once with the new one (condition-based typing, streaming, stop-button completion) — and prints four numbers side by side: time to first streamed content, overhead after the last token, typing + send overhead, and full round trip.
+
+The benchmark is a **simulation**: the fake tab stands in for a real website and its timings are modelled, not measured. Only the per-stage timings that `/health` reports on a real site are ground truth. Use the bench to compare changes, not to predict a specific site.
 
 The fake tab cannot know how a real website behaves, so changes to the extension still need a quick manual try. If you fix a bug in the bridge, a test that would have caught it is the best kind of pull request.
 

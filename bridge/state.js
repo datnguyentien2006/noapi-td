@@ -281,6 +281,11 @@ export class Bridge {
       if (timings.stopSeen) entry.stopSeen = true;
       if (timings.earlyReturn) entry.earlyReturn = true;
       if (Number.isFinite(Number(timings.idleMs))) entry.idleMs = Number(timings.idleMs);
+      // When the model produced its last token, so the benchmark can separate
+      // model time from the overhead the client adds after it.
+      if (Number.isFinite(Number(timings.lastToken))) entry.lastToken = Number(timings.lastToken);
+      if (timings.completedBy) entry.completedBy = String(timings.completedBy);
+      if (Number.isFinite(Number(timings.resubmits))) entry.resubmits = Number(timings.resubmits);
     }
     this.timings.push(entry);
     if (this.timings.length > MAX_TIMING_RECORDS) this.timings.shift();

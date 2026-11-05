@@ -3,31 +3,54 @@
 //
 //   npm run bench
 //
-// It answers "how long does one round trip cost, and how long until OpenCode
-// sees the first character?" — the two numbers that matter per tool call.
+// It runs the SAME simulated model twice, changing only the client behaviour:
+//   old - fixed typing sleeps, no streaming, 2200ms "no change" completion rule
+//   new - condition-based typing, live streaming, stop-button completion
+// and reports four numbers side by side:
+//   (a) time to first streamed content
+//   (b) overhead after the last token (completion detection + final flush)
+//   (c) typing + send overhead per turn
+//   (d) full round trip
 //
-// The fake tab simulates a model that thinks for a while, then streams tokens,
-// because that is what a real site does. Knobs:
-//   NOAPI_BENCH_PORT           bridge port (default 8796)
-//   NOAPI_BENCH_REQUESTS       how many round trips (default 5)
-//   NOAPI_BENCH_FIRST_MS       delay before the first token (default 700)
-//   NOAPI_BENCH_CHUNKS         streamed partial updates (default 24)
-//   NOAPI_BENCH_STEP_MS        delay between partial updates (default 40)
+// The fake tab is a SIMULATION. Only the timings /health reports on a real site
+// are ground truth; these numbers are for comparing changes, not for predicting
+// a specific website.
+//
+// Knobs:
+//   NOAPI_BENCH_PORT           bridge port for the "new" run (default 8796; the
+//                              "old" run uses port - 1)
+//   NOAPI_BENCH_REQUESTS       how many round trips per scenario (default 5)
+//   NOAPI_BENCH_FIRST_MS       model delay before the first token (default 700)
+//   NOAPI_BENCH_CHUNKS         streamed model updates (default 24)
+//   NOAPI_BENCH_STEP_MS        delay between model updates (default 40)
 import { spawn } from "node:child_process";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const PORT = Number(process.env.NOAPI_BENCH_PORT || 8796);
+const NEW_PORT = PORT;
+const OLD_PORT = PORT - 1;
 const REQUESTS = Number(process.env.NOAPI_BENCH_REQUESTS || 5);
 const FIRST_MS = Number(process.env.NOAPI_BENCH_FIRST_MS || 700);
 const CHUNKS = Number(process.env.NOAPI_BENCH_CHUNKS || 24);
 const STEP_MS = Number(process.env.NOAPI_BENCH_STEP_MS || 40);
-const BASE = `http://127.0.0.1:${PORT}`;
 
 const avg = (xs) => (xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : 0);
 
-async function oneRoundTrip(i) {
+async function waitFor(check, label, timeoutMs = 15_000) {
+  const t0 = Date.now();
+  for (;;) {
+    try {
+      const v = await check();
+      if (v) return v;
+    } catch {}
+    if (Date.now() - t0 > timeoutMs) throw new Error(`timed out waiting for ${label}`);
+    await sleep(100);
+  }
+}
+
+async function oneRoundTrip(base, i) {
   const started = Date.now();
-  const res = await fetch(`${BASE}/v1/chat/completions`, {
+  const res = await fetch(`${base}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -40,7 +63,6 @@ async function oneRoundTrip(i) {
   const decoder = new TextDecoder();
   let buf = "";
   let ttfb = null;
-  let lastContent = null;
   let contentChars = 0;
   for (;;) {
     const { done, value } = await reader.read();
@@ -62,84 +84,123 @@ async function oneRoundTrip(i) {
       const delta = parsed.choices?.[0]?.delta;
       if (delta?.content) {
         contentChars += delta.content.length;
-        lastContent = Date.now() - started;
         if (ttfb == null) ttfb = Date.now() - started;
       }
     }
   }
   const total = Date.now() - started;
-  return { ttfb: ttfb ?? total, total, contentChars, afterLast: lastContent == null ? total : total - lastContent };
+  return { ttfb: ttfb ?? total, total, contentChars };
 }
 
-async function run() {
-  const children = new Set();
+async function runScenario(mode, port) {
+  const base = `http://127.0.0.1:${port}`;
+  const children = [];
   const start = (args, opts = {}) => {
     const p = spawn("node", args, { cwd: process.cwd(), ...opts });
-    children.add(p);
+    children.push(p);
     return p;
   };
-  const stopAll = () => {
+  try {
+    start(["bridge/index.js", `--port=${port}`], { stdio: "ignore" });
+    await waitFor(async () => (await fetch(`${base}/health`)).ok, `bridge on :${port}`);
+
+    start(["tools/fake-extension.js", "chatgpt"], {
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        NOAPI_PORT: String(port),
+        NOAPI_FAKE_MODE: mode,
+        NOAPI_FAKE_FIRST_MS: String(FIRST_MS),
+        NOAPI_FAKE_STREAM_CHUNKS: String(CHUNKS),
+        NOAPI_FAKE_STREAM_STEP_MS: String(STEP_MS),
+      },
+    });
+    await waitFor(async () => {
+      const h = await (await fetch(`${base}/health`)).json();
+      return h.clients?.length ? h : null;
+    }, `fake tab on :${port}`);
+
+    const ttfb = [];
+    const total = [];
+    for (let i = 1; i <= REQUESTS; i++) {
+      const r = await oneRoundTrip(base, i);
+      ttfb.push(r.ttfb);
+      total.push(r.total);
+    }
+
+    const health = await (await fetch(`${base}/health`)).json();
+    const recent = health.timings?.recent || [];
+    const overhead = recent
+      .filter((r) => Number.isFinite(r.complete) && Number.isFinite(r.lastToken))
+      .map((r) => r.complete - r.lastToken);
+    const typing = recent.map((r) => r.sent).filter((v) => Number.isFinite(v));
+
+    return {
+      mode,
+      port,
+      ttfb: avg(ttfb),
+      total: avg(total),
+      overhead: avg(overhead),
+      typing: avg(typing),
+      runs: REQUESTS,
+      last: health.timings?.last || null,
+    };
+  } finally {
     for (const p of children) {
       try {
         p.kill();
       } catch {}
     }
-  };
+    await sleep(300);
+  }
+}
 
+function table(oldR, newR) {
+  const rows = [
+    ["(a) first streamed content", oldR.ttfb, newR.ttfb],
+    ["(b) overhead after last token", oldR.overhead, newR.overhead],
+    ["(c) typing + send overhead", oldR.typing, newR.typing],
+    ["(d) full round trip", oldR.total, newR.total],
+  ];
+  const label = 30;
+  const cell = 20;
+  const head = "metric".padEnd(label) + "old (2200ms rule)".padStart(cell) + "new (stop button)".padStart(cell);
+  console.log(head);
+  console.log("-".repeat(head.length));
+  for (const [name, o, n] of rows) {
+    console.log(name.padEnd(label) + `${o} ms`.padStart(cell) + `${n} ms`.padStart(cell));
+  }
+}
+
+async function run() {
   try {
-    console.log("=== NOAPI? latency benchmark ===");
+    console.log("=== NOAPI? latency benchmark ===\n");
     console.log(
-      `bridge :${PORT} — ${REQUESTS} requests, fake model: first token ${FIRST_MS}ms, ` +
-        `${CHUNKS} partials x ${STEP_MS}ms\n`
+      `Same simulated model for both scenarios: first token ${FIRST_MS}ms, ` +
+        `${CHUNKS} updates x ${STEP_MS}ms. ${REQUESTS} round trips each.\n`
     );
 
-    const bridge = start(["bridge/index.js", `--port=${PORT}`], { stdio: "ignore" });
-    // Bridge stderr would be noisy here; the timings we print come from /health.
-    bridge.stderr?.resume?.();
-    await sleep(900);
+    const oldR = await runScenario("old", OLD_PORT);
+    const newR = await runScenario("new", NEW_PORT);
 
-    const fake = start(["tools/fake-extension.js", "chatgpt"], {
-      stdio: "ignore",
-      env: {
-        ...process.env,
-        NOAPI_PORT: String(PORT),
-        NOAPI_FAKE_FIRST_MS: String(FIRST_MS),
-        NOAPI_FAKE_STREAM_CHUNKS: String(CHUNKS),
-        NOAPI_FAKE_STREAM_STEP_MS: String(STEP_MS),
-        NOAPI_FAKE_DEBOUNCE_MS: "0",
-      },
-    });
-    await sleep(1200);
+    console.log("");
+    table(oldR, newR);
 
-    const ttfbs = [];
-    const totals = [];
-    const tails = [];
-    for (let i = 1; i <= REQUESTS; i++) {
-      const r = await oneRoundTrip(i);
-      ttfbs.push(r.ttfb);
-      totals.push(r.total);
-      tails.push(r.afterLast);
-      console.log(`  #${i}  first content at ${r.ttfb}ms   done at ${r.total}ms   (${r.contentChars} chars)`);
+    console.log("\n--- detail ---");
+    for (const r of [oldR, newR]) {
+      console.log(
+        `${r.mode.padEnd(3)} : :${r.port}  first ${r.ttfb}ms  after-last-token ${r.overhead}ms  ` +
+          `typing ${r.typing}ms  total ${r.total}ms` +
+          (r.last?.completedBy ? `  completedBy=${r.last.completedBy}` : "")
+      );
     }
 
-    const health = await (await fetch(`${BASE}/health`)).json();
-    const stages = health.timings?.last || {};
-    console.log("\n--- summary ---");
-    console.log(`time to first streamed content : ${avg(ttfbs)} ms   (min ${Math.min(...ttfbs)}, max ${Math.max(...ttfbs)})`);
-    console.log(`full round trip                : ${avg(totals)} ms   (min ${Math.min(...totals)}, max ${Math.max(...totals)})`);
-    console.log(`overhead after last token      : ${avg(tails)} ms   (completion detection + final flush)`);
-    console.log(
-      `bridge stages (last request)   : composer ${stages.composer ?? "-"}ms  typed ${stages.typed ?? "-"}ms  ` +
-        `sent ${stages.sent ?? "-"}ms  first text ${stages.firstText ?? "-"}ms  complete ${stages.complete ?? "-"}ms`
-    );
-    console.log("\nNote: the fake tab stands in for a real website. Its simulated model time");
-    console.log(`(here ~${FIRST_MS + CHUNKS * STEP_MS}ms) is not something the bridge can remove; the number`);
-    console.log("that improves with streaming is 'time to first streamed content'.");
-    stopAll();
+    console.log("\nNOTE: these numbers come from a simulation (tools/fake-extension.js).");
+    console.log("Only the per-stage timings that /health reports on a real site are ground truth.");
+
     process.exit(0);
   } catch (err) {
     console.error("bench failed:", err.message);
-    stopAll();
     process.exit(1);
   }
 }

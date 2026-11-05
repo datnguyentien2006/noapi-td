@@ -1,17 +1,38 @@
-// Fake "browser tab" for testing the NOAPI? bridge without a real browser.
-// Connects to the bridge websocket, claims to be on a site, and when a prompt
-// arrives it "types" nothing and just replies with a canned answer.
+// Fake "browser tab" for testing and benchmarking the NOAPI? bridge without a
+// real browser. Connects to the bridge websocket, claims to be on a site, and
+// when a prompt arrives it simulates a real chat page: it "types" (with a delay
+// that grows with the prompt), streams a reply token by token, and finishes the
+// way the content script would.
 //
 //   node tools/fake-extension.js [site]   (default site: chatgpt)
 //
+// It can model two client behaviours so the benchmark can compare them with the
+// SAME simulated model timings (NOAPI_FAKE_MODE):
+//   new  (default) - condition-based typing, live streaming, and completion
+//                    detected from the stop button disappearing + a debounce.
+//   old            - fixed typing sleeps, no streaming at all, and the old
+//                    "reply text unchanged for 2200ms" stability rule.
+//
 // Environment knobs (all optional) let the tests simulate real page timing:
 //   NOAPI_PORT                  bridge port (default 8787)
-//   NOAPI_FAKE_FIRST_MS         delay before anything is produced (default 1200)
-//   NOAPI_FAKE_TYPING_MS        simulated composer-typing time, reported in timings
-//   NOAPI_FAKE_STREAM_CHUNKS    split the reply into N "partial" messages (default 0)
-//   NOAPI_FAKE_STREAM_STEP_MS   delay between partials (default 150)
-//   NOAPI_FAKE_DEBOUNCE_MS      dead time after the last token before the final
-//                               response, standing in for completion detection
+//   NOAPI_FAKE_MODE             "new" | "old" (default new)
+//   NOAPI_FAKE_FIRST_MS         delay after sending before the first token (1200)
+//   NOAPI_FAKE_STREAM_CHUNKS    split the reply into N partial updates (default 0)
+//   NOAPI_FAKE_STREAM_STEP_MS   delay between partial updates (default 150)
+//   NOAPI_FAKE_TYPE_BASE_MS     fixed part of the typing time (default 120)
+//   NOAPI_FAKE_TYPE_PER_CHAR_MS typing time per prompt character (default 0.6)
+//   NOAPI_FAKE_TYPING_CAP_MS    cap on the prompt-length typing time (1200)
+//   NOAPI_FAKE_TYPING_MS        fixed typing time, overrides the length model
+//   NOAPI_FAKE_FIXED_TYPING_MS  old mode's total typing+sending time (950)
+//   NOAPI_FAKE_FIXED_TYPED_MS   old mode's typed stage (500)
+//   NOAPI_FAKE_STOP_LEAD_MS     stop button vanishes this long after the last
+//                               token; negative = before it (default 180)
+//   NOAPI_FAKE_FINAL_RENDER_MS  final DOM update lands this long after the last
+//                               token, i.e. after the stop button is gone (260)
+//   NOAPI_FAKE_COMPLETION_DEBOUNCE_MS  new mode: quiet time after the last change
+//                               before completion (default 400; aliases
+//                               NOAPI_FAKE_DEBOUNCE_MS for compatibility)
+//   NOAPI_FAKE_STABLE_MS        old mode's "no change" rule (default 2200)
 //   NOAPI_FAKE_REPLY            exact reply text to send back
 //   NOAPI_FAKE_TOOL_CALLS       number of TOOL_CALL blocks to emit in a tool reply
 //   NOAPI_FAKE_TOOL_TAIL        narration appended after the tool blocks; a real
@@ -29,16 +50,34 @@ const env = (name, dflt) => {
   const v = Number(process.env[name]);
   return Number.isFinite(v) ? v : dflt;
 };
+const has = (name) => process.env[name] !== undefined && process.env[name] !== "";
+
+const MODE = String(process.env.NOAPI_FAKE_MODE || "new").toLowerCase() === "old" ? "old" : "new";
 const FIRST_MS = env("NOAPI_FAKE_FIRST_MS", 1200);
-const TYPING_MS = env("NOAPI_FAKE_TYPING_MS", 0);
 const STREAM_CHUNKS = env("NOAPI_FAKE_STREAM_CHUNKS", 0);
 const STREAM_STEP_MS = env("NOAPI_FAKE_STREAM_STEP_MS", 150);
-const DEBOUNCE_MS = env("NOAPI_FAKE_DEBOUNCE_MS", 0);
 const FORCED_REPLY = process.env.NOAPI_FAKE_REPLY || "";
 const TOOL_CALLS = env("NOAPI_FAKE_TOOL_CALLS", 1);
 const TOOL_TAIL = process.env.NOAPI_FAKE_TOOL_TAIL || "";
 // The content script returns ~400ms after a complete tool block settles.
 const EARLY_RETURN_MS = env("NOAPI_FAKE_EARLY_RETURN_MS", 400);
+
+// Typing model. New: condition-based, time grows with prompt length but is
+// bounded. Old: fixed sleeps (80+50+120+250ms typing + 450ms settle).
+const TYPE_BASE_MS = env("NOAPI_FAKE_TYPE_BASE_MS", 120);
+const TYPE_PER_CHAR_MS = env("NOAPI_FAKE_TYPE_PER_CHAR_MS", 0.6);
+const TYPING_CAP_MS = env("NOAPI_FAKE_TYPING_CAP_MS", 1200);
+const TYPING_OVERRIDE = has("NOAPI_FAKE_TYPING_MS") ? env("NOAPI_FAKE_TYPING_MS", 0) : null;
+const FIXED_TYPING_MS = env("NOAPI_FAKE_FIXED_TYPING_MS", 950);
+const FIXED_TYPED_MS = env("NOAPI_FAKE_FIXED_TYPED_MS", 500);
+
+// Completion model. The site's stop button disappears around the last token,
+// and the final render can land after it.
+const STOP_LEAD_MS = env("NOAPI_FAKE_STOP_LEAD_MS", 180);
+const FINAL_RENDER_MS = env("NOAPI_FAKE_FINAL_RENDER_MS", 260);
+const COMPLETION_DEBOUNCE_MS = env("NOAPI_FAKE_COMPLETION_DEBOUNCE_MS", env("NOAPI_FAKE_DEBOUNCE_MS", 400));
+const STABLE_MS = env("NOAPI_FAKE_STABLE_MS", 2200);
+const FINAL_RENDER_SUFFIX = process.env.NOAPI_FAKE_FINAL_RENDER_SUFFIX ?? "\n";
 
 const socket = net.createConnection({ host, port }, () => {
   const key = crypto.randomBytes(16).toString("base64");
@@ -105,31 +144,32 @@ function handleRequest(msg) {
   const record = { timers: [], cancelled: false };
   inFlight.set(msg.id, record);
   const t0 = Date.now();
-  const later = (fn, ms) => {
+  const at = (fn, ms) => {
     const t = setTimeout(() => {
       if (record.cancelled) return;
       fn();
-    }, ms);
+    }, Math.max(0, ms));
     record.timers.push(t);
     return t;
   };
 
   const promptText = String(msg.prompt);
   if (promptText.includes("FORCE_ERROR")) {
-    later(() => {
+    at(() => {
       send({ t: "error", id: msg.id, error: "fake failure requested by test" });
       inFlight.delete(msg.id);
     }, 100);
     return;
   }
   if (promptText.includes("FORCE_MIDSTREAM_ERROR")) {
-    later(() => send({ t: "partial", id: msg.id, text: "partial before the failure" }), 40);
-    later(() => {
+    at(() => send({ t: "partial", id: msg.id, text: "partial before the failure" }), 40);
+    at(() => {
       send({ t: "error", id: msg.id, error: "fake mid-stream failure" });
       inFlight.delete(msg.id);
     }, 140);
     return;
   }
+
   const full = replyFor(msg.prompt);
   // When tools are enabled and the reply calls tools, the content script hands
   // the block over as soon as it settles and stops the site — it never waits
@@ -137,32 +177,68 @@ function handleRequest(msg) {
   const isTool = full.includes("TOOL_CALL");
   const earlyReturn = Boolean(msg.tools_enabled && isTool && TOOL_TAIL);
   const text = earlyReturn ? full.slice(0, full.indexOf("\n\n" + TOOL_TAIL)) : full;
-  if (FIRST_MS > 0) later(() => sendProgress(msg.id, "Generating..."), Math.max(0, FIRST_MS - STREAM_STEP_MS));
+  // The final render usually applies formatting after the stop button is gone.
+  const finalText = earlyReturn ? text : text + FINAL_RENDER_SUFFIX;
 
-  later(() => {
-    const firstTextAt = Date.now() - t0;
-    if (STREAM_CHUNKS > 0 && text.length > 2) {
-      for (let i = 1; i <= STREAM_CHUNKS; i++) {
-        const upto = Math.max(1, Math.round((text.length * i) / STREAM_CHUNKS));
-        later(() => send({ t: "partial", id: msg.id, text: text.slice(0, upto) }), (i - 1) * STREAM_STEP_MS);
+  // Typing stages, measured from when the request reached this tab.
+  const typingMs =
+    TYPING_OVERRIDE != null
+      ? TYPING_OVERRIDE
+      : Math.min(TYPING_CAP_MS, TYPE_BASE_MS + Math.round(promptText.length * TYPE_PER_CHAR_MS));
+  const stages =
+    MODE === "old"
+      ? { composer: 0, typed: FIXED_TYPED_MS, sent: FIXED_TYPING_MS }
+      : { composer: 0, typed: Math.round(typingMs / 2), sent: typingMs };
+
+  // Model timeline, all relative to t0. Both modes produce the tokens at the
+  // same moments; only the client-side behaviour around them differs.
+  const chunks = Math.max(0, STREAM_CHUNKS);
+  const firstTokenAt = stages.sent + FIRST_MS;
+  const lastTokenAt = firstTokenAt + Math.max(0, chunks - 1) * STREAM_STEP_MS;
+  const finalRenderAt = lastTokenAt + FINAL_RENDER_MS;
+  const stopGoneAt = lastTokenAt + STOP_LEAD_MS;
+  const completeAt = earlyReturn
+    ? lastTokenAt + EARLY_RETURN_MS
+    : MODE === "old"
+      ? finalRenderAt + STABLE_MS
+      : Math.max(finalRenderAt, stopGoneAt) + COMPLETION_DEBOUNCE_MS;
+
+  if (FIRST_MS > 0) at(() => sendProgress(msg.id, "Generating..."), firstTokenAt - STREAM_STEP_MS);
+
+  // Old mode streams nothing until it is finished; new mode forwards the reply
+  // as it is written, including the final render after the stop button vanished.
+  if (MODE !== "old") {
+    if (chunks > 0 && text.length > 2) {
+      for (let i = 1; i <= chunks; i++) {
+        const upto = Math.max(1, Math.round((text.length * i) / chunks));
+        at(() => send({ t: "partial", id: msg.id, text: text.slice(0, upto) }), firstTokenAt + (i - 1) * STREAM_STEP_MS);
       }
+    } else if (text.length) {
+      at(() => send({ t: "partial", id: msg.id, text }), firstTokenAt);
     }
-    later(() => {
-      console.log(`[fake-ext] replying to ${msg.id}`);
-      const timings = {
-        composer: Math.round(TYPING_MS / 3),
-        typed: Math.round((TYPING_MS * 2) / 3),
-        sent: TYPING_MS,
-        firstText: firstTextAt,
-        complete: Date.now() - t0,
-        total: Date.now() - t0,
-        stopSeen: true,
-        earlyReturn,
-      };
-      send({ t: "response", id: msg.id, text, timings });
-      inFlight.delete(msg.id);
-    }, (STREAM_CHUNKS > 0 ? STREAM_CHUNKS * STREAM_STEP_MS : 0) + (earlyReturn ? EARLY_RETURN_MS : DEBOUNCE_MS));
-  }, FIRST_MS);
+    if (FINAL_RENDER_MS > 0 && !earlyReturn && finalText !== text) {
+      at(() => send({ t: "partial", id: msg.id, text: finalText }), finalRenderAt);
+    }
+  }
+
+  at(() => {
+    console.log(`[fake-ext] replying to ${msg.id}`);
+    const timings = {
+      composer: stages.composer,
+      typed: stages.typed,
+      sent: stages.sent,
+      firstText: MODE === "old" ? completeAt : firstTokenAt,
+      lastToken: lastTokenAt,
+      complete: completeAt,
+      total: completeAt,
+      stopSeen: earlyReturn ? true : MODE !== "old",
+      earlyReturn,
+      completedBy: earlyReturn ? "early" : MODE === "old" ? "fallback" : "stop",
+      resubmits: 0,
+    };
+    send({ t: "response", id: msg.id, text: finalText, timings });
+    inFlight.delete(msg.id);
+  }, completeAt);
 }
 
 function handleCancel(msg) {
