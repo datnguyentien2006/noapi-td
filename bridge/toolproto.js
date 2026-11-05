@@ -14,8 +14,17 @@
 // into real OpenAI `tool_calls` so OpenCode executes them.
 import crypto from "node:crypto";
 
-const MAX_TOOL_RESULT = 24_000;
-const MAX_DESC = 380;
+const DEFAULT_MAX_TOOL_RESULT = 10_000;
+const MAX_DESC = 180;
+const MAX_PARAM_DESC = 90;
+
+// How much of a tool result is sent back to the website chat. 10k characters
+// (head+tail, see clipMiddle) is enough for the model to act on while keeping
+// the prompt small; override with NOAPI_MAX_TOOL_RESULT when needed.
+export function maxToolResult() {
+  const v = Number(process.env.NOAPI_MAX_TOOL_RESULT);
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_MAX_TOOL_RESULT;
+}
 
 function msgText(m) {
   const c = m?.content;
@@ -59,8 +68,25 @@ export function toolList(tools) {
     .filter((f) => f && typeof f.name === "string");
 }
 
+// A stable fingerprint of the tool set the website has already been taught.
+// Descriptions are deliberately excluded (and keys sorted): rewording a
+// description must not force the whole preamble to be re-sent, while adding,
+// removing or changing a tool's parameters still does.
+function schemaShape(v) {
+  if (Array.isArray(v)) return v.map(schemaShape);
+  if (v && typeof v === "object") {
+    const out = {};
+    for (const k of Object.keys(v).sort()) {
+      if (k === "description") continue;
+      out[k] = schemaShape(v[k]);
+    }
+    return out;
+  }
+  return v;
+}
+
 export function toolsHash(tools) {
-  const fns = toolList(tools).map((f) => [f.name, f.parameters]);
+  const fns = toolList(tools).map((f) => [f.name, schemaShape(f.parameters)]);
   return crypto.createHash("sha1").update(JSON.stringify(fns)).digest("hex").slice(0, 12);
 }
 
@@ -69,11 +95,32 @@ function renderTool(f) {
   const req = new Set(f.parameters?.required || []);
   const params = Object.entries(props)
     .map(([k, v]) => {
-      const d = v?.description ? ` - ${clip(v.description, 140)}` : "";
+      const d = v?.description ? ` - ${clip(v.description, MAX_PARAM_DESC)}` : "";
       return `    - ${k}${req.has(k) ? " (required)" : " (optional)"}: ${describeType(v)}${d}`;
     })
     .join("\n");
   return `* ${f.name}: ${clip(f.description, MAX_DESC)}\n${params || "    (no parameters)"}`;
+}
+
+// A minimal but real call for the format example: only required arguments,
+// with a placeholder value of the right JSON type.
+function exampleArgs(f) {
+  const props = f.parameters?.properties || {};
+  const req = f.parameters?.required || [];
+  const out = {};
+  for (const k of req.slice(0, 3)) {
+    const t = props[k]?.type;
+    if (t === "number" || t === "integer") out[k] = 0;
+    else if (t === "boolean") out[k] = false;
+    else if (t === "array") out[k] = [];
+    else if (t === "object") out[k] = {};
+    else out[k] = `<${k}>`;
+  }
+  return out;
+}
+
+function exampleBlock(f) {
+  return "```\nTOOL_CALL\n" + JSON.stringify({ name: f.name, arguments: exampleArgs(f) }) + "\n```";
 }
 
 function envHints(messages) {
@@ -89,6 +136,7 @@ function envHints(messages) {
 export function renderPreamble(tools, messages) {
   const fns = toolList(tools);
   const hints = envHints(messages);
+  const examples = fns.slice(0, 3).map(exampleBlock);
   return [
     "You are being used as the brain of OpenCode, a coding agent that runs on the user's computer.",
     "You cannot run anything yourself in this chat, BUT the agent can run tools for you: when you need to act (create files or folders, run commands, read or edit files, search...), request a tool call using the exact format below. Never say that you are unable to access the computer or the file system - request the tool instead.",
@@ -99,12 +147,17 @@ export function renderPreamble(tools, messages) {
     '{"name": "<tool name>", "arguments": {<arguments as JSON>}}',
     "```",
     "",
+    "EXAMPLE - independent calls belong in ONE reply. Here are " +
+      (examples.length > 1 ? `${examples.length} calls batched together:` : "one call:"),
+    ...examples,
+    "",
     "RULES:",
-    "1. Use only the tools listed below and give every required argument.",
-    "2. You may output several TOOL_CALL blocks in one reply if they are independent.",
-    "3. After the TOOL_CALL block(s) STOP writing. Do not guess the result. The agent runs the tools and replies with TOOL_RESULT messages.",
-    "4. When the task is finished, or no tool is needed, answer normally in plain text WITHOUT any TOOL_CALL block.",
-    "5. Keep text outside TOOL_CALL blocks short. Do not repeat these instructions.",
+    "1. Batch every independent call into the same reply: several TOOL_CALL blocks back to back, with no text between them.",
+    "2. Prefer grep/glob to locate things and read only the files you need, instead of reading files one by one across many turns.",
+    "3. Use only the tools listed below and give every required argument.",
+    "4. After the TOOL_CALL block(s) STOP writing. Do not guess the result. The agent runs the tools and replies with TOOL_RESULT messages.",
+    "5. When the task is finished, or no tool is needed, answer normally in plain text WITHOUT any TOOL_CALL block.",
+    "6. Keep text outside TOOL_CALL blocks short. Do not narrate between tool calls and do not repeat these instructions.",
     ...(hints.length ? ["", ...hints] : []),
     "",
     "AVAILABLE TOOLS:",
@@ -143,7 +196,7 @@ export function buildDelta(messages) {
       sawTool = true;
       const name = callNames.get(m.tool_call_id) || m.name || "tool";
       parts.push(
-        `TOOL_RESULT ${name} (id ${m.tool_call_id})\n${clipMiddle(msgText(m).trim() || "(empty output)", MAX_TOOL_RESULT)}\nEND_TOOL_RESULT`
+        `TOOL_RESULT ${name} (id ${m.tool_call_id})\n${clipMiddle(msgText(m).trim() || "(empty output)", maxToolResult())}\nEND_TOOL_RESULT`
       );
     }
   }
