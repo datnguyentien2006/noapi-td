@@ -5,7 +5,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- Per-request latency instrumentation: stage timings (composer, typed, sent, first reply text, completion) travel with each reply, appear in `/health`, on the dashboard, and as a one-line summary in the bridge log
+- Live streaming to OpenCode: while a site is writing, the reply is forwarded as content deltas (throttled to 150 ms). Tool calls are never streamed as visible text
+- `npm run bench` latency benchmark using the fake browser tab
+
+### Changed
+
+- Completion is detected from the site's stop button disappearing plus a short per-site debounce (350-550 ms) instead of a fixed 2200 ms of no change; a MutationObserver wakes the watcher only when the page changes
+- Typing a prompt is condition-based (poll until the composer really holds the text) instead of fixed sleeps, and the page snapshot is no longer taken on every request
+- When tools are enabled, a complete `TOOL_CALL` block is returned as soon as it settles (400 ms) and the site is stopped, instead of waiting for the whole reply
+- The tool preamble asks for independent calls to be batched in one reply, prefers grep/glob over reading files one by one, and shows a concrete batching example
+- Tool results are trimmed to 10,000 characters by default (`NOAPI_MAX_TOOL_RESULT`), and tool descriptions in the preamble are shorter
+- The preamble is only re-sent when tool names or parameter schemas change, not when descriptions change
+
+### Fixed
+
+- `tools/test-all.js` uses an isolated port and deterministic fake replies, so it can never talk to a real bridge or type test prompts into a real chat tab
 
 ## [0.1.0] - 2026-10-11
 

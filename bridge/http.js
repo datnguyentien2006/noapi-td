@@ -269,7 +269,7 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         let consumed = 0; // characters of the streamed text already accounted for
         let emitted = ""; // content already sent to the client
         const emit = (part) => {
-          if (!part) return;
+          if (!part || res.writableEnded) return;
           chunk({ content: part });
           emitted += part;
         };
@@ -293,6 +293,7 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
 
         try {
           const reply = await ask((status) => think(status), onPartial);
+          if (res.writableEnded) return;
           const { calls, text } = finish(reply);
           if (calls.length || mode === "tool") {
             // Never streamed: emit the narration that came with the call, but

@@ -32,6 +32,7 @@ cd noapi
 
 npm start        # run the bridge on 127.0.0.1:8787
 npm test         # run the full test suite, no browser needed
+npm run bench    # measure latency per round trip with the fake browser tab
 ```
 
 Then load the extension from `extension/chrome` (or `extension/firefox/manifest.json` in Firefox). The steps are in the [README](README.md#-quick-start).
@@ -139,7 +140,11 @@ Short and in the imperative, for example `Fix DeepSeek send button` or `Retry wh
 
 ## 🧪 Tests
 
-`npm test` starts a bridge and a **fake browser tab**, then checks plain replies, streaming, MCP in both modes, and a full tool call round trip. It does not need a real browser or any account.
+`npm test` starts a bridge and a **fake browser tab**, then checks plain replies, streaming content deltas, MCP in both modes, early return on a single and on several `TOOL_CALL` blocks, and a full tool call round trip. It does not need a real browser or any account.
+
+It also runs the small pure functions lifted out of `content.js` (`tools/test-content-logic.js`), the `TOOL_CALL` protocol without a browser (`tools/test-toolproto.js`), and the security checks (`tools/test-security.js`). Every suite uses its own port, so it can never talk to a bridge you have running or type test prompts into a real chat tab.
+
+`npm run bench` uses the same fake tab to print time-to-first-streamed-content and full round-trip numbers, which is the easiest way to show that a latency change actually helped.
 
 The fake tab cannot know how a real website behaves, so changes to the extension still need a quick manual try. If you fix a bug in the bridge, a test that would have caught it is the best kind of pull request.
 

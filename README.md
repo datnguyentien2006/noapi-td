@@ -50,8 +50,8 @@ It is not magic and it is not an official integration. It is a careful bit of pl
   </td>
     <td width="50%" valign="top">
 
-**🧠 Live "Thinking" status**<br>
-While the site works, OpenCode shows what is going on: typing, sending, waiting, answering. No more staring at a blank screen.
+**🧠 Live "Thinking" status and streaming**<br>
+While the site works, OpenCode shows what is going on: typing, sending, waiting, then the answer streams in as the site writes it. Finished tool calls are handed over right away.
 
   </td>
   </tr>
@@ -201,19 +201,19 @@ In plain words:
 
 1. OpenCode thinks it is talking to an OpenAI compatible server. That server is the **bridge**, a tiny Node program on your machine.
 2. The bridge forwards the prompt over a WebSocket to the **extension**.
-3. The extension finds the chat box on the open tab, types the prompt, presses send, and watches the page until the answer is complete.
-4. The answer travels back the same way.
+3. The extension finds the chat box on the open tab, types the prompt, presses send, and watches the page while the answer grows. The reply is complete once the site's stop button disappears and the text has settled briefly.
+4. The answer streams back as it is written. When tools are enabled and the model finishes a `TOOL_CALL` block, the extension hands it over immediately and stops the site, instead of waiting for any trailing narration.
 
 ### 🧰 How tools work on a website that has no tools
 
 Chat websites do not accept tool definitions, so the bridge improvises:
 
-1. On the first prompt of a conversation it adds a short briefing that lists the available tools and a simple format for calling them.
-2. When the model wants to act, it writes a fenced block starting with `TOOL_CALL`, followed by a small JSON object.
-3. The bridge cuts that block out of the reply and hands OpenCode a real `tool_calls` response.
-4. OpenCode runs the tool and sends the result back, which the bridge pastes into the chat as the next message.
+1. On the first prompt of a conversation it adds a short briefing that lists the available tools, the format for calling them, and an example that batches several independent calls into one reply.
+2. When the model wants to act, it writes fenced blocks starting with `TOOL_CALL`, each followed by a small JSON object. Independent calls are requested together, so one round trip can do the work of several.
+3. The bridge cuts those blocks out of the reply and hands OpenCode real `tool_calls`. A finished block is returned as soon as it settles, without waiting for the rest of the reply.
+4. OpenCode runs the tools and sends the results back, which the bridge pastes into the chat as the next message.
 
-Because the website already remembers the conversation, only the **new** message is sent each turn, not the whole history. Very long tool output is trimmed in the middle to keep prompts sane.
+Because the website already remembers the conversation, only the **new** message is sent each turn, not the whole history. Very long tool output is trimmed in the middle (10,000 characters by default; set `NOAPI_MAX_TOOL_RESULT` to change it) to keep prompts sane.
 
 ### 🛡️ Small details that make it nicer
 
@@ -319,7 +319,13 @@ You can check the whole pipeline with a fake browser tab. No real site needed.
 npm test
 ```
 
-This starts a bridge, connects a fake extension, and runs plain requests, streaming, MCP in both modes, and a full tool call round trip (model asks for `bash`, gets the result, answers).
+This starts a bridge, connects a fake extension, and runs plain requests, streaming content deltas, early return on tool calls (one and several blocks), MCP in both modes, and a full tool call round trip (model asks for `bash`, gets the result, answers). It also runs the pure logic lifted out of the content script, the `TOOL_CALL` protocol, and the security checks.
+
+```bash
+npm run bench
+```
+
+runs the same fake tab a few times and prints time-to-first-streamed-content and full round-trip numbers, so you can see whether a change actually made things faster.
 
 <br>
 
@@ -341,7 +347,10 @@ NOAPI/
 ├── tools/
 │   ├── install-global.js   Register NOAPI? in your global OpenCode config
 │   ├── fake-extension.js   Fake browser tab for tests
+│   ├── bench-latency.js    Round-trip latency benchmark
 │   ├── test-all.js         End to end tests
+│   ├── test-content-logic.js  Unit tests for the pure content-script logic
+│   ├── test-toolproto.js   Unit tests for the TOOL_CALL protocol
 │   └── test-tools.js       Tool call round trip test
 └── opencode.json           Project level OpenCode config
 ```
@@ -367,7 +376,7 @@ Pull requests with selector fixes are very welcome. 🙏
 I would rather tell you now than have you find out later.
 
 - **It depends on page layouts.** There is no official interface here. When a site redesigns its chat page, that site can break until the selectors are updated.
-- **Speed.** You are driving a real web page, so replies take as long as the website takes, plus a little overhead.
+- **Speed.** You are driving a real web page, so replies take as long as the website takes, plus a little overhead. The bridge streams the answer as it is written and returns finished tool calls immediately, but the site's own model time cannot be removed.
 - **Tool quality varies by model.** Tool use works through a text format the model has to follow. Strong models do it reliably, weaker ones occasionally slip.
 - **One conversation per site tab.** The website keeps the history, so a very long session may hit that site's own limits.
 - **Free plans have limits too.** The websites still apply their own message caps and rules.
