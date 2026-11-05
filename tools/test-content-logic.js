@@ -18,14 +18,14 @@ function extractShared(file, name) {
   return m[1];
 }
 
-function loadShared(name, { wrap = "" } = {}) {
+function loadShared(name, { wrap = "", fn = name } = {}) {
   const chrome = extractShared("extension/chrome/content.js", name);
   const firefox = extractShared("extension/firefox/content.js", name);
   if (chrome !== firefox) {
     throw new Error(`shared block "${name}" differs between chrome and firefox content.js`);
   }
   const body = wrap ? wrap.replace("/* SHARED */", chrome) : chrome;
-  return new Function(`${body}\nreturn ${name};`)();
+  return new Function(`${body}\nreturn ${fn};`)();
 }
 
 let failed = 0;
@@ -49,6 +49,36 @@ ok("stop seen: not before the debounce", !complete(50, false, true, 399, 400, 22
 ok("stop never seen: waits for the long fallback", !complete(50, false, false, 2199, 400, 2200));
 ok("stop never seen: completes at the long fallback", complete(50, false, false, 2200, 400, 2200));
 ok("faster debounce completes sooner", complete(50, false, true, 350, 350, 2200) && !complete(50, false, true, 350, 400, 2200));
+
+// ---- early return on a complete TOOL_CALL (Phase 4) -----------------------
+const early = loadShared("toolEarlyReturn", { fn: "toolEarlyReturnDecision" });
+const completeCall =
+  "On it.\n```\nTOOL_CALL\n{\"name\":\"bash\",\"arguments\":{\"command\":\"mkdir x\"}}\n```";
+const secondCall =
+  "```\nTOOL_CALL\n{\"name\":\"read\",\"arguments\":{\"filePath\":\"a.txt\"}}\n```";
+
+ok("plain text is not a tool call", !early(true, "just a normal answer", 10_000, 400));
+ok("tool marker without a fence is not complete", !early(true, "TOOL_CALL {\"name\":\"bash\"}", 10_000, 400));
+ok(
+  "unclosed tool JSON is not complete",
+  !early(true, "```\nTOOL_CALL\n{\"name\":\"bash\",\"arguments\":{", 10_000, 400)
+);
+ok(
+  "brace inside a JSON string does not end the object early",
+  early(true, "```\nTOOL_CALL\n{\"name\":\"bash\",\"arguments\":{\"command\":\"echo {x}\"}}\n```", 10_000, 400)
+);
+ok("a complete tool call is actionable", early(true, completeCall, 400, 400));
+ok("but not before the quiet window", !early(true, completeCall, 399, 400));
+ok("tools disabled: never early-returns", !early(false, completeCall, 10_000, 400));
+ok("two complete blocks: still actionable", early(true, completeCall + "\n" + secondCall, 400, 400));
+ok(
+  "a second block still streaming is NOT cut off",
+  !early(true, completeCall + "\n```\nTOOL_CALL\n{\"name\":\"read\",\"arg", 10_000, 400)
+);
+ok(
+  "trailing narration after the block waits for real completion",
+  !early(true, completeCall + "\nNow let me explain the change I made.", 10_000, 400)
+);
 
 if (failed) {
   console.error(`\n${failed} test(s) failed`);

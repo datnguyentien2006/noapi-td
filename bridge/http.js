@@ -208,7 +208,7 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         const ask = (onProgress) =>
           titleOnly
             ? Promise.resolve(localTitle(messages))
-            : bridge.requestPrompt({ prompt, site: model, onProgress, signal: abort.signal });
+            : bridge.requestPrompt({ prompt, site: model, onProgress, signal: abort.signal, toolsEnabled: tools.length > 0 });
 
         if (!stream) {
           try {

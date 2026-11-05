@@ -121,7 +121,7 @@ export class Bridge {
 
   // Requests for the same site are serialized: a website chat can only answer
   // one prompt at a time.
-  async requestPrompt({ prompt, system, site, timeoutMs = 600_000, onProgress, signal }) {
+  async requestPrompt({ prompt, system, site, timeoutMs = 600_000, onProgress, signal, toolsEnabled = false }) {
     const key = site || "*";
     const prev = this.locks.get(key) || Promise.resolve();
     let release;
@@ -133,7 +133,7 @@ export class Bridge {
     try {
       await prev;
       if (signal?.aborted) throw new Error("Request cancelled.");
-      return await this._dispatch({ prompt, system, site, timeoutMs, onProgress, signal });
+      return await this._dispatch({ prompt, system, site, timeoutMs, onProgress, signal, toolsEnabled });
     } finally {
       release();
       const left = (this.busy.get(key) || 1) - 1;
@@ -144,7 +144,7 @@ export class Bridge {
     }
   }
 
-  _dispatch({ prompt, system, site, timeoutMs, onProgress, signal }) {
+  _dispatch({ prompt, system, site, timeoutMs, onProgress, signal, toolsEnabled = false }) {
     return new Promise((resolve, reject) => {
       const id = this._nextId();
       const targets = [...this.clients.entries()].filter(
@@ -195,6 +195,7 @@ export class Bridge {
         system: record.system,
         site: record.site,
         timeout_ms: timeoutMs,
+        tools_enabled: Boolean(toolsEnabled),
       });
       let delivered = 0;
       for (const [conn] of targets) {

@@ -14,6 +14,10 @@
 //                               response, standing in for completion detection
 //   NOAPI_FAKE_REPLY            exact reply text to send back
 //   NOAPI_FAKE_TOOL_CALLS       number of TOOL_CALL blocks to emit in a tool reply
+//   NOAPI_FAKE_TOOL_TAIL        narration appended after the tool blocks; a real
+//                               site would keep streaming it, but the content
+//                               script returns as soon as the tool blocks settle,
+//                               so this fake drops it when tools are enabled
 import net from "node:net";
 import crypto from "node:crypto";
 
@@ -32,6 +36,9 @@ const STREAM_STEP_MS = env("NOAPI_FAKE_STREAM_STEP_MS", 150);
 const DEBOUNCE_MS = env("NOAPI_FAKE_DEBOUNCE_MS", 0);
 const FORCED_REPLY = process.env.NOAPI_FAKE_REPLY || "";
 const TOOL_CALLS = env("NOAPI_FAKE_TOOL_CALLS", 1);
+const TOOL_TAIL = process.env.NOAPI_FAKE_TOOL_TAIL || "";
+// The content script returns ~400ms after a complete tool block settles.
+const EARLY_RETURN_MS = env("NOAPI_FAKE_EARLY_RETURN_MS", 400);
 
 const socket = net.createConnection({ host, port }, () => {
   const key = crypto.randomBytes(16).toString("base64");
@@ -107,7 +114,13 @@ function handleRequest(msg) {
     return t;
   };
 
-  const text = replyFor(msg.prompt);
+  const full = replyFor(msg.prompt);
+  // When tools are enabled and the reply calls tools, the content script hands
+  // the block over as soon as it settles and stops the site — it never waits
+  // for (or receives) the trailing narration.
+  const isTool = full.includes("TOOL_CALL");
+  const earlyReturn = Boolean(msg.tools_enabled && isTool && TOOL_TAIL);
+  const text = earlyReturn ? full.slice(0, full.indexOf("\n\n" + TOOL_TAIL)) : full;
   if (FIRST_MS > 0) later(() => sendProgress(msg.id, "Generating..."), Math.max(0, FIRST_MS - STREAM_STEP_MS));
 
   later(() => {
@@ -128,10 +141,11 @@ function handleRequest(msg) {
         complete: Date.now() - t0,
         total: Date.now() - t0,
         stopSeen: true,
+        earlyReturn,
       };
       send({ t: "response", id: msg.id, text, timings });
       inFlight.delete(msg.id);
-    }, (STREAM_CHUNKS > 0 ? STREAM_CHUNKS * STREAM_STEP_MS : 0) + DEBOUNCE_MS);
+    }, (STREAM_CHUNKS > 0 ? STREAM_CHUNKS * STREAM_STEP_MS : 0) + (earlyReturn ? EARLY_RETURN_MS : DEBOUNCE_MS));
   }, FIRST_MS);
 }
 
@@ -157,13 +171,14 @@ function replyFor(prompt) {
   // servers, so we need a marker that is stable across machines.
   if (p.includes("MCP_TEST")) return `[fake ${site}] MCP test reply from the fake browser tab.`;
   if (p.includes("END_TOOL_RESULT")) return `[fake ${site}] Done, the folder was created.`;
-  if (p.includes("AVAILABLE TOOLS") || p.includes("MULTI_TOOL")) {
-    const n = Math.max(1, TOOL_CALLS);
+  if (p.includes("AVAILABLE TOOLS") || p.includes("MULTI_TOOL") || p.includes("SINGLE_TOOL")) {
+    const n = p.includes("SINGLE_TOOL") ? 1 : Math.max(1, TOOL_CALLS);
     const blocks = [];
     for (let i = 0; i < n; i++) {
       blocks.push(`\`\`\`\nTOOL_CALL\n{"name":"bash","arguments":{"command":"mkdir chatgpt-test-${i}"}}\n\`\`\``);
     }
-    return (n > 1 ? "On it, running those in parallel.\n" : "On it.\n") + blocks.join("\n");
+    const head = n > 1 ? "On it, running those in parallel.\n" : "On it.\n";
+    return head + blocks.join("\n") + (TOOL_TAIL ? "\n\n" + TOOL_TAIL : "");
   }
   return `[fake ${site}] This is a fake reply from tools/fake-extension.js. Real use: open ${site} in your browser with the NOAPI? extension — the website's model will answer instead.`;
 }

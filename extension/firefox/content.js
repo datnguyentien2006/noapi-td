@@ -256,7 +256,7 @@
     return i >= 0 ? text.slice(i + tail.length).trim() : text;
   }
 
-  const state = { bridge: false, busy: false, port: null, cancel: false, reqId: null };
+  const state = { bridge: false, busy: false, port: null, cancel: false, reqId: null, justStopped: false };
 
   // ---------------- UI CREATION ----------------
   const host = document.createElement("div");
@@ -565,7 +565,7 @@
       updateStatusUI();
     } else if (msg.type === "noapi_autosend") {
       setLog("Prompt received from OpenCode…");
-      runPipeline(msg.prompt, msg.id).catch(() => {});
+      runPipeline(msg.prompt, msg.id, Boolean(msg.toolsEnabled)).catch(() => {});
     } else if (msg.type === "noapi_cancel") {
       if (state.busy && (!msg.id || msg.id === state.reqId)) cancelCurrent();
     } else if (msg.type === "noapi_toggle_panel") {
@@ -889,17 +889,22 @@
     return best;
   }
 
-  function cancelCurrent() {
-    state.cancel = true;
+  function stopGeneration() {
     for (const sel of SITE.stop || []) {
       try {
         const b = document.querySelector(sel);
         if (b && visible(b)) {
           b.click();
-          break;
+          return true;
         }
       } catch {}
     }
+    return false;
+  }
+
+  function cancelCurrent() {
+    state.cancel = true;
+    stopGeneration();
     setLog("Stopped.");
   }
 
@@ -908,6 +913,13 @@
   // STOP button or get swallowed. Idle = no stop button and the last reply did
   // not change between two samples. Bounded, so it can never hang.
   async function waitForIdle(maxMs = 60_000) {
+    // If the previous request was ended deliberately (we returned a complete
+    // tool call and clicked stop ourselves), the page is already idle — skip
+    // the stability poll entirely.
+    if (state.justStopped) {
+      state.justStopped = false;
+      return;
+    }
     const t0 = Date.now();
     const snap = () => {
       const n = replyNodes();
@@ -951,7 +963,56 @@
   }
   /* @noapi-shared-end completionDecision */
 
-  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, typedLen, pipelineT0 = null, timings = null }) {
+  // Tools enabled: a reply is "done enough" as soon as it ends with a complete
+  // TOOL_CALL block that has settled for EARLY_RETURN_MS. A finished tool call
+  // is actionable immediately; waiting for the site to also finish any trailing
+  // narration just burns a full round-trip of latency. Anchoring the check to
+  // the END of the reply is what makes several consecutive blocks safe: while
+  // the model is still writing (the next block, or the fence) the tail is not a
+  // finished block, and the quiet timer keeps resetting anyway.
+  const EARLY_RETURN_MS = 400;
+
+  // Pure decision functions, delimited so tools/test-content-logic.js can lift
+  // them out of this file and unit-test them without a browser. Keep them
+  // self-contained (no outer variables).
+  /* @noapi-shared-start toolEarlyReturn */
+  function toolCallComplete(text) {
+    const s = String(text || "").replace(/\s+$/, "");
+    if (!s.endsWith("```")) return false;
+    const before = s.slice(0, -3);
+    const marker = before.lastIndexOf("TOOL_CALL");
+    if (marker === -1) return false;
+    const brace = before.indexOf("{", marker);
+    if (brace === -1) return false;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let i = brace; i < before.length; i++) {
+      const ch = before[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === "\\") esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) return before.slice(i + 1).trim() === "";
+      }
+    }
+    return false;
+  }
+
+  function toolEarlyReturnDecision(toolsEnabled, replyText, quietMs, earlyReturnMs) {
+    if (!toolsEnabled) return false;
+    if (quietMs < earlyReturnMs) return false;
+    return toolCallComplete(replyText);
+  }
+  /* @noapi-shared-end toolEarlyReturn */
+
+  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, typedLen, toolsEnabled = false, pipelineT0 = null, timings = null }) {
     const t0 = Date.now();
     return new Promise((resolve, reject) => {
       let lastText = "";
@@ -1108,6 +1169,18 @@
             }
           }
 
+          // Tools on: a settled, complete TOOL_CALL block is actionable now.
+          // Return it and stop the site so the chat is idle for the next prompt,
+          // instead of waiting for the whole trailing narration.
+          if (toolEarlyReturnDecision(toolsEnabled, lastText, now - (lastTextAt || now), EARLY_RETURN_MS)) {
+            if (timings) timings.earlyReturn = true;
+            const stopped = stopGeneration();
+            state.justStopped = stopped;
+            setLog(`✓ ${SITE.name} returned a complete tool call — stopping generation.`);
+            finish(lastText);
+            return;
+          }
+
           // Completion. Needs a non-trivial reply and no stop button right now.
           if (completionDecision(lastText.length, generating, stopSeen, now - (lastTextAt || now), Number(SITE.debounce) || 400, FALLBACK_STABLE_MS)) {
             finish(lastText);
@@ -1124,7 +1197,7 @@
     });
   }
 
-  async function runPipeline(prompt, reqId) {
+  async function runPipeline(prompt, reqId, toolsEnabled = false) {
     if (state.busy) {
       if (reqId) {
         ext.runtime.sendMessage({ type: "noapi_error", id: reqId, error: "This tab is already handling a prompt." }).catch(() => {});
@@ -1178,7 +1251,7 @@
       timings.sent = Date.now() - t0;
 
       setLog("Waiting for " + SITE.name + " to answer…", true);
-      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, typedLen, pipelineT0: t0, timings });
+      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, typedLen, toolsEnabled, pipelineT0: t0, timings });
       timings.complete = Date.now() - t0;
 
       setLog(`✓ Response captured (${text.length} chars). Sent to OpenCode.`);

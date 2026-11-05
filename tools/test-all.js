@@ -63,7 +63,14 @@ async function run() {
   console.log("2. Connecting fake browser extension...");
   const fakeProc = start(["tools/fake-extension.js", "chatgpt"], {
     stdio: ["ignore", "pipe", "pipe"],
-    env: fakeEnv({ NOAPI_FAKE_FIRST_MS: "400", NOAPI_FAKE_TYPING_MS: "300", NOAPI_FAKE_STREAM_CHUNKS: "4", NOAPI_FAKE_STREAM_STEP_MS: "80" }),
+    env: fakeEnv({
+      NOAPI_FAKE_FIRST_MS: "400",
+      NOAPI_FAKE_TYPING_MS: "300",
+      NOAPI_FAKE_STREAM_CHUNKS: "4",
+      NOAPI_FAKE_STREAM_STEP_MS: "80",
+      NOAPI_FAKE_TOOL_CALLS: "2",
+      NOAPI_FAKE_TOOL_TAIL: "EXTRA_NARRATION that only arrives if nobody returned early",
+    }),
   });
   fakeProc.stdout.on("data", (d) => process.stderr.write("  [fake] " + d));
   await sleep(1500);
@@ -119,6 +126,60 @@ async function run() {
     throw new Error(`invalid SSE stream:\n${streamText}`);
   }
   console.log("   ✓ streaming SSE received chunks + [DONE]");
+
+  // Step 4b: Early return on a complete TOOL_CALL (tools enabled). The fake
+  // appends a narration tail that a real site would keep streaming; because the
+  // content script returns as soon as the tool blocks settle, the tail must
+  // never reach OpenCode, and the reply must carry the tool_calls instead.
+  console.log("4b. Testing early return on tool calls (single and multiple)...");
+  const toolRequest = (content) =>
+    fetchJson(`${BASE}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "chatgpt",
+        messages: [{ role: "user", content }],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "bash",
+              description: "Run a shell command.",
+              parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+            },
+          },
+        ],
+      }),
+    });
+
+  const single = await toolRequest("SINGLE_TOOL please");
+  const singleMsg = single.data?.choices?.[0]?.message || {};
+  if ((singleMsg.tool_calls || []).length !== 1) {
+    throw new Error(`expected 1 tool call, got: ${JSON.stringify(single)}`);
+  }
+  if (single.data?.choices?.[0]?.finish_reason !== "tool_calls") {
+    throw new Error(`expected finish_reason tool_calls: ${JSON.stringify(single.data?.choices?.[0])}`);
+  }
+  if (JSON.stringify(singleMsg).includes("EXTRA_NARRATION")) {
+    throw new Error(`early return did not cut the trailing narration: ${JSON.stringify(singleMsg)}`);
+  }
+  console.log("   ✓ single tool call returned early, no narration");
+
+  const multi = await toolRequest("MULTI_TOOL please");
+  const multiCalls = multi.data?.choices?.[0]?.message?.tool_calls || [];
+  if (multiCalls.length !== 2) {
+    throw new Error(`expected 2 tool calls (second block not cut off), got: ${JSON.stringify(multi)}`);
+  }
+  if (JSON.stringify(multi.data?.choices?.[0]?.message || {}).includes("EXTRA_NARRATION")) {
+    throw new Error("early return leaked the narration on a multi-block reply");
+  }
+  console.log("   ✓ two consecutive tool calls returned early, neither cut off");
+
+  const health4 = await fetchJson(`${BASE}/health`);
+  if (health4.data?.timings?.last?.earlyReturn !== true) {
+    throw new Error(`early return not reported in /health: ${JSON.stringify(health4.data?.timings?.last)}`);
+  }
+  console.log("   ✓ /health reports earlyReturn for the tool request");
 
   // Step 5: Test MCP in PROXY mode (bridge is running on the test port)
   console.log("5. Testing MCP stdio in proxy mode (forwarding to running bridge)...");

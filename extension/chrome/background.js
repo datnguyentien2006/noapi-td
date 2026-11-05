@@ -202,6 +202,10 @@
         prompt,
         system: m.system || null,
         site: targetInfo.site,
+        // Tools are enabled for this request: the content script may return a
+        // complete TOOL_CALL block as soon as it settles instead of waiting for
+        // the whole (often long) trailing narration.
+        toolsEnabled: Boolean(m.tools_enabled),
       };
 
       try {

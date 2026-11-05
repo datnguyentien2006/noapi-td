@@ -72,6 +72,7 @@ async function main() {
             system: msg.system || undefined,
             site: msg.site || undefined,
             timeoutMs,
+            toolsEnabled: Boolean(msg.tools_enabled),
           })
           .then((text) => {
             conn.send(JSON.stringify({ t: "proxy-response", id: msg.id, data: text }));
