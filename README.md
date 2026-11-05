@@ -213,7 +213,7 @@ Chat websites do not accept tool definitions, so the bridge improvises:
 3. The bridge cuts those blocks out of the reply and hands OpenCode real `tool_calls`. A finished block is returned as soon as it settles, without waiting for the rest of the reply.
 4. OpenCode runs the tools and sends the results back, which the bridge pastes into the chat as the next message.
 
-Because the website already remembers the conversation, only the **new** message is sent each turn, not the whole history. Very long tool output is trimmed in the middle (10,000 characters by default; set `NOAPI_MAX_TOOL_RESULT` to change it) to keep prompts sane.
+Because the website already remembers the conversation, only the **new** message is sent each turn, not the whole history. Very long tool output is trimmed in the middle (16,000 characters by default; set `NOAPI_MAX_TOOL_RESULT` to change it), and the truncation marker tells the model how many characters were cut and how to re-run the tool for the missing part, so prompts stay sane without losing context silently.
 
 ### 🛡️ Small details that make it nicer
 
@@ -292,6 +292,9 @@ node bridge/index.js [--mcp] [--port=8787] [--host=127.0.0.1]
 |---|---|---|
 | `NOAPI_EARLY_RETURN` | on | Set to `0` to disable the early return on a complete `TOOL_CALL` block **and** the stop click; the turn then falls back to normal completion detection. |
 | `NOAPI_EARLY_RETURN_MS` | `400` | Grace window after the last reply text before an early return is allowed. Clamped to 50–5000. |
+| `NOAPI_MAX_TOOL_RESULT` | `16000` | Characters of a tool result sent back to the site (head + tail). Truncation always says how much was cut. |
+| `NOAPI_DESC_MAX` | `400` | Description cap for priority tools (edit, write, bash, read, patch-like, or any tool with an `oldString`/`newString`/`replace` parameter). Other tools stay at 180. |
+| `NOAPI_PARAM_DESC_MAX` | `400` | Parameter-description cap for those same priority tools. Other tools stay at 90. |
 
 The MCP server offers three tools: `chat` (ask a site), `status` and `sites`.
 

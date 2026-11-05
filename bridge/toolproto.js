@@ -14,16 +14,55 @@
 // into real OpenAI `tool_calls` so OpenCode executes them.
 import crypto from "node:crypto";
 
-const DEFAULT_MAX_TOOL_RESULT = 10_000;
-const MAX_DESC = 180;
-const MAX_PARAM_DESC = 90;
+const DEFAULT_MAX_TOOL_RESULT = 16_000;
+// Descriptions are clipped, but not uniformly: tools whose semantics are subtle
+// keep a long description (so the model is not guessing at an edit/write/bash
+// contract), while the rest get a short one to keep the preamble small.
+const LONG_DESC = 400;
+const LONG_PARAM_DESC = 400;
+const SHORT_DESC = 180;
+const SHORT_PARAM_DESC = 90;
 
-// How much of a tool result is sent back to the website chat. 10k characters
+// How much of a tool result is sent back to the website chat. 16k characters
 // (head+tail, see clipMiddle) is enough for the model to act on while keeping
 // the prompt small; override with NOAPI_MAX_TOOL_RESULT when needed.
 export function maxToolResult() {
   const v = Number(process.env.NOAPI_MAX_TOOL_RESULT);
   return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_MAX_TOOL_RESULT;
+}
+
+function envInt(name, fallback) {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : fallback;
+}
+
+// Description caps for a priority tool; NOAPI_DESC_MAX and
+// NOAPI_PARAM_DESC_MAX override the 400-character defaults.
+export function descMax() {
+  return envInt("NOAPI_DESC_MAX", LONG_DESC);
+}
+export function paramDescMax() {
+  return envInt("NOAPI_PARAM_DESC_MAX", LONG_PARAM_DESC);
+}
+
+// A tool is "priority" when its contract is easy to get wrong. That covers the
+// file/command tools by name and, more robustly, any tool that takes an
+// oldString/newString/replace style argument.
+const PRIORITY_NAME = /(edit|write|patch|bash|read|shell|replace|apply|rename|move|create|delete|notebook)/i;
+const PRIORITY_PARAM = /(oldstring|newstring|replace|old_string|new_string)/i;
+
+export function isPriorityTool(f) {
+  if (!f) return false;
+  if (PRIORITY_NAME.test(String(f.name || ""))) return true;
+  const props = f.parameters?.properties || {};
+  return Object.keys(props).some((k) => PRIORITY_PARAM.test(k));
+}
+
+function descLimit(f) {
+  return isPriorityTool(f) ? descMax() : SHORT_DESC;
+}
+function paramDescLimit(f) {
+  return isPriorityTool(f) ? paramDescMax() : SHORT_PARAM_DESC;
 }
 
 function msgText(m) {
@@ -35,14 +74,15 @@ function msgText(m) {
 
 function clip(s, n) {
   s = String(s || "").replace(/\s+/g, " ").trim();
-  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+  return s.length > n ? s.slice(0, n - 1) + "..." : s;
 }
 
 function clipMiddle(s, n) {
   s = String(s || "");
   if (s.length <= n) return s;
   const half = Math.floor(n / 2);
-  return `${s.slice(0, half)}\n[... ${s.length - n} chars truncated ...]\n${s.slice(-half)}`;
+  const cut = s.length - n;
+  return `${s.slice(0, half)}\n[... ${cut} chars truncated; re-run the tool with a narrower range (offset/limit, grep, or head/tail) to see the missing part ...]\n${s.slice(-half)}`;
 }
 
 function describeType(schema, depth = 0) {
@@ -93,13 +133,14 @@ export function toolsHash(tools) {
 function renderTool(f) {
   const props = f.parameters?.properties || {};
   const req = new Set(f.parameters?.required || []);
+  const cap = paramDescLimit(f);
   const params = Object.entries(props)
     .map(([k, v]) => {
-      const d = v?.description ? ` - ${clip(v.description, MAX_PARAM_DESC)}` : "";
+      const d = v?.description ? ` - ${clip(v.description, cap)}` : "";
       return `    - ${k}${req.has(k) ? " (required)" : " (optional)"}: ${describeType(v)}${d}`;
     })
     .join("\n");
-  return `* ${f.name}: ${clip(f.description, MAX_DESC)}\n${params || "    (no parameters)"}`;
+  return `* ${f.name}: ${clip(f.description, descLimit(f))}\n${params || "    (no parameters)"}`;
 }
 
 // A minimal but real call for the format example: only required arguments,

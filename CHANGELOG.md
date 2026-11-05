@@ -13,6 +13,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `tools/lib/harness.js`: every test starts its own bridge on an OS-assigned ephemeral port and passes that port to the fake tab explicitly; `tools/test-isolation.js` checks the guarantee
 - Tests for the browser error and cancel paths (mid-stream error, Esc mid-stream) and unit tests for the bridge request queue (timeout, abort, progress, partial, timings)
 - `NOAPI_EARLY_RETURN=0` disables the early return on a tool call and the stop click, falling back to normal completion detection
+- `NOAPI_DESC_MAX` and `NOAPI_PARAM_DESC_MAX` override the 400-character description caps for priority tools
 
 ### Changed
 
@@ -20,7 +21,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Typing a prompt is condition-based (poll until the composer really holds the text) instead of fixed sleeps, and the page snapshot is no longer taken on every request
 - When tools are enabled, a complete `TOOL_CALL` block is returned as soon as it settles instead of waiting for the whole reply. The grace window is configurable (`NOAPI_EARLY_RETURN_MS`, default 400 ms) and the early return must name a real tool in a balanced, parses-as-JSON block; while the site is still generating, the window is extended up to a 1500 ms hard cap so a second block is not lost, and the reply node is re-read once after the stop click to avoid a truncated block
 - The tool preamble asks for independent calls to be batched in one reply, prefers grep/glob over reading files one by one, and shows a concrete batching example
-- Tool results are trimmed to 10,000 characters by default (`NOAPI_MAX_TOOL_RESULT`), and tool descriptions in the preamble are shorter
+- Tool results are trimmed to 16,000 characters by default (`NOAPI_MAX_TOOL_RESULT`); the truncation marker reports how many characters were cut and suggests a narrower re-run (offset/limit, grep, head/tail)
+- Tool descriptions are no longer clipped uniformly: tools whose semantics are subtle (edit, write, bash, read, patch-like, or anything with an `oldString`/`newString`/`replace` parameter) keep up to 400 characters, while the rest stay short
 - The preamble is only re-sent when tool names or parameter schemas change, not when descriptions change
 
 ### Fixed
