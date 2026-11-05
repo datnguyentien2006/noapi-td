@@ -40,6 +40,7 @@ async function oneRoundTrip(i) {
   const decoder = new TextDecoder();
   let buf = "";
   let ttfb = null;
+  let lastContent = null;
   let contentChars = 0;
   for (;;) {
     const { done, value } = await reader.read();
@@ -61,11 +62,13 @@ async function oneRoundTrip(i) {
       const delta = parsed.choices?.[0]?.delta;
       if (delta?.content) {
         contentChars += delta.content.length;
+        lastContent = Date.now() - started;
         if (ttfb == null) ttfb = Date.now() - started;
       }
     }
   }
-  return { ttfb: ttfb ?? Date.now() - started, total: Date.now() - started, contentChars };
+  const total = Date.now() - started;
+  return { ttfb: ttfb ?? total, total, contentChars, afterLast: lastContent == null ? total : total - lastContent };
 }
 
 async function run() {
@@ -110,10 +113,12 @@ async function run() {
 
     const ttfbs = [];
     const totals = [];
+    const tails = [];
     for (let i = 1; i <= REQUESTS; i++) {
       const r = await oneRoundTrip(i);
       ttfbs.push(r.ttfb);
       totals.push(r.total);
+      tails.push(r.afterLast);
       console.log(`  #${i}  first content at ${r.ttfb}ms   done at ${r.total}ms   (${r.contentChars} chars)`);
     }
 
@@ -122,7 +127,7 @@ async function run() {
     console.log("\n--- summary ---");
     console.log(`time to first streamed content : ${avg(ttfbs)} ms   (min ${Math.min(...ttfbs)}, max ${Math.max(...ttfbs)})`);
     console.log(`full round trip                : ${avg(totals)} ms   (min ${Math.min(...totals)}, max ${Math.max(...totals)})`);
-    console.log(`dead time after last token     : ${Math.max(0, avg(totals) - avg(ttfbs))} ms`);
+    console.log(`overhead after last token      : ${avg(tails)} ms   (completion detection + final flush)`);
     console.log(
       `bridge stages (last request)   : composer ${stages.composer ?? "-"}ms  typed ${stages.typed ?? "-"}ms  ` +
         `sent ${stages.sent ?? "-"}ms  first text ${stages.firstText ?? "-"}ms  complete ${stages.complete ?? "-"}ms`

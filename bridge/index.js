@@ -123,6 +123,8 @@ async function main() {
           b.respond(conn, msg.id, msg.text, msg.timings);
         } else if (msg.t === "progress") {
           b.progress(msg.id, msg.status);
+        } else if (msg.t === "partial") {
+          b.partial(msg.id, msg.text);
         } else if (msg.t === "error") {
           b.fail(conn, msg.id, msg.error);
         } else if (msg.t === "ping") {

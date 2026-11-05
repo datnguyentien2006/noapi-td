@@ -121,7 +121,7 @@ export class Bridge {
 
   // Requests for the same site are serialized: a website chat can only answer
   // one prompt at a time.
-  async requestPrompt({ prompt, system, site, timeoutMs = 600_000, onProgress, signal, toolsEnabled = false }) {
+  async requestPrompt({ prompt, system, site, timeoutMs = 600_000, onProgress, onPartial, signal, toolsEnabled = false }) {
     const key = site || "*";
     const prev = this.locks.get(key) || Promise.resolve();
     let release;
@@ -133,7 +133,7 @@ export class Bridge {
     try {
       await prev;
       if (signal?.aborted) throw new Error("Request cancelled.");
-      return await this._dispatch({ prompt, system, site, timeoutMs, onProgress, signal, toolsEnabled });
+      return await this._dispatch({ prompt, system, site, timeoutMs, onProgress, onPartial, signal, toolsEnabled });
     } finally {
       release();
       const left = (this.busy.get(key) || 1) - 1;
@@ -144,7 +144,7 @@ export class Bridge {
     }
   }
 
-  _dispatch({ prompt, system, site, timeoutMs, onProgress, signal, toolsEnabled = false }) {
+  _dispatch({ prompt, system, site, timeoutMs, onProgress, onPartial, signal, toolsEnabled = false }) {
     return new Promise((resolve, reject) => {
       const id = this._nextId();
       const targets = [...this.clients.entries()].filter(
@@ -173,6 +173,7 @@ export class Bridge {
         site: site || null,
         startedAt: Date.now(),
         onProgress,
+        onPartial,
         conns: targets.map(([conn]) => conn),
         resolve: (text) => {
           if (this.pending.delete(id)) {
@@ -243,6 +244,17 @@ export class Bridge {
     if (!record || !status) return;
     try {
       record.onProgress?.(String(status));
+    } catch {}
+  }
+
+  // Streaming text so far, from the browser. Advisory only: the final
+  // `response` remains the source of truth (and may differ slightly, e.g. when
+  // the site re-renders a message).
+  partial(id, text) {
+    const record = this.pending.get(id);
+    if (!record || typeof text !== "string") return;
+    try {
+      record.onPartial?.(text);
     } catch {}
   }
 

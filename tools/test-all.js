@@ -125,13 +125,38 @@ async function run() {
   if (!streamText.includes("data:") || !streamText.includes("[DONE]")) {
     throw new Error(`invalid SSE stream:\n${streamText}`);
   }
-  console.log("   ✓ streaming SSE received chunks + [DONE]");
+  const sseEvents = (raw) =>
+    raw
+      .split("\n")
+      .filter((l) => l.startsWith("data: {"))
+      .map((l) => JSON.parse(l.slice(6)));
+  const streamEvents = sseEvents(streamText);
+  const contentDeltas = streamEvents.map((e) => e.choices?.[0]?.delta?.content).filter((c) => typeof c === "string" && c);
+  const streamed = contentDeltas.join("");
+  if (!streamed.includes("[fake chatgpt]")) {
+    throw new Error(`streamed content missing the reply:\n${streamText}`);
+  }
+  if (contentDeltas.length < 2) {
+    throw new Error(`reply was not streamed in real deltas (${contentDeltas.length} content chunk(s))`);
+  }
+  if (streamed.includes("TOOL_CALL")) throw new Error("TOOL_CALL leaked into streamed content");
+  console.log(`   ✓ streaming SSE received ${contentDeltas.length} content deltas + [DONE]`);
 
   // Step 4b: Early return on a complete TOOL_CALL (tools enabled). The fake
   // appends a narration tail that a real site would keep streaming; because the
   // content script returns as soon as the tool blocks settle, the tail must
   // never reach OpenCode, and the reply must carry the tool_calls instead.
   console.log("4b. Testing early return on tool calls (single and multiple)...");
+  const TOOLS = [
+    {
+      type: "function",
+      function: {
+        name: "bash",
+        description: "Run a shell command.",
+        parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+      },
+    },
+  ];
   const toolRequest = (content) =>
     fetchJson(`${BASE}/v1/chat/completions`, {
       method: "POST",
@@ -139,16 +164,7 @@ async function run() {
       body: JSON.stringify({
         model: "chatgpt",
         messages: [{ role: "user", content }],
-        tools: [
-          {
-            type: "function",
-            function: {
-              name: "bash",
-              description: "Run a shell command.",
-              parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
-            },
-          },
-        ],
+        tools: TOOLS,
       }),
     });
 
@@ -174,6 +190,37 @@ async function run() {
     throw new Error("early return leaked the narration on a multi-block reply");
   }
   console.log("   ✓ two consecutive tool calls returned early, neither cut off");
+
+  // Step 4c: Streaming a tool reply must never show the protocol to the user.
+  console.log("4c. Testing streaming tool calls...");
+  const toolStreamResp = await fetch(`${BASE}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "chatgpt",
+      messages: [{ role: "user", content: "SINGLE_TOOL streamed" }],
+      tools: TOOLS,
+      stream: true,
+    }),
+  });
+  const toolEvents = sseEvents(await toolStreamResp.text());
+  const leakedContent = toolEvents
+    .map((e) => e.choices?.[0]?.delta?.content)
+    .filter((c) => typeof c === "string")
+    .join("");
+  if (leakedContent.includes("TOOL_CALL") || leakedContent.includes("mkdir")) {
+    throw new Error(`TOOL_CALL protocol leaked into streamed content: ${JSON.stringify(leakedContent)}`);
+  }
+  const streamedCalls = toolEvents.flatMap((e) => e.choices?.[0]?.delta?.tool_calls || []);
+  if (streamedCalls.length !== 1) {
+    throw new Error(`expected exactly one streamed tool call, got ${streamedCalls.length}: ${JSON.stringify(streamedCalls)}`);
+  }
+  if (!JSON.stringify(streamedCalls[0]).includes("mkdir")) {
+    throw new Error(`streamed tool call is wrong: ${JSON.stringify(streamedCalls[0])}`);
+  }
+  const toolFinishes = toolEvents.filter((e) => e.choices?.[0]?.finish_reason === "tool_calls").length;
+  if (toolFinishes !== 1) throw new Error(`expected one tool_calls finish, got ${toolFinishes}`);
+  console.log("   ✓ tool call streamed once, protocol text never shown");
 
   const health4 = await fetchJson(`${BASE}/health`);
   if (health4.data?.timings?.last?.earlyReturn !== true) {

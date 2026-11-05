@@ -971,6 +971,8 @@
   // the model is still writing (the next block, or the fence) the tail is not a
   // finished block, and the quiet timer keeps resetting anyway.
   const EARLY_RETURN_MS = 400;
+  // How often the still-growing reply is forwarded to OpenCode while it streams.
+  const PARTIAL_THROTTLE_MS = 150;
 
   // Pure decision functions, delimited so tools/test-content-logic.js can lift
   // them out of this file and unit-test them without a browser. Keep them
@@ -1047,6 +1049,22 @@
         done = true;
         cleanup();
         reject(err);
+      };
+
+      // Stream the text so far while it grows (throttled). The bridge forwards
+      // it to OpenCode as content deltas for plain answers and buffers it while
+      // it might contain a TOOL_CALL; the final `response` stays authoritative.
+      let lastPartialAt = 0;
+      let lastPartialText = "";
+      const sendPartial = (text) => {
+        if (!state.reqId || !text || text === lastPartialText) return;
+        const now = Date.now();
+        if (now - lastPartialAt < PARTIAL_THROTTLE_MS) return;
+        lastPartialAt = now;
+        lastPartialText = text;
+        try {
+          ext.runtime.sendMessage({ type: "noapi_partial", id: state.reqId, text }).catch(() => {});
+        } catch {}
       };
 
       try {
@@ -1166,6 +1184,7 @@
               sawActivity = true;
               if (timings && !timings.firstText) timings.firstText = Date.now() - (pipelineT0 ?? t0);
               setLog(`${SITE.name} is answering... (${text.length} chars)`, "tick");
+              sendPartial(text);
             }
           }
 

@@ -294,6 +294,12 @@
         break;
       }
 
+      case "noapi_partial": {
+        if (msg.id && typeof msg.text === "string") sendWs({ t: "partial", id: msg.id, text: msg.text });
+        sendResponse?.({ ok: true });
+        break;
+      }
+
       case "noapi_reply": {
         if (msg.id) {
           state.pending.delete(msg.id);
