@@ -13,6 +13,7 @@
   const SITES = {
     chatgpt: {
       name: "ChatGPT",
+      debounce: 350,
       hosts: ["chatgpt.com", "chat.openai.com"],
       input: [
         "#prompt-textarea",
@@ -43,6 +44,7 @@
     },
     claude: {
       name: "Claude",
+      debounce: 400,
       hosts: ["claude.ai"],
       input: [
         'div[contenteditable="true"].ProseMirror',
@@ -69,6 +71,7 @@
     },
     gemini: {
       name: "Gemini",
+      debounce: 550,
       hosts: ["gemini.google.com", "gemini.google"],
       input: [
         'div.ql-editor[contenteditable="true"]',
@@ -96,6 +99,7 @@
     },
     perplexity: {
       name: "Perplexity",
+      debounce: 450,
       hosts: ["perplexity.ai"],
       input: [
         'textarea[placeholder*="Ask" i]',
@@ -114,6 +118,7 @@
     },
     grok: {
       name: "Grok",
+      debounce: 350,
       hosts: ["grok.com"],
       input: [
         'div[contenteditable="true"][role="textbox"]',
@@ -131,6 +136,7 @@
     },
      mistral: {
        name: "Mistral Chat",
+       debounce: 450,
        hosts: ["chat.mistral.ai"],
        input: [
          'textarea[placeholder*="message" i]',
@@ -147,6 +153,7 @@
      },
      deepseek: {
        name: "DeepSeek",
+       debounce: 450,
        hosts: ["chat.deepseek.com", "deepseek.com"],
        iconSend: true,
        input: [
@@ -871,96 +878,187 @@
     }
   }
 
+  // ---- completion detection -------------------------------------------------
+  // The reply is complete when the site's "stop" button has been seen and has
+  // now disappeared AND the reply text has not changed for a short debounce
+  // (SITE.debounce). That replaces the old "unchanged for 2200ms" rule, which
+  // was pure dead time after the last token. The 2200ms rule is kept only as a
+  // fallback for sites/cases where the stop button was never observed at all.
+  //
+  // A MutationObserver wakes us as soon as the page changes, so extractText only
+  // runs when something actually moved (throttled to ~8/s), with a slow safety
+  // net for sites whose reply lives in a shadow root, where an observer on the
+  // light DOM cannot see the mutation.
+  const FALLBACK_STABLE_MS = 2200;
+  const OBSERVER_TICK_MS = 250;
+  const EXTRACT_THROTTLE_MS = 120;
+  const UNSEEN_MUTATION_MS = 1000;
+  const STALL_LOG_MS = 20_000;
+
+  // Pure decision function, delimited so tools/test-content-logic.js can lift it
+  // out of this file and unit-test it without a browser. Keep it self-contained
+  // (no outer variables) — that is what makes the extraction possible.
+  /* @noapi-shared-start completionDecision */
+  function completionDecision(lastTextLength, stopVisible, stopSeen, quietMs, debounceMs, fallbackMs) {
+    if (lastTextLength < 5 || stopVisible) return false;
+    return stopSeen ? quietMs >= debounceMs : quietMs >= fallbackMs;
+  }
+  /* @noapi-shared-end completionDecision */
+
   async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, pre, scope, typedLen, pipelineT0 = null, timings = null }) {
     const t0 = Date.now();
-    let lastText = "";
-    let stableSince = 0;
-    let sawActivity = false;
-    let resubmits = 0;
+    return new Promise((resolve, reject) => {
+      let lastText = "";
+      let lastTextAt = 0; // when the extracted reply text last changed
+      let stopSeen = false;
+      let sawActivity = false;
+      let resubmits = 0;
+      let lastExtractAt = 0;
+      let lastStallLog = 0;
+      let dirty = true;
+      let ticking = false;
+      let done = false;
+      let observer = null;
+      let timer = null;
 
-    while (Date.now() - t0 < timeoutMs) {
-      await sleep(500);
-      if (state.cancel) throw new Error("Cancelled.");
+      const cleanup = () => {
+        if (timer) clearInterval(timer);
+        timer = null;
+        try {
+          observer?.disconnect();
+        } catch {}
+        observer = null;
+      };
+      const finish = (text) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve(text);
+      };
+      const fail = (err) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        reject(err);
+      };
 
-      const generating = isStopVisible();
-      if (generating) {
-        sawActivity = true;
-        if (timings) timings.stopSeen = true;
-      }
+      try {
+        observer = new MutationObserver(() => {
+          dirty = true;
+        });
+        observer.observe(scope || document.body, { subtree: true, childList: true, characterData: true });
+      } catch {}
 
-      // If the site swallowed the send (nothing started), recover. Two cases:
-      //  - the composer still holds our text  -> click send again
-      //  - the composer is EMPTY (re-render wiped it) and the page did not
-      //    change -> type the prompt again and send
-      if (!sawActivity && Date.now() - t0 > 4000 * (resubmits + 1) && resubmits < 3) {
-        const c = (await findComposer()) || composer;
-        const tail = prompt.replace(/\s+/g, " ").trim().slice(-40);
-        const pageHasPrompt = tail.length >= 8 && (scope?.textContent || "").replace(/\s+/g, " ").includes(tail);
-        const pageGrew = scope && typedLen != null ? scope.textContent.length - typedLen > 15 : false;
-        if (c && replyNodes().length <= before && !isStopVisible()) {
-          if (composerText(c).length >= 4) {
-            resubmits++;
-            setLog(`Prompt not accepted yet, sending again (${resubmits}/3)…`, true);
-            await submitComposer(c);
-            continue;
-          }
-          // Box empty and the page shows no trace of our prompt: it was never sent.
-          if (!c.isContentEditable && !pageHasPrompt && !pageGrew) {
-            resubmits++;
-            setLog(`Chat box is empty and nothing was sent, typing the prompt again (${resubmits}/3)…`, true);
-            const c2 = await ensureTyped(c, prompt);
-            await submitComposer(c2);
-            continue;
-          }
-        }
-      }
-
-      const nodes = replyNodes();
-      let text = "";
-      let fromSelector = false;
-      if (nodes.length > before) {
-        text = extractText(nodes[nodes.length - 1]);
-        fromSelector = true;
-      } else if (nodes.length && nodes.length === before) {
-        const t = extractText(nodes[nodes.length - 1]);
-        if (t && t !== beforeLast && (generating || sawActivity || SITE.iconSend)) {
-          text = t;
+      const readText = (generating) => {
+        const nodes = replyNodes();
+        let text = "";
+        let fromSelector = false;
+        if (nodes.length > before) {
+          text = extractText(nodes[nodes.length - 1]);
           fromSelector = true;
+        } else if (nodes.length && nodes.length === before) {
+          const t = extractText(nodes[nodes.length - 1]);
+          if (t && t !== beforeLast && (generating || sawActivity || SITE.iconSend)) {
+            text = t;
+            fromSelector = true;
+          }
         }
-      }
-
-      if (!fromSelector && Date.now() - t0 > 8000) {
-        const grown = findDeepestGrown(pre, composer);
-        if (grown) text = dropEcho(extractText(grown), prompt);
-      }
-
-      if (!text) {
-        lastText = "";
-        stableSince = 0;
-        // Make a silent stall visible in OpenCode instead of "Finding input…" forever.
-        const waited = Math.round((Date.now() - t0) / 1000);
-        if (waited >= 20 && waited % 20 < 1) {
-          const c = (await findComposer()) || composer;
-          const dbg = `nodes=${replyNodes().length}/${before} box=${composerText(c).length}ch stop=${isStopVisible()}`;
-          setLog(`Prompt sent, but no answer detected on ${SITE.name} yet (${waited}s) [${dbg}]. Still waiting…`, true);
+        if (!fromSelector && Date.now() - t0 > 8000) {
+          const grown = findDeepestGrown(pre, composer);
+          if (grown) text = dropEcho(extractText(grown), prompt);
         }
-        continue;
-      }
-      sawActivity = true;
-      if (timings && !timings.firstText) timings.firstText = Date.now() - (pipelineT0 ?? t0);
+        return text;
+      };
 
-      if (text === lastText && !generating) {
-        if (!stableSince) stableSince = Date.now();
-        if (Date.now() - stableSince >= 2200) return text;
-      } else {
-        lastText = text;
-        stableSince = 0;
-        setLog(`${SITE.name} is answering… (${text.length} chars)`, "tick");
-      }
-    }
+      const tick = async () => {
+        if (done || ticking) return;
+        ticking = true;
+        try {
+          if (state.cancel) {
+            fail(new Error("Cancelled."));
+            return;
+          }
+          const now = Date.now();
+          if (now - t0 >= timeoutMs) {
+            if (lastText.length >= 5) finish(lastText);
+            else fail(new Error("Timed out waiting for " + SITE.name + " to complete response."));
+            return;
+          }
 
-    if (lastText.length >= 5) return lastText;
-    throw new Error("Timed out waiting for " + SITE.name + " to complete response.");
+          const generating = isStopVisible();
+          if (generating) {
+            sawActivity = true;
+            stopSeen = true;
+            if (timings) timings.stopSeen = true;
+          }
+
+          // If the site swallowed the send (nothing started), recover. Two cases:
+          //  - the composer still holds our text  -> click send again
+          //  - the composer is EMPTY (re-render wiped it) and the page did not
+          //    change -> type the prompt again and send
+          if (!sawActivity && now - t0 > 4000 * (resubmits + 1) && resubmits < 3) {
+            const c = (await findComposer()) || composer;
+            const tail = prompt.replace(/\s+/g, " ").trim().slice(-40);
+            const pageHasPrompt = tail.length >= 8 && (scope?.textContent || "").replace(/\s+/g, " ").includes(tail);
+            const pageGrew = scope && typedLen != null ? scope.textContent.length - typedLen > 15 : false;
+            if (c && replyNodes().length <= before && !isStopVisible()) {
+              if (composerText(c).length >= 4) {
+                resubmits++;
+                setLog(`Prompt not accepted yet, sending again (${resubmits}/3)...`, true);
+                await submitComposer(c);
+                return;
+              }
+              // Box empty and the page shows no trace of our prompt: it was never sent.
+              if (!c.isContentEditable && !pageHasPrompt && !pageGrew) {
+                resubmits++;
+                setLog(`Chat box is empty and nothing was sent, typing the prompt again (${resubmits}/3)...`, true);
+                const c2 = await ensureTyped(c, prompt);
+                await submitComposer(c2);
+                return;
+              }
+            }
+          }
+
+          // Only read the DOM when it changed (or, at most once a second, in case
+          // mutations happen somewhere we cannot observe).
+          if ((dirty || now - lastExtractAt >= UNSEEN_MUTATION_MS) && now - lastExtractAt >= EXTRACT_THROTTLE_MS) {
+            dirty = false;
+            lastExtractAt = now;
+            const text = readText(generating);
+            if (!text) {
+              lastText = "";
+              lastTextAt = 0;
+              // Make a silent stall visible in OpenCode instead of "Finding input..." forever.
+              const waited = Math.round((now - t0) / 1000);
+              if (waited >= 20 && waited - lastStallLog >= STALL_LOG_MS / 1000) {
+                lastStallLog = waited;
+                const c = (await findComposer()) || composer;
+                const dbg = `nodes=${replyNodes().length}/${before} box=${composerText(c).length}ch stop=${isStopVisible()}`;
+                setLog(`Prompt sent, but no answer detected on ${SITE.name} yet (${waited}s) [${dbg}]. Still waiting...`, true);
+              }
+            } else if (text !== lastText) {
+              lastText = text;
+              lastTextAt = now;
+              sawActivity = true;
+              if (timings && !timings.firstText) timings.firstText = Date.now() - (pipelineT0 ?? t0);
+              setLog(`${SITE.name} is answering... (${text.length} chars)`, "tick");
+            }
+          }
+
+          // Completion. Needs a non-trivial reply and no stop button right now.
+          if (completionDecision(lastText.length, generating, stopSeen, now - (lastTextAt || now), Number(SITE.debounce) || 400, FALLBACK_STABLE_MS)) {
+            finish(lastText);
+          }
+        } catch (err) {
+          fail(err);
+        } finally {
+          ticking = false;
+        }
+      };
+
+      timer = setInterval(tick, OBSERVER_TICK_MS);
+      tick();
+    });
   }
 
   async function runPipeline(prompt, reqId) {
