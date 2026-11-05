@@ -9,7 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - Per-request latency instrumentation: stage timings (composer, typed, sent, first reply text, completion) travel with each reply, appear in `/health`, on the dashboard, and as a one-line summary in the bridge log
 - Live streaming to OpenCode: while a site is writing, the reply is forwarded as content deltas (throttled to 150 ms). Tool calls are never streamed as visible text
-- `npm run bench` latency benchmark using the fake browser tab
+- `npm run bench` latency benchmark using the fake browser tab, running the same simulated model with the old and new client behaviour and reporting four separate numbers (first streamed content, overhead after the last token, typing + send overhead, full round trip)
+- `tools/lib/harness.js`: every test starts its own bridge on an OS-assigned ephemeral port and passes that port to the fake tab explicitly; `tools/test-isolation.js` checks the guarantee
 - Tests for the browser error and cancel paths (mid-stream error, Esc mid-stream) and unit tests for the bridge request queue (timeout, abort, progress, partial, timings)
 
 ### Changed
@@ -23,7 +24,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
-- `tools/test-all.js` uses an isolated port and deterministic fake replies, so it can never talk to a real bridge or type test prompts into a real chat tab
+- Tests can no longer reach a real bridge or type into a real chat tab: each runner binds an ephemeral port (`--port=0`) and hands it to the fake tab, and refuses to use the default port at all
 
 ## [0.1.0] - 2026-10-11
 

@@ -5,83 +5,56 @@
 //  3. MCP in proxy mode (standalone bridge running, opencode spawns MCP proxy)
 //  4. MCP in local mode (no standalone bridge, opencode spawns bridge + MCP directly)
 //
-// It uses its own port (8797) instead of the default 8787 so it can never talk
-// to a bridge you have running for real — and never type test prompts into the
-// chat tabs of a real browser extension that happens to be connected.
-import { spawn } from "node:child_process";
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const PORT = Number(process.env.NOAPI_TEST_PORT || 8797);
-const BASE = `http://127.0.0.1:${PORT}`;
-
-// Track everything we spawn so a failure cannot leave a bridge or a fake tab
-// behind on the test port.
-const children = new Set();
-function start(args, opts = {}) {
-  const p = spawn("node", args, { cwd: process.cwd(), ...opts });
-  children.add(p);
-  return p;
-}
-function stopAll() {
-  for (const p of children) {
-    try {
-      p.kill();
-    } catch {}
-  }
-  children.clear();
-}
-
-async function fetchJson(url, opts) {
-  const r = await fetch(url, opts);
-  const text = await r.text();
-  try {
-    return { status: r.status, data: JSON.parse(text) };
-  } catch {
-    return { status: r.status, raw: text };
-  }
-}
-
-const fakeEnv = (extra = {}) => ({ ...process.env, NOAPI_PORT: String(PORT), ...extra });
+// Every bridge it starts binds an EPHEMERAL port (`--port=0`) and the fake tab
+// is given that exact port, so the suite can never talk to a real bridge or
+// type test prompts into a real chat tab. See tools/lib/harness.js.
+import {
+  startBridge,
+  startFake,
+  spawnProxy,
+  stopAll,
+  waitForHealth,
+  fetchJson,
+  warnIfDefaultBridge,
+  sleep,
+} from "./lib/harness.js";
 
 async function run() {
+  await warnIfDefaultBridge();
   console.log("=== NOAPI? Test Suite ===\n");
 
-  // Step 1: Start standalone bridge on its own port
-  console.log(`1. Starting standalone bridge on :${PORT}...`);
-  const bridgeProc = start(["bridge/index.js", `--port=${PORT}`], {
-    stdio: ["ignore", "pipe", "pipe"],
+  // Step 1: Start standalone bridge on an ephemeral port
+  const { port: PORT, proc: bridgeProc } = await startBridge({
+    onStderr: (s) => process.stderr.write("  [bridge] " + s),
   });
-  bridgeProc.stderr.on("data", (d) => process.stderr.write("  [bridge] " + d));
-  bridgeProc.stdout.on("data", (d) => process.stderr.write("  [bridge] " + d));
-  await sleep(1000);
+  const BASE = `http://127.0.0.1:${PORT}`;
+  console.log(`1. Started standalone bridge on :${PORT}...`);
 
-  const health1 = await fetchJson(`${BASE}/health`);
-  if (!health1.data?.ok) throw new Error("bridge health check failed");
+  await waitForHealth(PORT);
   console.log("   ✓ bridge is listening, health ok");
 
   // Step 2: Start fake browser extension (with simulated typing + streaming)
   console.log("2. Connecting fake browser extension...");
-  const fakeProc = start(["tools/fake-extension.js", "chatgpt"], {
-    stdio: ["ignore", "pipe", "pipe"],
-    env: fakeEnv({
+  const fakeLogs = [];
+  const fakeProc = startFake({
+    port: PORT,
+    site: "chatgpt",
+    env: {
       NOAPI_FAKE_FIRST_MS: "400",
       NOAPI_FAKE_TYPING_MS: "300",
       NOAPI_FAKE_STREAM_CHUNKS: "4",
       NOAPI_FAKE_STREAM_STEP_MS: "80",
       NOAPI_FAKE_TOOL_CALLS: "2",
       NOAPI_FAKE_TOOL_TAIL: "EXTRA_NARRATION that only arrives if nobody returned early",
-    }),
+    },
+    onStdout: (d) => {
+      fakeLogs.push(d);
+      process.stderr.write("  [fake] " + d);
+    },
   });
-  const fakeLogs = [];
-  fakeProc.stdout.on("data", (d) => {
-    fakeLogs.push(d.toString());
-    process.stderr.write("  [fake] " + d);
-  });
-  await sleep(1500);
 
-  const health2 = await fetchJson(`${BASE}/health`);
-  if (!health2.data?.clients?.length) throw new Error("fake browser did not register");
-  console.log(`   ✓ fake browser connected (clients: ${health2.data.clients.length})`);
+  const health2 = await waitForHealth(PORT, { clients: true });
+  console.log(`   ✓ fake browser connected (clients: ${health2.clients.length})`);
 
   // Step 3: Test HTTP chat completions (non-stream)
   console.log("3. Testing POST /v1/chat/completions (non-stream)...");
@@ -287,7 +260,7 @@ async function run() {
 
   // Step 5: Test MCP in PROXY mode (bridge is running on the test port)
   console.log("5. Testing MCP stdio in proxy mode (forwarding to running bridge)...");
-  const mcpProxy = start(["bridge/index.js", "--mcp", `--port=${PORT}`]);
+  const mcpProxy = spawnProxy(PORT);
   const proxyOut = [];
   mcpProxy.stdout.on("data", (d) => {
     for (const line of d.toString("utf8").split("\n")) {
@@ -345,7 +318,7 @@ async function run() {
 
   // Step 6: Test MCP in LOCAL mode (MCP process starts bridge directly)
   console.log("6. Testing MCP in LOCAL mode (no standalone bridge running)...");
-  const mcpLocal = start(["bridge/index.js", "--mcp", `--port=${PORT}`]);
+  const { port: LOCAL_PORT, proc: mcpLocal } = await startBridge({ mcp: true });
   const localOut = [];
   mcpLocal.stdout.on("data", (d) => {
     for (const line of d.toString("utf8").split("\n")) {
@@ -357,13 +330,10 @@ async function run() {
       }
     }
   });
-  await sleep(1000);
 
   // Connect fake browser directly to the MCP process's bridge!
-  const fakeProc2 = start(["tools/fake-extension.js", "claude"], {
-    env: fakeEnv({ NOAPI_FAKE_FIRST_MS: "300" }),
-  });
-  await sleep(1500);
+  const fakeProc2 = startFake({ port: LOCAL_PORT, site: "claude", env: { NOAPI_FAKE_FIRST_MS: "300" } });
+  await waitForHealth(LOCAL_PORT, { clients: true });
 
   mcpLocal.stdin.write(
     JSON.stringify({

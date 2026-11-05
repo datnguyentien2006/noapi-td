@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node bridge/index.js",
     "mcp": "node bridge/index.js --mcp",
-    "test": "node tools/test-content-logic.js && node tools/test-toolproto.js && node tools/test-bridge-state.js && node tools/test-all.js && node tools/test-tools.js && node tools/test-security.js",
+    "test": "node tools/test-content-logic.js && node tools/test-toolproto.js && node tools/test-bridge-state.js && node tools/test-isolation.js && node tools/test-all.js && node tools/test-tools.js && node tools/test-security.js",
     "bench": "node tools/bench-latency.js",
     "icons": "node tools/make-icons.js",
     "install-global": "node tools/install-global.js"

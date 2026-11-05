@@ -46,7 +46,8 @@ async function main() {
     );
     return;
   }
-  if (!Number.isInteger(args.port) || args.port < 1 || args.port > 65535) {
+  // 0 means "let the OS pick a free port"; anything else must be usable.
+  if (!Number.isInteger(args.port) || args.port < 0 || args.port > 65535) {
     process.stderr.write("invalid --port\n");
     process.exit(1);
   }
@@ -140,6 +141,9 @@ async function main() {
     });
     await listen(server, args.port, args.host);
     bridge = b; // only usable after the port is actually bound
+    // --port=0 asks the OS for a free port. Report and use the real one so the
+    // MCP proxy path and the tests do not keep referring to 0.
+    args.port = server.address().port;
     log(`listening on http://${args.host}:${args.port}`);
     log("dashboard: http://127.0.0.1:" + args.port + "/");
   } catch (err) {

@@ -142,7 +142,9 @@ Short and in the imperative, for example `Fix DeepSeek send button` or `Retry wh
 
 `npm test` starts a bridge and a **fake browser tab**, then checks plain replies, streaming content deltas, MCP in both modes, early return on a single and on several `TOOL_CALL` blocks, browser errors (including mid-stream), cancellation mid-stream, and a full tool call round trip. It does not need a real browser or any account.
 
-It also runs the small pure functions lifted out of `content.js` (`tools/test-content-logic.js`), the `TOOL_CALL` protocol without a browser (`tools/test-toolproto.js`), the bridge request queue without a browser (`tools/test-bridge-state.js`), and the security checks (`tools/test-security.js`). Every suite uses its own port, so it can never talk to a bridge you have running or type test prompts into a real chat tab.
+It also runs the small pure functions lifted out of `content.js` (`tools/test-content-logic.js`), the `TOOL_CALL` protocol without a browser (`tools/test-toolproto.js`), the bridge request queue without a browser (`tools/test-bridge-state.js`), and the security checks (`tools/test-security.js`).
+
+Every suite asks the OS for an ephemeral port (`--port=0`) through `tools/lib/harness.js` and passes that exact port to the fake tab, so it can never talk to a bridge you have running or type test prompts into a real chat tab. `tools/test-isolation.js` checks that guarantee and fails if a runner ever hardcodes the default port.
 
 `npm run bench` runs the same simulated model twice — once with the old behaviour (fixed typing sleeps, no streaming, 2200 ms stability rule) and once with the new one (condition-based typing, streaming, stop-button completion) — and prints four numbers side by side: time to first streamed content, overhead after the last token, typing + send overhead, and full round trip.
 

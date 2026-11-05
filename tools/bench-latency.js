@@ -16,37 +16,29 @@
 // are ground truth; these numbers are for comparing changes, not for predicting
 // a specific website.
 //
+// Each scenario gets its own bridge on an ephemeral port (see lib/harness.js),
+// so the benchmark can never touch a real bridge on the default port.
+//
 // Knobs:
-//   NOAPI_BENCH_PORT           bridge port for the "new" run (default 8796; the
-//                              "old" run uses port - 1)
 //   NOAPI_BENCH_REQUESTS       how many round trips per scenario (default 5)
 //   NOAPI_BENCH_FIRST_MS       model delay before the first token (default 700)
 //   NOAPI_BENCH_CHUNKS         streamed model updates (default 24)
 //   NOAPI_BENCH_STEP_MS        delay between model updates (default 40)
-import { spawn } from "node:child_process";
+import {
+  startBridge,
+  startFake,
+  waitForHealth,
+  stopAll,
+  warnIfDefaultBridge,
+  sleep,
+} from "./lib/harness.js";
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const PORT = Number(process.env.NOAPI_BENCH_PORT || 8796);
-const NEW_PORT = PORT;
-const OLD_PORT = PORT - 1;
 const REQUESTS = Number(process.env.NOAPI_BENCH_REQUESTS || 5);
 const FIRST_MS = Number(process.env.NOAPI_BENCH_FIRST_MS || 700);
 const CHUNKS = Number(process.env.NOAPI_BENCH_CHUNKS || 24);
 const STEP_MS = Number(process.env.NOAPI_BENCH_STEP_MS || 40);
 
 const avg = (xs) => (xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : 0);
-
-async function waitFor(check, label, timeoutMs = 15_000) {
-  const t0 = Date.now();
-  for (;;) {
-    try {
-      const v = await check();
-      if (v) return v;
-    } catch {}
-    if (Date.now() - t0 > timeoutMs) throw new Error(`timed out waiting for ${label}`);
-    await sleep(100);
-  }
-}
 
 async function oneRoundTrip(base, i) {
   const started = Date.now();
@@ -92,33 +84,22 @@ async function oneRoundTrip(base, i) {
   return { ttfb: ttfb ?? total, total, contentChars };
 }
 
-async function runScenario(mode, port) {
-  const base = `http://127.0.0.1:${port}`;
-  const children = [];
-  const start = (args, opts = {}) => {
-    const p = spawn("node", args, { cwd: process.cwd(), ...opts });
-    children.push(p);
-    return p;
-  };
+async function runScenario(mode) {
   try {
-    start(["bridge/index.js", `--port=${port}`], { stdio: "ignore" });
-    await waitFor(async () => (await fetch(`${base}/health`)).ok, `bridge on :${port}`);
+    const { port } = await startBridge({ port: 0 });
+    const base = `http://127.0.0.1:${port}`;
 
-    start(["tools/fake-extension.js", "chatgpt"], {
-      stdio: "ignore",
+    startFake({
+      port,
+      site: "chatgpt",
       env: {
-        ...process.env,
-        NOAPI_PORT: String(port),
         NOAPI_FAKE_MODE: mode,
         NOAPI_FAKE_FIRST_MS: String(FIRST_MS),
         NOAPI_FAKE_STREAM_CHUNKS: String(CHUNKS),
         NOAPI_FAKE_STREAM_STEP_MS: String(STEP_MS),
       },
     });
-    await waitFor(async () => {
-      const h = await (await fetch(`${base}/health`)).json();
-      return h.clients?.length ? h : null;
-    }, `fake tab on :${port}`);
+    await waitForHealth(port, { clients: true });
 
     const ttfb = [];
     const total = [];
@@ -146,11 +127,7 @@ async function runScenario(mode, port) {
       last: health.timings?.last || null,
     };
   } finally {
-    for (const p of children) {
-      try {
-        p.kill();
-      } catch {}
-    }
+    stopAll();
     await sleep(300);
   }
 }
@@ -174,14 +151,15 @@ function table(oldR, newR) {
 
 async function run() {
   try {
+    await warnIfDefaultBridge();
     console.log("=== NOAPI? latency benchmark ===\n");
     console.log(
       `Same simulated model for both scenarios: first token ${FIRST_MS}ms, ` +
         `${CHUNKS} updates x ${STEP_MS}ms. ${REQUESTS} round trips each.\n`
     );
 
-    const oldR = await runScenario("old", OLD_PORT);
-    const newR = await runScenario("new", NEW_PORT);
+    const oldR = await runScenario("old");
+    const newR = await runScenario("new");
 
     console.log("");
     table(oldR, newR);
@@ -201,6 +179,7 @@ async function run() {
     process.exit(0);
   } catch (err) {
     console.error("bench failed:", err.message);
+    stopAll();
     process.exit(1);
   }
 }

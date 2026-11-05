@@ -349,9 +349,11 @@ NOAPI/
 │   ├── fake-extension.js   Fake browser tab for tests
 │   ├── bench-latency.js    Round-trip latency benchmark
 │   ├── test-all.js         End to end tests
+│   ├── lib/harness.js      Ephemeral-port test harness
 │   ├── test-content-logic.js  Unit tests for the pure content-script logic
 │   ├── test-toolproto.js   Unit tests for the TOOL_CALL protocol
 │   ├── test-bridge-state.js  Unit tests for the bridge request queue
+│   ├── test-isolation.js   Checks tests never touch the default port
 │   └── test-tools.js       Tool call round trip test
 └── opencode.json           Project level OpenCode config
 ```
