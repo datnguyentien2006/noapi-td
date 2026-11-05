@@ -123,16 +123,37 @@ const outcome = (p) => p.then((text) => ({ text }), (err) => ({ err: err.message
   const off = makeConn("off");
   b.register(on, { site: "tools-on" });
   b.register(off, { site: "tools-off" });
-  const p1 = outcome(b.requestPrompt({ prompt: "hi", site: "tools-on", toolsEnabled: true, timeoutMs: 5000 }));
+  const kill = makeConn("kill");
+  b.register(kill, { site: "tools-kill" });
+  const p1 = outcome(
+    b.requestPrompt({
+      prompt: "hi",
+      site: "tools-on",
+      toolsEnabled: true,
+      earlyReturn: true,
+      earlyReturnMs: 650,
+      toolNames: ["bash", "read"],
+      timeoutMs: 5000,
+    })
+  );
   const p2 = outcome(b.requestPrompt({ prompt: "hi", site: "tools-off", timeoutMs: 5000 }));
-  await sleep(20);
+  const p3 = outcome(
+    b.requestPrompt({ prompt: "hi", site: "tools-kill", toolsEnabled: true, earlyReturn: false, timeoutMs: 5000 })
+  );
+  await sleep(30);
   const reqOn = on.sent.find((m) => m.t === "request");
   const reqOff = off.sent.find((m) => m.t === "request");
+  const reqKill = kill.sent.find((m) => m.t === "request");
   ok("tools_enabled=true is forwarded", reqOn?.tools_enabled === true, JSON.stringify(reqOn));
+  ok("early_return defaults to true", reqOn?.early_return === true, JSON.stringify(reqOn));
+  ok("early_return_ms is forwarded", reqOn?.early_return_ms === 650, JSON.stringify(reqOn));
+  ok("tool_names are forwarded", JSON.stringify(reqOn?.tool_names) === JSON.stringify(["bash", "read"]), JSON.stringify(reqOn));
   ok("tools_enabled defaults to false", reqOff?.tools_enabled === false, JSON.stringify(reqOff));
+  ok("the kill switch is forwarded as early_return=false", reqKill?.early_return === false, JSON.stringify(reqKill));
   b.respond(on, reqOn.id, "ok");
   b.respond(off, reqOff.id, "ok");
-  await Promise.all([p1, p2]);
+  b.respond(kill, reqKill.id, "ok");
+  await Promise.all([p1, p2, p3]);
 }
 
 if (failed) {

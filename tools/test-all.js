@@ -168,6 +168,45 @@ async function run() {
   }
   console.log("   ✓ two consecutive tool calls returned early, neither cut off");
 
+  // Step 4b2: NOAPI_EARLY_RETURN=0 is the kill switch. The bridge must not stop
+  // the site early, so the trailing narration arrives and the tool call is still
+  // parsed normally by the final completion path.
+  console.log("4b2. Testing the early-return kill switch...");
+  {
+    const { port: killPort, proc: killBridge } = await startBridge({ env: { NOAPI_EARLY_RETURN: "0" } });
+    const killFake = startFake({
+      port: killPort,
+      site: "chatgpt",
+      env: {
+        NOAPI_FAKE_FIRST_MS: "200",
+        NOAPI_FAKE_STREAM_CHUNKS: "3",
+        NOAPI_FAKE_STREAM_STEP_MS: "60",
+        NOAPI_FAKE_TOOL_TAIL: "EXTRA_NARRATION after the block",
+      },
+    });
+    await waitForHealth(killPort, { clients: true });
+    const killed = await fetchJson(`http://127.0.0.1:${killPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "chatgpt", messages: [{ role: "user", content: "SINGLE_TOOL now" }], tools: TOOLS }),
+    });
+    const km = killed.data?.choices?.[0]?.message || {};
+    if ((km.tool_calls || []).length !== 1) {
+      throw new Error(`kill switch: expected the tool call anyway, got ${JSON.stringify(killed)}`);
+    }
+    if (!String(km.content || "").includes("EXTRA_NARRATION")) {
+      throw new Error(`kill switch: the trailer should have arrived (no early stop), got ${JSON.stringify(km)}`);
+    }
+    const kh = await fetchJson(`http://127.0.0.1:${killPort}/health`);
+    if (kh.data?.timings?.last?.earlyReturn === true) {
+      throw new Error(`kill switch: earlyReturn was still reported: ${JSON.stringify(kh.data.timings.last)}`);
+    }
+    killBridge.kill();
+    killFake.kill();
+    await sleep(300);
+  }
+  console.log("   ✓ NOAPI_EARLY_RETURN=0 falls back to normal completion");
+
   // Step 4c: Streaming a tool reply must never show the protocol to the user.
   console.log("4c. Testing streaming tool calls...");
   const toolStreamResp = await fetch(`${BASE}/v1/chat/completions`, {

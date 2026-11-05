@@ -175,7 +175,10 @@ function handleRequest(msg) {
   // the block over as soon as it settles and stops the site — it never waits
   // for (or receives) the trailing narration.
   const isTool = full.includes("TOOL_CALL");
-  const earlyReturn = Boolean(msg.tools_enabled && isTool && TOOL_TAIL);
+  // Honor the bridge's kill switch (NOAPI_EARLY_RETURN=0), which it forwards as
+  // early_return=false: then the fake keeps the trailing narration instead of
+  // dropping it, and finishes through normal completion.
+  const earlyReturn = Boolean(msg.tools_enabled && msg.early_return !== false && isTool && TOOL_TAIL);
   const text = earlyReturn ? full.slice(0, full.indexOf("\n\n" + TOOL_TAIL)) : full;
   // The final render usually applies formatting after the stop button is gone.
   const finalText = earlyReturn ? text : text + FINAL_RENDER_SUFFIX;

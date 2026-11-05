@@ -121,7 +121,19 @@ export class Bridge {
 
   // Requests for the same site are serialized: a website chat can only answer
   // one prompt at a time.
-  async requestPrompt({ prompt, system, site, timeoutMs = 600_000, onProgress, onPartial, signal, toolsEnabled = false }) {
+  async requestPrompt({
+    prompt,
+    system,
+    site,
+    timeoutMs = 600_000,
+    onProgress,
+    onPartial,
+    signal,
+    toolsEnabled = false,
+    earlyReturn = true,
+    earlyReturnMs = 400,
+    toolNames = [],
+  }) {
     const key = site || "*";
     const prev = this.locks.get(key) || Promise.resolve();
     let release;
@@ -133,7 +145,19 @@ export class Bridge {
     try {
       await prev;
       if (signal?.aborted) throw new Error("Request cancelled.");
-      return await this._dispatch({ prompt, system, site, timeoutMs, onProgress, onPartial, signal, toolsEnabled });
+      return await this._dispatch({
+        prompt,
+        system,
+        site,
+        timeoutMs,
+        onProgress,
+        onPartial,
+        signal,
+        toolsEnabled,
+        earlyReturn,
+        earlyReturnMs,
+        toolNames,
+      });
     } finally {
       release();
       const left = (this.busy.get(key) || 1) - 1;
@@ -144,7 +168,19 @@ export class Bridge {
     }
   }
 
-  _dispatch({ prompt, system, site, timeoutMs, onProgress, onPartial, signal, toolsEnabled = false }) {
+  _dispatch({
+    prompt,
+    system,
+    site,
+    timeoutMs,
+    onProgress,
+    onPartial,
+    signal,
+    toolsEnabled = false,
+    earlyReturn = true,
+    earlyReturnMs = 400,
+    toolNames = [],
+  }) {
     return new Promise((resolve, reject) => {
       const id = this._nextId();
       const targets = [...this.clients.entries()].filter(
@@ -197,6 +233,11 @@ export class Bridge {
         site: record.site,
         timeout_ms: timeoutMs,
         tools_enabled: Boolean(toolsEnabled),
+        // Read from the bridge's environment and passed down because a content
+        // script cannot read process.env. See NOAPI_EARLY_RETURN* in http.js.
+        early_return: Boolean(earlyReturn),
+        early_return_ms: Number(earlyReturnMs) || 400,
+        tool_names: Array.isArray(toolNames) ? toolNames : [],
       });
       let delivered = 0;
       for (const [conn] of targets) {

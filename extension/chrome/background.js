@@ -206,6 +206,12 @@
         // complete TOOL_CALL block as soon as it settles instead of waiting for
         // the whole (often long) trailing narration.
         toolsEnabled: Boolean(m.tools_enabled),
+        // Early return on a complete tool call: the bridge decides via its
+        // environment and passes the knobs down (a content script cannot read
+        // process.env). NOAPI_EARLY_RETURN=0 disables it and the stop click.
+        earlyReturn: m.early_return !== false,
+        earlyReturnMs: Number(m.early_return_ms) || 400,
+        toolNames: Array.isArray(m.tool_names) ? m.tool_names : [],
       };
 
       try {

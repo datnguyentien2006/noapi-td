@@ -52,33 +52,72 @@ ok("faster debounce completes sooner", complete(50, false, true, 350, 350, 2200)
 
 // ---- early return on a complete TOOL_CALL (Phase 4) -----------------------
 const early = loadShared("toolEarlyReturn", { fn: "toolEarlyReturnDecision" });
+const countBlocks = loadShared("toolEarlyReturn", { fn: "toolBlockCount" });
 const completeCall =
   "On it.\n```\nTOOL_CALL\n{\"name\":\"bash\",\"arguments\":{\"command\":\"mkdir x\"}}\n```";
 const secondCall =
   "```\nTOOL_CALL\n{\"name\":\"read\",\"arguments\":{\"filePath\":\"a.txt\"}}\n```";
+const TOOL_NAMES = ["bash", "read"];
+const decision = (over = {}) =>
+  early({ toolsEnabled: true, enabled: true, quietMs: 10_000, earlyReturnMs: 400, toolNames: TOOL_NAMES, ...over });
 
-ok("plain text is not a tool call", !early(true, "just a normal answer", 10_000, 400));
-ok("tool marker without a fence is not complete", !early(true, "TOOL_CALL {\"name\":\"bash\"}", 10_000, 400));
+ok("plain text is not a tool call", !decision({ replyText: "just a normal answer" }));
+ok("tool marker without a fence is not complete", !decision({ replyText: "TOOL_CALL {\"name\":\"bash\"}" }));
 ok(
   "unclosed tool JSON is not complete",
-  !early(true, "```\nTOOL_CALL\n{\"name\":\"bash\",\"arguments\":{", 10_000, 400)
+  !decision({ replyText: "```\nTOOL_CALL\n{\"name\":\"bash\",\"arguments\":{" })
+);
+ok(
+  "invalid JSON is not complete",
+  !decision({ replyText: "```\nTOOL_CALL\n{\"name\":\"bash\",\"arguments\":{oops}}\n```" })
+);
+ok(
+  "a block for an unknown tool is not actionable",
+  !decision({ replyText: "```\nTOOL_CALL\n{\"name\":\"nope\",\"arguments\":{}}\n```" })
 );
 ok(
   "brace inside a JSON string does not end the object early",
-  early(true, "```\nTOOL_CALL\n{\"name\":\"bash\",\"arguments\":{\"command\":\"echo {x}\"}}\n```", 10_000, 400)
+  decision({ replyText: "```\nTOOL_CALL\n{\"name\":\"bash\",\"arguments\":{\"command\":\"echo {x}\"}}\n```" })
 );
-ok("a complete tool call is actionable", early(true, completeCall, 400, 400));
-ok("but not before the quiet window", !early(true, completeCall, 399, 400));
-ok("tools disabled: never early-returns", !early(false, completeCall, 10_000, 400));
-ok("two complete blocks: still actionable", early(true, completeCall + "\n" + secondCall, 400, 400));
+ok("a complete tool call is actionable", decision({ replyText: completeCall }));
+ok("but not before the quiet window", !decision({ replyText: completeCall, quietMs: 399 }));
+ok("tools disabled: never early-returns", !decision({ replyText: completeCall, toolsEnabled: false }));
+ok("kill switch: never early-returns or stops", !decision({ replyText: completeCall, enabled: false }));
+ok("two complete blocks: still actionable", decision({ replyText: completeCall + "\n" + secondCall }));
 ok(
   "a second block still streaming is NOT cut off",
-  !early(true, completeCall + "\n```\nTOOL_CALL\n{\"name\":\"read\",\"arg", 10_000, 400)
+  !decision({ replyText: completeCall + "\n```\nTOOL_CALL\n{\"name\":\"read\",\"arg" })
 );
 ok(
   "trailing narration after the block waits for real completion",
-  !early(true, completeCall + "\nNow let me explain the change I made.", 10_000, 400)
+  !decision({ replyText: completeCall + "\nNow let me explain the change I made." })
 );
+
+// A gap shorter than the grace window: both blocks land before it expires, so
+// the reply ends with the second complete block and is actionable.
+ok(
+  "two blocks with a gap shorter than the window are returned together",
+  decision({ replyText: completeCall + "\n" + secondCall, quietMs: 400 })
+);
+// A gap longer than the window while the site keeps generating: the first block
+// is complete and quiet, but the site is still writing, so we must not stop yet.
+ok(
+  "a gap longer than the window is extended while the site is still generating",
+  !decision({ replyText: completeCall, quietMs: 400, generating: true, sinceBlockMs: 400 })
+);
+ok(
+  "...and it stops at the hard cap",
+  decision({ replyText: completeCall, quietMs: 400, generating: true, sinceBlockMs: 1500 })
+);
+ok(
+  "...but not if the site is already idle",
+  decision({ replyText: completeCall, quietMs: 400, generating: false })
+);
+
+// The re-read after clicking stop compares complete-block counts.
+ok("toolBlockCount counts complete blocks", countBlocks(completeCall + "\n" + secondCall, TOOL_NAMES) === 2);
+ok("toolBlockCount ignores invalid JSON", countBlocks("```\nTOOL_CALL\n{oops}\n```", TOOL_NAMES) === 0);
+ok("toolBlockCount ignores unknown tools", countBlocks("```\nTOOL_CALL\n{\"name\":\"nope\",\"arguments\":{}}\n```", TOOL_NAMES) === 0);
 
 if (failed) {
   console.error(`\n${failed} test(s) failed`);

@@ -74,6 +74,9 @@ async function main() {
             site: msg.site || undefined,
             timeoutMs,
             toolsEnabled: Boolean(msg.tools_enabled),
+            earlyReturn: msg.early_return !== false,
+            earlyReturnMs: Number(msg.early_return_ms) || 400,
+            toolNames: Array.isArray(msg.tool_names) ? msg.tool_names : [],
           })
           .then((text) => {
             conn.send(JSON.stringify({ t: "proxy-response", id: msg.id, data: text }));

@@ -284,9 +284,14 @@ node bridge/index.js [--mcp] [--port=8787] [--host=127.0.0.1]
 | Endpoint | Purpose |
 |---|---|
 | `GET /` | Status dashboard |
-| `GET /health` | JSON status: clients, pending requests, sites |
+| `GET /health` | JSON status: clients, pending requests, sites, per-site counters |
 | `GET /v1/models` | One model per site |
 | `POST /v1/chat/completions` | OpenAI compatible chat, streaming and non streaming |
+
+| Env var | Default | What it does |
+|---|---|---|
+| `NOAPI_EARLY_RETURN` | on | Set to `0` to disable the early return on a complete `TOOL_CALL` block **and** the stop click; the turn then falls back to normal completion detection. |
+| `NOAPI_EARLY_RETURN_MS` | `400` | Grace window after the last reply text before an early return is allowed. Clamped to 50–5000. |
 
 The MCP server offers three tools: `chat` (ask a site), `status` and `sites`.
 

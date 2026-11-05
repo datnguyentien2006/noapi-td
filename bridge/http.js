@@ -182,6 +182,14 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         const messages = Array.isArray(body.messages) ? body.messages : [];
         const tools = body.tool_choice === "none" ? [] : toolList(body.tools);
         const stream = Boolean(body.stream);
+        // Early return on a complete TOOL_CALL block. A content script cannot
+        // read process.env, so the bridge reads the knobs here and forwards
+        // them with the request. NOAPI_EARLY_RETURN=0 is the kill switch: it
+        // disables both the early return and the stop click, falling back to
+        // normal completion detection.
+        const earlyReturn = process.env.NOAPI_EARLY_RETURN !== "0";
+        const earlyReturnMs = Math.min(Math.max(Number(process.env.NOAPI_EARLY_RETURN_MS) || 400, 50), 5000);
+        const toolNames = tools.map((t) => t.name);
 
         // Re-send the tool protocol for new conversations or when the tool set changed.
         const hash = toolsHash(tools);
@@ -208,7 +216,17 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         const ask = (onProgress, onPartial) =>
           titleOnly
             ? Promise.resolve(localTitle(messages))
-            : bridge.requestPrompt({ prompt, site: model, onProgress, onPartial, signal: abort.signal, toolsEnabled: tools.length > 0 });
+            : bridge.requestPrompt({
+                prompt,
+                site: model,
+                onProgress,
+                onPartial,
+                signal: abort.signal,
+                toolsEnabled: tools.length > 0,
+                earlyReturn,
+                earlyReturnMs,
+                toolNames,
+              });
 
         if (!stream) {
           try {

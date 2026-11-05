@@ -565,7 +565,11 @@
       updateStatusUI();
     } else if (msg.type === "noapi_autosend") {
       setLog("Prompt received from OpenCode…");
-      runPipeline(msg.prompt, msg.id, Boolean(msg.toolsEnabled)).catch(() => {});
+      runPipeline(msg.prompt, msg.id, Boolean(msg.toolsEnabled), {
+        earlyReturn: msg.earlyReturn,
+        earlyReturnMs: msg.earlyReturnMs,
+        toolNames: msg.toolNames,
+      }).catch(() => {});
     } else if (msg.type === "noapi_cancel") {
       if (state.busy && (!msg.id || msg.id === state.reqId)) cancelCurrent();
     } else if (msg.type === "noapi_toggle_panel") {
@@ -970,7 +974,14 @@
   // the END of the reply is what makes several consecutive blocks safe: while
   // the model is still writing (the next block, or the fence) the tail is not a
   // finished block, and the quiet timer keeps resetting anyway.
-  const EARLY_RETURN_MS = 400;
+  const DEFAULT_EARLY_RETURN_MS = 400;
+  // If the site is still generating after a complete block, wait at most this
+  // long for a possible second block before stopping. Trade-off: batching many
+  // calls wins up to this point, and a very late block after it is treated as
+  // trailing narration (it is dropped in exchange for not adding dead time).
+  const EARLY_RETURN_HARD_CAP_MS = 1500;
+  // One re-read after clicking stop, to catch a block that was mid-write.
+  const EARLY_RETURN_REREAD_MS = 120;
   // How often the still-growing reply is forwarded to OpenCode while it streams.
   const PARTIAL_THROTTLE_MS = 150;
 
@@ -978,17 +989,21 @@
   // them out of this file and unit-test them without a browser. Keep them
   // self-contained (no outer variables).
   /* @noapi-shared-start toolEarlyReturn */
-  function toolCallComplete(text) {
+  // The JSON object of a TOOL_CALL block that ends the reply, or null. "Valid"
+  // means: a closing fence, a balanced JSON object that actually parses, and a
+  // tool name (checked against the current tool list when one is provided).
+  function toolBlockAtEnd(text, toolNames) {
     const s = String(text || "").replace(/\s+$/, "");
-    if (!s.endsWith("```")) return false;
+    if (!s.endsWith("```")) return null;
     const before = s.slice(0, -3);
     const marker = before.lastIndexOf("TOOL_CALL");
-    if (marker === -1) return false;
-    const brace = before.indexOf("{", marker);
-    if (brace === -1) return false;
+    if (marker === -1) return null;
+    const brace = before.indexOf("{", marker + "TOOL_CALL".length);
+    if (brace === -1) return null;
     let depth = 0;
     let inStr = false;
     let esc = false;
+    let end = -1;
     for (let i = brace; i < before.length; i++) {
       const ch = before[i];
       if (inStr) {
@@ -1001,20 +1016,100 @@
       else if (ch === "{") depth++;
       else if (ch === "}") {
         depth--;
-        if (depth === 0) return before.slice(i + 1).trim() === "";
+        if (depth === 0) {
+          end = i + 1;
+          break;
+        }
       }
     }
-    return false;
+    if (end === -1 || before.slice(end).trim() !== "") return null;
+    let obj = null;
+    try {
+      obj = JSON.parse(before.slice(brace, end));
+    } catch {
+      return null;
+    }
+    const name = obj && (obj.name || obj.tool || obj.tool_name || (obj.function && obj.function.name));
+    if (typeof name !== "string") return null;
+    if (Array.isArray(toolNames) && toolNames.length) {
+      const known = toolNames.some((n) => n === name || String(n).toLowerCase() === name.toLowerCase());
+      if (!known) return null;
+    }
+    return { name };
   }
 
-  function toolEarlyReturnDecision(toolsEnabled, replyText, quietMs, earlyReturnMs) {
-    if (!toolsEnabled) return false;
-    if (quietMs < earlyReturnMs) return false;
-    return toolCallComplete(replyText);
+  // How many complete, valid TOOL_CALL blocks the reply contains. Used to tell
+  // whether a re-read after clicking stop captured more than the first read.
+  function toolBlockCount(text, toolNames) {
+    const s = String(text || "");
+    let count = 0;
+    let from = 0;
+    for (;;) {
+      const marker = s.indexOf("TOOL_CALL", from);
+      if (marker === -1) break;
+      const brace = s.indexOf("{", marker + "TOOL_CALL".length);
+      if (brace === -1) break;
+      let depth = 0;
+      let inStr = false;
+      let esc = false;
+      let end = -1;
+      for (let i = brace; i < s.length; i++) {
+        const ch = s[i];
+        if (inStr) {
+          if (esc) esc = false;
+          else if (ch === "\\") esc = true;
+          else if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === "{") depth++;
+        else if (ch === "}") {
+          depth--;
+          if (depth === 0) {
+            end = i + 1;
+            break;
+          }
+        }
+      }
+      if (end === -1) {
+        from = marker + 1;
+        continue;
+      }
+      let obj = null;
+      try {
+        obj = JSON.parse(s.slice(brace, end));
+      } catch {}
+      const name = obj && (obj.name || obj.tool || obj.tool_name || (obj.function && obj.function.name));
+      const known =
+        typeof name === "string" &&
+        (!Array.isArray(toolNames) ||
+          !toolNames.length ||
+          toolNames.some((n) => n === name || String(n).toLowerCase() === name.toLowerCase()));
+      const fenced = s.slice(end).includes("```");
+      if (known && fenced) count++;
+      from = end;
+    }
+    return count;
+  }
+
+  function toolEarlyReturnDecision(opts) {
+    const o = opts || {};
+    if (!o.toolsEnabled || o.enabled === false) return false;
+    if (!toolBlockAtEnd(o.replyText, o.toolNames)) return false;
+    const grace = Number.isFinite(o.earlyReturnMs) ? o.earlyReturnMs : 400;
+    if ((o.quietMs || 0) < grace) return false;
+    // While the site is still generating, a pause is not proof the turn is
+    // over: a second block may start just after the grace window. Wait up to a
+    // hard cap before clicking stop, so that block is not silently lost.
+    if (o.generating) {
+      const cap = Number.isFinite(o.hardCapMs) ? o.hardCapMs : 1500;
+      if ((o.sinceBlockMs || 0) < cap) return false;
+    }
+    return true;
   }
   /* @noapi-shared-end toolEarlyReturn */
 
-  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, typedLen, toolsEnabled = false, pipelineT0 = null, timings = null }) {
+  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, typedLen, toolsEnabled = false, earlyReturn = true, earlyReturnMs = DEFAULT_EARLY_RETURN_MS, toolNames = [], pipelineT0 = null, timings = null }) {
     const t0 = Date.now();
     return new Promise((resolve, reject) => {
       let lastText = "";
@@ -1054,6 +1149,7 @@
       // Stream the text so far while it grows (throttled). The bridge forwards
       // it to OpenCode as content deltas for plain answers and buffers it while
       // it might contain a TOOL_CALL; the final `response` stays authoritative.
+      let earlyBlockAt = 0; // when the reply first ended with a complete tool block
       let lastPartialAt = 0;
       let lastPartialText = "";
       const sendPartial = (text) => {
@@ -1190,13 +1286,45 @@
 
           // Tools on: a settled, complete TOOL_CALL block is actionable now.
           // Return it and stop the site so the chat is idle for the next prompt,
-          // instead of waiting for the whole trailing narration.
-          if (toolEarlyReturnDecision(toolsEnabled, lastText, now - (lastTextAt || now), EARLY_RETURN_MS)) {
+          // instead of waiting for the whole trailing narration. The block must
+          // be valid JSON naming a real tool (never return early on a partial or
+          // malformed block), and while the site is still generating we wait up
+          // to a hard cap for a possible second block.
+          if (toolsEnabled && earlyReturn) {
+            if (toolBlockAtEnd(lastText, toolNames)) {
+              if (!earlyBlockAt) earlyBlockAt = now;
+            } else {
+              earlyBlockAt = 0;
+            }
+          }
+          if (
+            toolEarlyReturnDecision({
+              toolsEnabled,
+              enabled: earlyReturn,
+              replyText: lastText,
+              quietMs: now - (lastTextAt || now),
+              earlyReturnMs,
+              generating,
+              sinceBlockMs: earlyBlockAt ? now - earlyBlockAt : 0,
+              hardCapMs: EARLY_RETURN_HARD_CAP_MS,
+              toolNames,
+            })
+          ) {
             if (timings) timings.earlyReturn = true;
             const stopped = stopGeneration();
             state.justStopped = stopped;
+            // Clicking stop is not instantaneous. Re-read once and keep the
+            // longer text if it now holds more complete blocks, so a block that
+            // was being written when we clicked is not cut off.
+            let finalText = lastText;
+            if (stopped) {
+              await sleep(EARLY_RETURN_REREAD_MS);
+              const nodes = replyNodes();
+              const after = nodes.length ? extractText(nodes[nodes.length - 1]) : "";
+              if (after && toolBlockCount(after, toolNames) > toolBlockCount(lastText, toolNames)) finalText = after;
+            }
             setLog(`✓ ${SITE.name} returned a complete tool call — stopping generation.`);
-            finish(lastText);
+            finish(finalText);
             return;
           }
 
@@ -1216,7 +1344,15 @@
     });
   }
 
-  async function runPipeline(prompt, reqId, toolsEnabled = false) {
+  async function runPipeline(prompt, reqId, toolsEnabled = false, opts = {}) {
+    // Early return on a complete tool call. The bridge reads the env vars and
+    // forwards the decision, because a content script cannot read process.env.
+    const earlyReturn = opts.earlyReturn !== false;
+    const earlyReturnMs =
+      Number.isFinite(Number(opts.earlyReturnMs)) && Number(opts.earlyReturnMs) > 0
+        ? Number(opts.earlyReturnMs)
+        : DEFAULT_EARLY_RETURN_MS;
+    const toolNames = Array.isArray(opts.toolNames) ? opts.toolNames.filter((n) => typeof n === "string") : [];
     if (state.busy) {
       if (reqId) {
         ext.runtime.sendMessage({ type: "noapi_error", id: reqId, error: "This tab is already handling a prompt." }).catch(() => {});
@@ -1270,7 +1406,7 @@
       timings.sent = Date.now() - t0;
 
       setLog("Waiting for " + SITE.name + " to answer…", true);
-      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, typedLen, toolsEnabled, pipelineT0: t0, timings });
+      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, typedLen, toolsEnabled, earlyReturn, earlyReturnMs, toolNames, pipelineT0: t0, timings });
       timings.complete = Date.now() - t0;
 
       setLog(`✓ Response captured (${text.length} chars). Sent to OpenCode.`);
