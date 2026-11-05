@@ -114,6 +114,22 @@ function handleRequest(msg) {
     return t;
   };
 
+  const promptText = String(msg.prompt);
+  if (promptText.includes("FORCE_ERROR")) {
+    later(() => {
+      send({ t: "error", id: msg.id, error: "fake failure requested by test" });
+      inFlight.delete(msg.id);
+    }, 100);
+    return;
+  }
+  if (promptText.includes("FORCE_MIDSTREAM_ERROR")) {
+    later(() => send({ t: "partial", id: msg.id, text: "partial before the failure" }), 40);
+    later(() => {
+      send({ t: "error", id: msg.id, error: "fake mid-stream failure" });
+      inFlight.delete(msg.id);
+    }, 140);
+    return;
+  }
   const full = replyFor(msg.prompt);
   // When tools are enabled and the reply calls tools, the content script hands
   // the block over as soon as it settles and stops the site — it never waits

@@ -72,7 +72,11 @@ async function run() {
       NOAPI_FAKE_TOOL_TAIL: "EXTRA_NARRATION that only arrives if nobody returned early",
     }),
   });
-  fakeProc.stdout.on("data", (d) => process.stderr.write("  [fake] " + d));
+  const fakeLogs = [];
+  fakeProc.stdout.on("data", (d) => {
+    fakeLogs.push(d.toString());
+    process.stderr.write("  [fake] " + d);
+  });
   await sleep(1500);
 
   const health2 = await fetchJson(`${BASE}/health`);
@@ -221,6 +225,59 @@ async function run() {
   const toolFinishes = toolEvents.filter((e) => e.choices?.[0]?.finish_reason === "tool_calls").length;
   if (toolFinishes !== 1) throw new Error(`expected one tool_calls finish, got ${toolFinishes}`);
   console.log("   ✓ tool call streamed once, protocol text never shown");
+
+  // Step 4d: browser errors must surface as an API error, not hang.
+  console.log("4d. Testing browser error paths...");
+  const errResp = await fetchJson(`${BASE}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "chatgpt", messages: [{ role: "user", content: "FORCE_ERROR now" }] }),
+  });
+  if (errResp.status !== 503 || !JSON.stringify(errResp.data).includes("fake failure")) {
+    throw new Error(`browser error did not surface: ${JSON.stringify(errResp)}`);
+  }
+  console.log("   ✓ browser error -> HTTP 503");
+
+  const midErrResp = await fetch(`${BASE}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "chatgpt",
+      messages: [{ role: "user", content: "FORCE_MIDSTREAM_ERROR now" }],
+      stream: true,
+    }),
+  });
+  const midErrText = await midErrResp.text();
+  if (!midErrText.includes("fake mid-stream failure") || !midErrText.includes("[DONE]")) {
+    throw new Error(`mid-stream error not surfaced:\n${midErrText}`);
+  }
+  console.log("   ✓ mid-stream browser error -> SSE error + [DONE]");
+
+  // Step 4e: aborting mid-stream (Esc in OpenCode) must stop the site too.
+  console.log("4e. Testing cancellation mid-stream...");
+  const ac = new AbortController();
+  const cancelled = fetch(`${BASE}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal: ac.signal,
+    body: JSON.stringify({
+      model: "chatgpt",
+      messages: [{ role: "user", content: "cancel this streamed answer" }],
+      stream: true,
+    }),
+  }).catch(() => null);
+  await sleep(520);
+  ac.abort();
+  await cancelled;
+  await sleep(800);
+  if (!fakeLogs.join("").includes("cancelled")) {
+    throw new Error("the fake browser was not told to cancel the request");
+  }
+  const healthCancel = await fetchJson(`${BASE}/health`);
+  if ((healthCancel.data?.pending || []).length) {
+    throw new Error(`request stayed pending after cancel: ${JSON.stringify(healthCancel.data.pending)}`);
+  }
+  console.log("   ✓ mid-stream cancel reached the browser and cleared the pending request");
 
   const health4 = await fetchJson(`${BASE}/health`);
   if (health4.data?.timings?.last?.earlyReturn !== true) {

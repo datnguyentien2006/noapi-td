@@ -140,9 +140,9 @@ Short and in the imperative, for example `Fix DeepSeek send button` or `Retry wh
 
 ## 🧪 Tests
 
-`npm test` starts a bridge and a **fake browser tab**, then checks plain replies, streaming content deltas, MCP in both modes, early return on a single and on several `TOOL_CALL` blocks, and a full tool call round trip. It does not need a real browser or any account.
+`npm test` starts a bridge and a **fake browser tab**, then checks plain replies, streaming content deltas, MCP in both modes, early return on a single and on several `TOOL_CALL` blocks, browser errors (including mid-stream), cancellation mid-stream, and a full tool call round trip. It does not need a real browser or any account.
 
-It also runs the small pure functions lifted out of `content.js` (`tools/test-content-logic.js`), the `TOOL_CALL` protocol without a browser (`tools/test-toolproto.js`), and the security checks (`tools/test-security.js`). Every suite uses its own port, so it can never talk to a bridge you have running or type test prompts into a real chat tab.
+It also runs the small pure functions lifted out of `content.js` (`tools/test-content-logic.js`), the `TOOL_CALL` protocol without a browser (`tools/test-toolproto.js`), the bridge request queue without a browser (`tools/test-bridge-state.js`), and the security checks (`tools/test-security.js`). Every suite uses its own port, so it can never talk to a bridge you have running or type test prompts into a real chat tab.
 
 `npm run bench` uses the same fake tab to print time-to-first-streamed-content and full round-trip numbers, which is the easiest way to show that a latency change actually helped.
 

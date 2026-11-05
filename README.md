@@ -351,6 +351,7 @@ NOAPI/
 │   ├── test-all.js         End to end tests
 │   ├── test-content-logic.js  Unit tests for the pure content-script logic
 │   ├── test-toolproto.js   Unit tests for the TOOL_CALL protocol
+│   ├── test-bridge-state.js  Unit tests for the bridge request queue
 │   └── test-tools.js       Tool call round trip test
 └── opencode.json           Project level OpenCode config
 ```

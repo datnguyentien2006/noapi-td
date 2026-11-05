@@ -10,6 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Per-request latency instrumentation: stage timings (composer, typed, sent, first reply text, completion) travel with each reply, appear in `/health`, on the dashboard, and as a one-line summary in the bridge log
 - Live streaming to OpenCode: while a site is writing, the reply is forwarded as content deltas (throttled to 150 ms). Tool calls are never streamed as visible text
 - `npm run bench` latency benchmark using the fake browser tab
+- Tests for the browser error and cancel paths (mid-stream error, Esc mid-stream) and unit tests for the bridge request queue (timeout, abort, progress, partial, timings)
 
 ### Changed
 
