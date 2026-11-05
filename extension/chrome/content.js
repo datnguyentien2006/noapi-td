@@ -654,67 +654,107 @@
     return false;
   }
 
+  // Condition-based typing helpers. The old code slept for a fixed 80+50+120+250ms
+  // (plus 450ms in ensureTyped) "just in case"; instead we insert the text and then
+  // poll until the composer really holds it, which is usually far quicker and still
+  // waits as long as needed on a slow page.
+  const FILL_POLL_MS = 35;
+  const LONG_PROMPT_PASTE_THRESHOLD = 1500;
+
+  async function waitUntil(fn, timeoutMs, stepMs = FILL_POLL_MS) {
+    const t0 = Date.now();
+    for (;;) {
+      if (fn()) return true;
+      if (Date.now() - t0 >= timeoutMs) return false;
+      await sleep(stepMs);
+    }
+  }
+
+  function selectComposerContents(el) {
+    el.focus();
+    const sel = window.getSelection();
+    if (!sel) return;
+    sel.removeAllRanges();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    sel.addRange(range);
+  }
+
+  function pasteIntoComposer(el, text) {
+    try {
+      const dt = new DataTransfer();
+      dt.setData("text/plain", text);
+      el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function setNativeValue(el, value) {
+    const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (setter) setter.call(el, value);
+    else el.value = value;
+  }
+
   async function typePromptIntoComposer(el, text) {
     const activeSel = window.getSelection();
     if (activeSel) activeSel.removeAllRanges();
 
     el.focus();
-    await sleep(80);
-    
+
     if (!el.isContentEditable) {
-      const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-      if (setter) setter.call(el, "");
-      else el.value = "";
+      setNativeValue(el, "");
       el.dispatchEvent(new Event("input", { bubbles: true }));
     } else {
       el.innerHTML = "";
       el.dispatchEvent(new Event("input", { bubbles: true }));
     }
-    await sleep(50);
+
+    // Make sure the clear actually landed before inserting (frameworks often
+    // clear asynchronously). Returns immediately when it is already empty.
+    await waitUntil(() => composerText(el).length === 0, 150);
+
     const want = text.replace(/\s+/g, " ").trim();
     const filled = () => {
       const got = composerText(el);
       return got.length >= want.length * 0.95 && got.length <= want.length * 1.2 + 10;
     };
+    const looselyFilled = () => composerText(el).length >= want.length * 0.95;
 
     if (el.isContentEditable) {
-      const selectAll = () => {
-        el.focus();
-        const sel = window.getSelection();
-        sel.removeAllRanges();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        sel.addRange(range);
+      const tryPaste = () => {
+        selectComposerContents(el);
+        return pasteIntoComposer(el, text);
       };
-      selectAll();
-      let ok = false;
-      try {
-        ok = document.execCommand("insertText", false, text);
-      } catch {}
-      await sleep(120);
-      if (!ok || !filled()) {
-        selectAll();
+      const tryInsert = () => {
+        selectComposerContents(el);
+        let ok = false;
         try {
-          const dt = new DataTransfer();
-          dt.setData("text/plain", text);
-          el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+          ok = document.execCommand("insertText", false, text);
         } catch {}
-        await sleep(150);
-      }
-      if (!filled()) {
-        el.textContent = text;
-        el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+        return ok;
+      };
+
+      // Long prompts: execCommand("insertText") gets slow with a few thousand
+      // characters, so try the synthetic paste first. Both paths are verified by
+      // polling the composer, and anything that does not land falls through.
+      if (text.length > LONG_PROMPT_PASTE_THRESHOLD && tryPaste() && (await waitUntil(filled, 400))) return;
+      if (!(tryInsert() && (await waitUntil(filled, 400)))) {
+        if (!(tryPaste() && (await waitUntil(filled, 400)))) {
+          selectComposerContents(el);
+          el.textContent = text;
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+          await waitUntil(looselyFilled, 300);
+        }
       }
     } else {
-      const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-      if (setter) setter.call(el, text);
-      else el.value = text;
+      setNativeValue(el, text);
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
+      await waitUntil(filled, 300);
     }
-    await sleep(250);
   }
 
   const wantedFilled = (el, text) => {
@@ -725,16 +765,17 @@
 
   // Type the prompt and CHECK it stayed there: frameworks like React may
   // re-render the composer right after our programmatic input and reset it to
-  // empty, which leaves the send button disabled and nothing gets sent.
+  // empty, which leaves the send button disabled and nothing gets sent. The
+  // settle delay only exists to catch that async wipe, so it is short.
+  const TYPE_SETTLE_MS = 150;
   async function ensureTyped(composer, text) {
     let el = composer;
     for (let attempt = 1; attempt <= 4; attempt++) {
       await typePromptIntoComposer(el, text);
-      await sleep(450);
+      await sleep(TYPE_SETTLE_MS);
       el = (await findComposer()) || el;
       if (wantedFilled(el, text)) return el;
-      setLog(`Text did not stick in the chat box, typing again (${attempt}/4)…`, true);
-      await sleep(300);
+      setLog(`Text did not stick in the chat box, typing again (${attempt}/4)...`, true);
     }
     return el;
   }
