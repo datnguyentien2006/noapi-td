@@ -27,7 +27,34 @@ export class Bridge {
     this.busy = new Map(); // site -> queued + running count
     this.toolHashes = new Map(); // site -> hash of the tool set the website chat already knows
     this.timings = []; // most recent completed requests, oldest first
+    this.stats = new Map(); // site -> lifetime counters (debug; see statsSummary)
     this.startedAt = Date.now();
+  }
+
+  // Per-site lifetime counters. Cheap to keep and the only way to see, from
+  // /health on a real site, whether the fast paths are actually used.
+  statsFor(site) {
+    const key = site || "any";
+    let s = this.stats.get(key);
+    if (!s) {
+      s = {
+        requests: 0,
+        completedByStop: 0,
+        completedByFallback: 0,
+        earlyReturn: 0,
+        resubmits: 0,
+        aborted: 0,
+        timeouts: 0,
+      };
+      this.stats.set(key, s);
+    }
+    return s;
+  }
+
+  statsSummary() {
+    const out = {};
+    for (const [site, s] of this.stats) out[site] = { ...s };
+    return out;
   }
 
   register(conn, info) {
@@ -84,6 +111,7 @@ export class Bridge {
       pending: this.listPending(),
       sites: this.sites(),
       timings: this.timingsSummary(),
+      stats: this.statsSummary(),
     };
   }
 
@@ -253,25 +281,29 @@ export class Bridge {
         return;
       }
       timer = setTimeout(() => {
-        this.cancel(id);
+        this.cancel(id, "timeout");
         record.reject(new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the website to answer.`));
       }, timeoutMs);
       if (signal) {
         onAbort = () => {
-          this.cancel(id);
+          this.cancel(id, "abort");
           record.reject(new Error("Request cancelled."));
         };
         if (signal.aborted) onAbort();
         else signal.addEventListener("abort", onAbort, { once: true });
       }
       this.log(`request ${id} -> ${delivered} client(s) (site: ${record.site || "any"})`);
+      this.statsFor(record.site).requests += 1;
     });
   }
 
   // Tell the browser to stop generating / forget this request.
-  cancel(id) {
+  cancel(id, reason = "abort") {
     const record = this.pending.get(id);
     if (!record) return;
+    const stats = this.statsFor(record.site);
+    if (reason === "timeout") stats.timeouts += 1;
+    else stats.aborted += 1;
     const msg = JSON.stringify({ t: "cancel", id });
     for (const conn of record.conns || []) {
       try {
@@ -330,6 +362,11 @@ export class Bridge {
     }
     this.timings.push(entry);
     if (this.timings.length > MAX_TIMING_RECORDS) this.timings.shift();
+    const stats = this.statsFor(record.site);
+    if (entry.completedBy === "stop") stats.completedByStop += 1;
+    else if (entry.completedBy === "fallback") stats.completedByFallback += 1;
+    if (entry.earlyReturn) stats.earlyReturn += 1;
+    if (Number.isFinite(Number(entry.resubmits))) stats.resubmits += Number(entry.resubmits);
     const parts = TIMING_STAGES.filter((k) => entry[k] != null).map((k) => `${k}=${entry[k]}ms`);
     this.log(
       `timing ${record.site || "any"}: total=${entry.total}ms${parts.length ? " " + parts.join(" ") : ""}` +

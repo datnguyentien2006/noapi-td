@@ -1133,10 +1133,17 @@
         } catch {}
         observer = null;
       };
-      const finish = (text) => {
+      const finish = (text, completedBy) => {
         if (done) return;
         done = true;
         cleanup();
+        if (timings) {
+          timings.resubmits = resubmits;
+          // How this turn ended: the stop button disappearing ("stop"), the
+          // stable-text fallback ("fallback"), or the early tool return
+          // ("early"). /health keeps a per-site counter for each.
+          timings.completedBy = completedBy || (stopSeen ? "stop" : "fallback");
+        }
         resolve(text);
       };
       const fail = (err) => {
@@ -1324,7 +1331,7 @@
               if (after && toolBlockCount(after, toolNames) > toolBlockCount(lastText, toolNames)) finalText = after;
             }
             setLog(`✓ ${SITE.name} returned a complete tool call — stopping generation.`);
-            finish(finalText);
+            finish(finalText, "early");
             return;
           }
 

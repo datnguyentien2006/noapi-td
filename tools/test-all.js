@@ -297,6 +297,20 @@ async function run() {
   }
   console.log("   ✓ /health reports earlyReturn for the tool request");
 
+  const counters = health4.data?.stats?.chatgpt;
+  if (!counters || counters.requests < 1) {
+    throw new Error(`/health is missing per-site counters: ${JSON.stringify(health4.data?.stats)}`);
+  }
+  if (counters.completedByStop < 1) {
+    throw new Error(`stop-button completions were not counted: ${JSON.stringify(counters)}`);
+  }
+  if (counters.earlyReturn < 1) {
+    throw new Error(`early returns were not counted: ${JSON.stringify(counters)}`);
+  }
+  console.log(
+    `   ✓ /health counters: requests=${counters.requests} stop=${counters.completedByStop} fallback=${counters.completedByFallback} early=${counters.earlyReturn} resubmits=${counters.resubmits} aborted=${counters.aborted}`
+  );
+
   // Step 4f: NOAPI_STREAM=0 restores the old "emit once at the end" behaviour.
   console.log("4f. Testing the streaming kill switch...");
   {

@@ -104,6 +104,9 @@ async function render() {
     const timingRows = Object.entries(t.bySite || {}).map(([site, v]) =>
       \`<tr><td>\${site}</td><td>\${v.avg.count}</td><td>\${fmt(v.last.total)}</td><td>\${fmt(v.last.composer)}</td><td>\${fmt(v.last.typed)}</td><td>\${fmt(v.last.sent)}</td><td>\${fmt(v.last.firstText)}</td><td>\${fmt(v.last.complete)}</td><td>\${fmt(v.avg.total)}</td></tr>\`
     ).join("") || '<tr><td colspan="9">no completed requests yet</td></tr>';
+    const statRows = Object.entries(s.stats || {}).map(([site, v]) =>
+      \`<tr><td>\${site}</td><td>\${v.requests}</td><td>\${v.completedByStop}</td><td>\${v.completedByFallback}</td><td>\${v.earlyReturn}</td><td>\${v.resubmits}</td><td>\${v.aborted}</td><td>\${v.timeouts}</td></tr>\`
+    ).join("") || '<tr><td colspan="8">no requests yet</td></tr>';
     el.innerHTML = \`
       <h2>browser clients</h2>
       <table><tr><th>id</th><th>site</th><th>url</th></tr>\${clientRows}</table>
@@ -111,6 +114,8 @@ async function render() {
       <table><tr><th>id</th><th>site</th><th>chars</th><th>waiting</th></tr>\${pendingRows}</table>
       <h2>timings (last request per site, and average)</h2>
       <table><tr><th>site</th><th>n</th><th>total</th><th>composer</th><th>typed</th><th>sent</th><th>first&nbsp;text</th><th>complete</th><th>avg&nbsp;total</th></tr>\${timingRows}</table>
+      <h2>debug counters (per site, since start)</h2>
+      <table><tr><th>site</th><th>requests</th><th>by stop</th><th>by fallback</th><th>early</th><th>resubmits</th><th>aborted</th><th>timeouts</th></tr>\${statRows}</table>
       <h2>models</h2>
       <table><tr><th>id</th><th>name</th><th>status</th></tr>\${siteRows}</table>\`;
   } catch (e) {

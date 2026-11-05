@@ -156,6 +156,44 @@ const outcome = (p) => p.then((text) => ({ text }), (err) => ({ err: err.message
   await Promise.all([p1, p2, p3]);
 }
 
+// ---- per-site debug counters (/health) -----------------------------------
+{
+  const b = new Bridge();
+  const conn = makeConn();
+  b.register(conn, { site: "stats-site" });
+
+  const done = outcome(b.requestPrompt({ prompt: "hi", site: "stats-site", timeoutMs: 5000 }));
+  await sleep(10);
+  const id = b.listPending()[0].id;
+  b.respond(conn, id, "answer", { completedBy: "stop", earlyReturn: true, resubmits: 2 });
+  await done;
+
+  const fallbackDone = outcome(b.requestPrompt({ prompt: "hi", site: "stats-site", timeoutMs: 5000 }));
+  await sleep(10);
+  const id2 = b.listPending()[0].id;
+  b.respond(conn, id2, "answer", { completedBy: "fallback", resubmits: 1 });
+  await fallbackDone;
+
+  const ac = new AbortController();
+  const aborted = outcome(b.requestPrompt({ prompt: "hi", site: "stats-site", signal: ac.signal, timeoutMs: 5000 }));
+  await sleep(10);
+  ac.abort();
+  await aborted;
+
+  const timedOut = outcome(b.requestPrompt({ prompt: "hi", site: "stats-site", timeoutMs: 40 }));
+  await timedOut;
+
+  const s = b.status().stats["stats-site"];
+  ok("stats: dispatch count", s.requests === 4, JSON.stringify(s));
+  ok("stats: stop-button completions counted", s.completedByStop === 1, JSON.stringify(s));
+  ok("stats: fallback completions counted", s.completedByFallback === 1, JSON.stringify(s));
+  ok("stats: early returns counted", s.earlyReturn === 1, JSON.stringify(s));
+  ok("stats: resubmits summed", s.resubmits === 3, JSON.stringify(s));
+  ok("stats: client aborts counted", s.aborted === 1, JSON.stringify(s));
+  ok("stats: timeouts counted", s.timeouts === 1, JSON.stringify(s));
+  ok("stats: exposed by status() for /health", Boolean(b.status().stats["stats-site"]));
+}
+
 if (failed) {
   console.error(`\n${failed} test(s) failed`);
   process.exit(1);

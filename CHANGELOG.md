@@ -16,6 +16,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `NOAPI_DESC_MAX` and `NOAPI_PARAM_DESC_MAX` override the 400-character description caps for priority tools
 - `NOAPI_STREAM=0` disables live content deltas and emits the reply once at the end
 - A unit test suite for the streaming safety filter: plain text, prose then a block, a block at the start, the marker and fence split across updates, ordinary fenced code, a block at the very end, `TOOL_CALL` in prose, and tools disabled
+- Per-site debug counters in `/health` and on the dashboard: requests, completions by stop button vs by the 2200 ms fallback, early returns, resubmits, aborted streams and timeouts
+- `docs/REVIEW-latency.md`: a self-review of the completion-detection, early-return and streaming changes (failure modes, selectors, constants, and the switch/fallback that covers each)
 
 ### Changed
 
