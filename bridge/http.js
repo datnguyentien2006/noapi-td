@@ -8,6 +8,7 @@ import http from "node:http";
 import { SITES, SITE_KEYS } from "./sites.js";
 import { requestAllowed } from "./security.js";
 import { buildPrompt, parseToolCalls, toolList, toolsHash, isTitleRequest, localTitle } from "./toolproto.js";
+import { StreamFilter, streamEnabled } from "./streamfilter.js";
 
 function readBody(req, limit = 5 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
@@ -272,58 +273,28 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
           if (!res.writableEnded) res.write(": keepalive\n\n");
         }, 10_000);
 
-        // Stream the growing reply as content deltas. A reply that might contain
-        // a TOOL_CALL is never streamed as content: showing the raw protocol to
-        // the user is wrong, and a half-written call could corrupt the turn. In
-        // that case the text is buffered and emitted as real tool_calls at the
-        // end (the final `response` is always authoritative).
-        //
-        // STREAM_HOLDBACK covers "```" + newline + "TOOL_CALL", so the opening
-        // fence of a tool block can never be sent before the marker is seen.
-        const TOOL_MARKER = "TOOL_CALL";
-        const STREAM_HOLDBACK = TOOL_MARKER.length + 8;
-        const STREAM_DECIDE_CHARS = 32;
-        let mode = "undecided"; // undecided -> text | tool
-        let consumed = 0; // characters of the streamed text already accounted for
-        let emitted = ""; // content already sent to the client
+        // Stream the growing reply as content deltas, but never the tool
+        // protocol: StreamFilter holds back anything that could still become a
+        // TOOL_CALL block (or the parser's bare-JSON fallback) and streams
+        // everything else, including ordinary fenced code. NOAPI_STREAM=0
+        // restores the old "emit once at the end" behaviour.
+        const filter = streamEnabled() ? new StreamFilter({ tools }) : null;
         const emit = (part) => {
           if (!part || res.writableEnded) return;
           chunk({ content: part });
-          emitted += part;
         };
         const onPartial = (full) => {
-          if (res.writableEnded || mode === "tool" || typeof full !== "string") return;
-          if (full.includes(TOOL_MARKER)) {
-            mode = "tool";
-            return;
-          }
-          if (mode === "undecided") {
-            if (full.length < STREAM_DECIDE_CHARS) return;
-            mode = "text";
-          }
-          const safeLen = Math.max(0, full.length - STREAM_HOLDBACK);
-          if (safeLen <= consumed) return;
-          let part = full.slice(consumed, safeLen);
-          consumed = safeLen;
-          if (!emitted) part = part.replace(/^\s+/, "");
-          emit(part);
+          if (res.writableEnded || !filter) return;
+          emit(filter.push(full));
         };
 
         try {
           const reply = await ask((status) => think(status), onPartial);
           if (res.writableEnded) return;
           const { calls, text } = finish(reply);
-          if (calls.length || mode === "tool") {
-            // Never streamed: emit the narration that came with the call, but
-            // only the part that was not already sent.
-            if (text && text.startsWith(emitted)) emit(text.slice(emitted.length));
-          } else if (text && text.startsWith(emitted)) {
-            emit(text.slice(emitted.length));
-          } else if (text && !emitted) {
-            emit(text);
-          }
-          // (If a streamed prefix differs from the cleaned text by whitespace
-          // normalization only, keep what the client already received.)
+          // `text` is the cleaned reply (tool blocks removed). send only what
+          // was not already streamed, so nothing is shown twice.
+          emit(filter ? filter.finish(text) : text);
           if (calls.length) {
             chunk({
               tool_calls: calls.map((c, index) => ({

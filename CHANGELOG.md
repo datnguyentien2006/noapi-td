@@ -14,6 +14,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Tests for the browser error and cancel paths (mid-stream error, Esc mid-stream) and unit tests for the bridge request queue (timeout, abort, progress, partial, timings)
 - `NOAPI_EARLY_RETURN=0` disables the early return on a tool call and the stop click, falling back to normal completion detection
 - `NOAPI_DESC_MAX` and `NOAPI_PARAM_DESC_MAX` override the 400-character description caps for priority tools
+- `NOAPI_STREAM=0` disables live content deltas and emits the reply once at the end
+- A unit test suite for the streaming safety filter: plain text, prose then a block, a block at the start, the marker and fence split across updates, ordinary fenced code, a block at the very end, `TOOL_CALL` in prose, and tools disabled
 
 ### Changed
 

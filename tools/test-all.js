@@ -297,6 +297,35 @@ async function run() {
   }
   console.log("   ✓ /health reports earlyReturn for the tool request");
 
+  // Step 4f: NOAPI_STREAM=0 restores the old "emit once at the end" behaviour.
+  console.log("4f. Testing the streaming kill switch...");
+  {
+    const { port: nsPort, proc: nsBridge } = await startBridge({ env: { NOAPI_STREAM: "0" } });
+    const nsFake = startFake({
+      port: nsPort,
+      site: "chatgpt",
+      env: { NOAPI_FAKE_FIRST_MS: "200", NOAPI_FAKE_STREAM_CHUNKS: "4", NOAPI_FAKE_STREAM_STEP_MS: "40" },
+    });
+    await waitForHealth(nsPort, { clients: true });
+    const nsResp = await fetch(`http://127.0.0.1:${nsPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "chatgpt", messages: [{ role: "user", content: "stream please" }], stream: true }),
+    });
+    const nsEvents = sseEvents(await nsResp.text());
+    const nsDeltas = nsEvents.map((e) => e.choices?.[0]?.delta?.content).filter((c) => typeof c === "string" && c);
+    if (nsDeltas.length !== 1) {
+      throw new Error(`NOAPI_STREAM=0 should emit one content chunk, got ${nsDeltas.length}`);
+    }
+    if (!nsDeltas[0].includes("[fake chatgpt]")) {
+      throw new Error(`NOAPI_STREAM=0 lost the reply: ${JSON.stringify(nsDeltas)}`);
+    }
+    nsBridge.kill();
+    nsFake.kill();
+    await sleep(300);
+  }
+  console.log("   ✓ NOAPI_STREAM=0 emits the reply once at the end");
+
   // Step 5: Test MCP in PROXY mode (bridge is running on the test port)
   console.log("5. Testing MCP stdio in proxy mode (forwarding to running bridge)...");
   const mcpProxy = spawnProxy(PORT);

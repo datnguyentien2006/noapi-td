@@ -295,6 +295,7 @@ node bridge/index.js [--mcp] [--port=8787] [--host=127.0.0.1]
 | `NOAPI_MAX_TOOL_RESULT` | `16000` | Characters of a tool result sent back to the site (head + tail). Truncation always says how much was cut. |
 | `NOAPI_DESC_MAX` | `400` | Description cap for priority tools (edit, write, bash, read, patch-like, or any tool with an `oldString`/`newString`/`replace` parameter). Other tools stay at 180. |
 | `NOAPI_PARAM_DESC_MAX` | `400` | Parameter-description cap for those same priority tools. Other tools stay at 90. |
+| `NOAPI_STREAM` | on | Set to `0` to stop streaming live deltas and emit the reply once at the end (the old behaviour). |
 
 The MCP server offers three tools: `chat` (ask a site), `status` and `sites`.
 
@@ -360,6 +361,7 @@ NOAPI/
 │   ├── lib/harness.js      Ephemeral-port test harness
 │   ├── test-content-logic.js  Unit tests for the pure content-script logic
 │   ├── test-toolproto.js   Unit tests for the TOOL_CALL protocol
+│   ├── test-streamfilter.js  Unit tests for the streaming safety filter
 │   ├── test-bridge-state.js  Unit tests for the bridge request queue
 │   ├── test-isolation.js   Checks tests never touch the default port
 │   └── test-tools.js       Tool call round trip test
