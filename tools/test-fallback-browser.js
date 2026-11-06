@@ -62,7 +62,31 @@ const STUB = `(() => {
     onMessage: { addListener(fn) { api.runtimeListeners.push(fn); } },
   };
   runtime.getURL = (p) => p;
-  globalThis.chrome = { runtime };
+  // Feature-flag storage, seeded per case from globalThis.__FAKE_FLAGS. The
+  // content script reads it at load (promise form) to toggle the fast paths.
+  const store = {};
+  const storage = {
+    local: {
+      get(keys, cb) {
+        const list = typeof keys === "string" ? [keys] : Array.isArray(keys) ? keys : Object.keys(store);
+        const out = {};
+        for (const k of list) {
+          if (globalThis.__FAKE_FLAGS && k in globalThis.__FAKE_FLAGS) out[k] = globalThis.__FAKE_FLAGS[k];
+          else if (k in store) out[k] = store[k];
+        }
+        const p = Promise.resolve(out);
+        if (typeof cb === "function") { p.then(cb); return; }
+        return p;
+      },
+      set(patch, cb) {
+        Object.assign(store, patch);
+        const p = Promise.resolve();
+        if (typeof cb === "function") { p.then(cb); return; }
+        return p;
+      },
+    },
+  };
+  globalThis.chrome = { runtime, storage };
   // Deliver a prompt exactly the way the background worker would, over the port.
   api.autosend = function (prompt, opts) {
     const msg = Object.assign({ type: "noapi_autosend", prompt: prompt, id: "req-" + Date.now() }, opts || {});
@@ -123,6 +147,10 @@ function fakeHtml(cfg) {
       if (window.__fakeClickedAt == null) window.__fakeClickedAt = performance.now();
       window.__fakeSent = true;
       composer.innerHTML = "";
+      const turn = (window.__fakeTurn = (window.__fakeTurn || 0) + 1);
+      // In multiTurn mode each turn answers with its own text, so returning the
+      // previous reply (or the old answer) is detectable.
+      const text = cfg.multiTurn ? cfg.replyText + " (turn " + turn + ")" : cfg.replyText;
       if (cfg.fetchStream) {
         // Phase 3: the page answers over its own fetch + text/event-stream. The
         // MAIN-world observer must see it without breaking this read - every
@@ -142,6 +170,13 @@ function fakeHtml(cfg) {
             if (done) break;
             window.__fakeStreamChunks++;
             p.textContent += dec.decode(value, { stream: true });
+          }
+          // streamLateDomMs: the final DOM paint lands some time AFTER the
+          // stream closed, which must not truncate the reply.
+          if (cfg.streamLateDomMs != null) {
+            await sleep(cfg.streamLateDomMs);
+            p.textContent = text;
+            window.__fakeLatePaint = true;
           }
           window.__fakeStreamDone = true;
         } catch (e) {
@@ -168,10 +203,10 @@ function fakeHtml(cfg) {
       // model that thinks first and then streams actually behaves.
       const chunks = cfg.chunks || 1;
       for (let i = 0; i < chunks; i++) {
-        p.textContent = cfg.replyText.slice(0, Math.round((cfg.replyText.length * (i + 1)) / chunks));
+        p.textContent = text.slice(0, Math.round((text.length * (i + 1)) / chunks));
         await sleep(cfg.chunkMs || 0);
       }
-      p.textContent = cfg.replyText;
+      p.textContent = text;
       if (cfg.showStop) stop.style.display = "none";
     });
   </script>
@@ -180,9 +215,10 @@ function fakeHtml(cfg) {
 
 const PROMPT = "Please answer this question for the regression test.";
 
-async function runCase(browser, name, cfg, { maxMs = 20000, expect } = {}) {
+async function runCase(browser, name, cfg, { maxMs = 20000, expect, flags = null } = {}) {
   const context = await browser.newContext();
   try {
+    if (flags) await context.addInitScript((f) => { globalThis.__FAKE_FLAGS = f; }, flags);
     await context.addInitScript({ content: STUB });
     const page = await context.newPage();
     const pageErrors = [];
@@ -190,9 +226,13 @@ async function runCase(browser, name, cfg, { maxMs = 20000, expect } = {}) {
     await page.route("https://chatgpt.com/**", (route) => {
       const u = route.request().url();
       if (u.includes("/fake-stream")) {
+        const full = cfg.replyText || "";
+        // With streamLateDomMs the stream only carries the first half; the page
+        // paints the rest after the stream closes.
+        const shown = cfg.streamLateDomMs != null ? full.slice(0, Math.ceil(full.length / 2)) : full;
         const body =
-          `data: ${JSON.stringify({ delta: (cfg.replyText || "").slice(0, 24) })}\n\n` +
-          `data: ${JSON.stringify({ delta: (cfg.replyText || "").slice(24) })}\n\n` +
+          `data: ${JSON.stringify({ delta: shown.slice(0, 24) })}\n\n` +
+          `data: ${JSON.stringify({ delta: shown.slice(24) })}\n\n` +
           "data: [DONE]\n\n";
         return route.fulfill({ contentType: "text/event-stream", body });
       }
@@ -228,6 +268,8 @@ async function runCase(browser, name, cfg, { maxMs = 20000, expect } = {}) {
         streamChunks: globalThis.__fakeStreamChunks ?? null,
         streamDone: globalThis.__fakeStreamDone ?? false,
         streamError: globalThis.__fakeStreamError ?? null,
+        latePaint: globalThis.__fakeLatePaint ?? false,
+        turn: globalThis.__fakeTurn ?? 0,
         completedBy: (globalThis.__noapi?.reply?.timings?.completedBy) ?? null,
         sseSeen: (globalThis.__noapi?.reply?.timings?.sseSeen) ?? null,
       }))
@@ -235,6 +277,51 @@ async function runCase(browser, name, cfg, { maxMs = 20000, expect } = {}) {
     const res = expect(text, elapsed, pageErrors, state);
     ok(name, res.pass, res.why || "");
     return { text, elapsed };
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
+// Three turns in the same chat, each with its own answer: the previous reply
+// (or the old answer already on the page) must never come back.
+async function runMultiTurn(browser) {
+  const context = await browser.newContext();
+  try {
+    await context.addInitScript({ content: STUB });
+    const page = await context.newPage();
+    const pageErrors = [];
+    page.on("pageerror", (e) => pageErrors.push(String(e && e.message ? e.message : e)));
+    const cfg = {
+      oldAnswerHtml: '<div data-message-author-role="assistant"><p>OLD ANSWER: must never come back.</p></div>',
+      multiTurn: true,
+      replyDelayMs: 200,
+      chunks: 4,
+      chunkMs: 30,
+      showStop: true,
+      replyAttrs: { "data-message-author-role": "assistant" },
+      replyText: "REPLY-T",
+    };
+    await page.route("https://chatgpt.com/**", (route) => route.fulfill({ contentType: "text/html", body: fakeHtml(cfg) }));
+    await page.goto("https://chatgpt.com/c/multi");
+    await page.addScriptTag({ content: OBSERVER });
+    await page.addScriptTag({ content: CONTENT });
+    await page.waitForFunction(() => globalThis.__noapi && globalThis.__noapi.portListeners.length > 0, null, { timeout: 5000 });
+    const replies = [];
+    let seen = 0;
+    for (let turn = 1; turn <= 3; turn++) {
+      await page.evaluate((p) => globalThis.__noapi.autosend(p), "question " + turn);
+      await page.waitForFunction((n) => globalThis.__noapi.sent.filter((m) => m.type === "noapi_reply").length > n, seen, { timeout: 15000, polling: 100 });
+      const all = await page.evaluate(() => globalThis.__noapi.sent.filter((m) => m.type === "noapi_reply").map((m) => m.text || ""));
+      seen = all.length;
+      replies.push(all[all.length - 1] || "");
+    }
+    const unique = new Set(replies).size === 3;
+    const eachOwn = replies.every((t, i) => t.includes("turn " + (i + 1)) && !t.includes("OLD ANSWER"));
+    ok(
+      "(j) a second and third turn never return the previous reply",
+      replies.length === 3 && unique && eachOwn,
+      `replies=${JSON.stringify(replies.map((r) => r.slice(0, 44)))} pageErrors=${pageErrors.join("; ")}`
+    );
   } finally {
     await context.close().catch(() => {});
   }
@@ -390,6 +477,85 @@ try {
       },
     }
   );
+
+  // (g) The SSE stream closes BEFORE the site paints its final tokens. Finishing
+  //     on the end signal must first re-read the DOM, so the reply is complete.
+  await runCase(
+    browser,
+    "(g) a final DOM paint after the stream closes is not truncated",
+    {
+      fetchStream: true,
+      streamLateDomMs: 60,
+      replyText: "REPLY-G: the whole answer survives a late repaint.",
+    },
+    {
+      maxMs: 10000,
+      expect: (text, elapsed, _pageErrors, state) => {
+        const s = state || {};
+        return {
+          pass: s.streamDone === true && s.latePaint === true && text.includes("REPLY-G: the whole answer survives a late repaint."),
+          why: `elapsed=${elapsed}ms latePaint=${s.latePaint} done=${s.streamDone} completedBy=${s.completedBy} text="${text.slice(0, 70)}"`,
+        };
+      },
+    }
+  );
+
+  // (h) The send button enables only after the eager gate's timeout. The gate
+  //     gives up, the submit poll then finds the button: exactly ONE send.
+  await runCase(
+    browser,
+    "(h) the eager gate timing out still sends exactly once",
+    {
+      sendEnableAfterMs: 1500,
+      replyDelayMs: 300,
+      chunks: 3,
+      chunkMs: 40,
+      showStop: true,
+      replyAttrs: { "data-message-author-role": "assistant" },
+      replyText: "REPLY-H: one send after the eager gate gave up.",
+    },
+    {
+      maxMs: 14000,
+      expect: (text, elapsed, _pageErrors, state) => {
+        const s = state || {};
+        return {
+          pass: text.includes("REPLY-H") && s.clicks === 1,
+          why: `elapsed=${elapsed}ms clicks=${s.clicks} enabledAt=${s.enabledAt} clickedAt=${s.clickedAt} completedBy=${s.completedBy}`,
+        };
+      },
+    }
+  );
+
+  // (i) Every content-script fast path flipped off must restore the old DOM path
+  //     (fixed settle before send, interval-driven loop, no SSE signal).
+  await runCase(
+    browser,
+    "(i) flipping the fast paths off restores the old path",
+    {
+      sendEnableAfterMs: 0,
+      replyDelayMs: 400,
+      chunks: 3,
+      chunkMs: 40,
+      showStop: true,
+      replyAttrs: { "data-message-author-role": "assistant" },
+      replyText: "REPLY-I: the slow path still answers.",
+    },
+    {
+      maxMs: 14000,
+      flags: { eagerSend: false, observerDriven: false, sseObserver: false },
+      expect: (text, elapsed, _pageErrors, state) => {
+        const s = state || {};
+        const waited = s.enabledAt != null && s.clickedAt != null ? Math.round(s.clickedAt - s.enabledAt) : null;
+        return {
+          pass: text.includes("REPLY-I") && s.clicks === 1 && waited != null && waited >= 120 && s.completedBy !== "sse",
+          why: `elapsed=${elapsed}ms clicks=${s.clicks} waited=${waited}ms completedBy=${s.completedBy}`,
+        };
+      },
+    }
+  );
+
+  // (j) Three turns in one chat; none may return a previous reply.
+  await runMultiTurn(browser);
 } finally {
   await browser.close().catch(() => {});
 }

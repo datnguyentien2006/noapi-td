@@ -1276,6 +1276,10 @@
   const EARLY_RETURN_HARD_CAP_MS = 1500;
   // One re-read after clicking stop, to catch a block that was mid-write.
   const EARLY_RETURN_REREAD_MS = 120;
+  // One re-read after the page's SSE stream closes, to catch a final DOM paint
+  // that lands just after the stream ends (the site decodes the last chunk and
+  // repaints a frame later). Without it the turn could return a truncated reply.
+  const SSE_END_REREAD_MS = 120;
   // How often the still-growing reply is forwarded to OpenCode while it streams.
   const PARTIAL_THROTTLE_MS = 150;
 
@@ -1732,9 +1736,25 @@
           // short while the site is visibly still generating. An "error" event
           // never reaches here (sseDecision only returns "ended" for a clean end).
           if (sseState === "ended" && !generating) {
-            const nodes = replyNodes();
-            const text = (nodes.length ? extractText(nodes[nodes.length - 1]) : "") || lastText;
+            const readNow = () => {
+              const nodes = replyNodes();
+              return (nodes.length ? extractText(nodes[nodes.length - 1]) : "") || lastText;
+            };
+            let text = readNow();
             if (text && text.length >= 5) {
+              // The site may paint the last tokens just after the stream closes.
+              // Re-read once after a short grace and keep the longer text, so a
+              // late DOM update can never be lost (reply truncated).
+              await sleep(SSE_END_REREAD_MS);
+              if (state.cancel) {
+                fail(new Error("Cancelled."));
+                return;
+              }
+              const after = readNow();
+              // The latest non-trivial read wins, not the longest: the page's
+              // final paint is the authoritative text (an intermediate read may
+              // be a longer raw stream body with markers still in it).
+              if (after && after.length >= 5) text = after;
               setLog(`✓ ${SITE.name} stream ended (${text.length} chars).`);
               finish(text, "sse");
               return;

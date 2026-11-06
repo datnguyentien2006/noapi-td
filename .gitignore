@@ -1,2 +1,5 @@
 # Local A/B run captures (see tools/ab-report.js)
 ab-results/
+
+# Node modules (dependencies are installed locally, never committed)
+node_modules/
