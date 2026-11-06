@@ -12,6 +12,7 @@ import {
   isPriorityTool,
   descMax,
   paramDescMax,
+  terseEnabled,
 } from "../bridge/toolproto.js";
 
 let failed = 0;
@@ -176,6 +177,32 @@ delete process.env.NOAPI_DESC_MAX;
 delete process.env.NOAPI_PARAM_DESC_MAX;
 const shortTool = { type: "function", function: { name: "bash", description: SHORT_OK, parameters: { type: "object", properties: {} } } };
 ok("a description under the cap is left alone", renderPreamble([shortTool], []).includes(`* bash: ${SHORT_OK}`));
+
+// ---- Phase 4: terse mode --------------------------------------------------
+ok("terse mode is on by default", terseEnabled() === true);
+const tersePre = renderPreamble([tool()], []);
+ok("terse: no prose around tool calls", /NOTHING but the blocks/i.test(tersePre));
+ok("terse: concise final answers", /final answer terse/i.test(tersePre));
+
+process.env.NOAPI_TERSE = "0";
+ok("NOAPI_TERSE=0 disables terse mode", terseEnabled() === false);
+const chattyPre = renderPreamble([tool()], []);
+ok(
+  "non-terse: the terse rules are gone",
+  !/NOTHING but the blocks/i.test(chattyPre) && !/final answer terse/i.test(chattyPre)
+);
+delete process.env.NOAPI_TERSE;
+
+// The full tool semantics must survive in BOTH modes; only the verbosity changes.
+for (const [label, p] of [
+  ["terse", tersePre],
+  ["non-terse", chattyPre],
+]) {
+  ok(`${label}: still teaches the TOOL_CALL format`, p.includes("TOOL_CALL") && /FORMAT/.test(p) && /arguments as JSON/.test(p));
+  ok(`${label}: still lists the tool and its required args`, p.includes("* bash:") && p.includes("command (required)"));
+  ok(`${label}: still teaches batching and STOP`, /batch/i.test(p) && /ONE reply/i.test(p) && /STOP writing/.test(p));
+  ok(`${label}: still ends with the AVAILABLE TOOLS section`, /AVAILABLE TOOLS:/.test(p));
+}
 
 // ---- parsing is unaffected ---------------------------------------------
 const twoCalls = [

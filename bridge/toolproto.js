@@ -174,10 +174,32 @@ function envHints(messages) {
   return out;
 }
 
-export function renderPreamble(tools, messages) {
+// Terse mode (Phase 4) asks the model for shorter output: no prose between tool
+// calls and concise final answers. It is most of the remaining wall-clock time
+// on a real site, because the answer is generated token by token. NOAPI_TERSE=0
+// restores the original wording; the tool semantics are identical either way.
+export function terseEnabled() {
+  return process.env.NOAPI_TERSE !== "0";
+}
+
+export function renderPreamble(tools, messages, { terse = terseEnabled() } = {}) {
   const fns = toolList(tools);
   const hints = envHints(messages);
   const examples = fns.slice(0, 3).map(exampleBlock);
+  const rules = [
+    "1. Batch every independent call into the same reply: several TOOL_CALL blocks back to back, with no text between them.",
+    "2. Prefer grep/glob to locate things and read only the files you need, instead of reading files one by one across many turns.",
+    "3. Use only the tools listed below and give every required argument.",
+    "4. After the TOOL_CALL block(s) STOP writing. Do not guess the result. The agent runs the tools and replies with TOOL_RESULT messages.",
+    "5. When the task is finished, or no tool is needed, answer normally in plain text WITHOUT any TOOL_CALL block.",
+    "6. Keep text outside TOOL_CALL blocks short. Do not narrate between tool calls and do not repeat these instructions.",
+  ];
+  if (terse) {
+    rules.push(
+      "7. Between and around TOOL_CALL blocks output NOTHING but the blocks themselves - no prose, no headings, no commentary before or after them.",
+      "8. Keep the final answer terse: state the result and stop. No preamble, no restating the request, no offers of further help."
+    );
+  }
   return [
     "You are being used as the brain of OpenCode, a coding agent that runs on the user's computer.",
     "You cannot run anything yourself in this chat, BUT the agent can run tools for you: when you need to act (create files or folders, run commands, read or edit files, search...), request a tool call using the exact format below. Never say that you are unable to access the computer or the file system - request the tool instead.",
@@ -193,12 +215,7 @@ export function renderPreamble(tools, messages) {
     ...examples,
     "",
     "RULES:",
-    "1. Batch every independent call into the same reply: several TOOL_CALL blocks back to back, with no text between them.",
-    "2. Prefer grep/glob to locate things and read only the files you need, instead of reading files one by one across many turns.",
-    "3. Use only the tools listed below and give every required argument.",
-    "4. After the TOOL_CALL block(s) STOP writing. Do not guess the result. The agent runs the tools and replies with TOOL_RESULT messages.",
-    "5. When the task is finished, or no tool is needed, answer normally in plain text WITHOUT any TOOL_CALL block.",
-    "6. Keep text outside TOOL_CALL blocks short. Do not narrate between tool calls and do not repeat these instructions.",
+    ...rules,
     ...(hints.length ? ["", ...hints] : []),
     "",
     "AVAILABLE TOOLS:",
