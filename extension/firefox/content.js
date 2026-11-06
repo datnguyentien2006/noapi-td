@@ -1124,6 +1124,10 @@
   // timeout / stop-button checks still need a periodic wake-up.
   const FALLBACK_STABLE_MS = 2200;
   const FALLBACK_TICK_MS = 400;
+  // Kill switch for the event-driven loop: set to false to go back to the old
+  // interval-only behaviour (the observer then only marks the DOM dirty and the
+  // 400ms fallback interval drives every tick).
+  const OBSERVER_DRIVEN = true;
   const EXTRACT_THROTTLE_MS = 120;
   const UNSEEN_MUTATION_MS = 1000;
   const STALL_LOG_MS = 20_000;
@@ -1431,7 +1435,7 @@
       try {
         observer = new MutationObserver(() => {
           dirty = true;
-          scheduler?.schedule();
+          if (OBSERVER_DRIVEN) scheduler?.schedule();
         });
         observer.observe(scope || document.body, { subtree: true, childList: true, characterData: true });
       } catch {}
