@@ -216,6 +216,29 @@ const outcome = (p) => p.then((text) => ({ text }), (err) => ({ err: err.message
   ok("stats: exposed by status() for /health", Boolean(b.status().stats["stats-site"]));
 }
 
+// ---- timing retention (for the A/B report) --------------------------------
+{
+  const b = new Bridge();
+  for (let i = 0; i < 60; i++) {
+    b.recordTiming({ id: "a" + i, site: "site-a", startedAt: Date.now() - (100 + i) }, { firstText: i + 1, complete: i + 2, completedBy: "sse", sseSeen: true });
+  }
+  for (let i = 0; i < 10; i++) {
+    b.recordTiming({ id: "b" + i, site: "site-b", startedAt: Date.now() - 50 }, { firstText: 1, complete: 2, completedBy: "stop-button" });
+  }
+  const sum = b.timingsSummary();
+  ok(
+    "keeps at least 50 recent records per site",
+    sum.bySite["site-a"].recent.length === 50 && sum.bySite["site-b"].recent.length === 10,
+    JSON.stringify({ a: sum.bySite["site-a"].recent.length, b: sum.bySite["site-b"].recent.length })
+  );
+  ok("trimming one site keeps another site's records", sum.bySite["site-b"].recent.length === 10);
+  ok("the oldest record of a site is dropped first", sum.bySite["site-a"].recent[0].id === "a10", String(sum.bySite["site-a"].recent[0].id));
+  ok("per-site recent records are exposed by /health", Array.isArray(sum.bySite["site-a"].recent));
+  // A flood of distinct site names must not grow memory without bound.
+  for (let i = 0; i < 600; i++) b.recordTiming({ id: "x" + i, site: "flood-" + i, startedAt: Date.now() }, { total: 1 });
+  ok("overall record count stays bounded", b.timings.length <= 500, String(b.timings.length));
+}
+
 if (failed) {
   console.error(`\n${failed} test(s) failed`);
   process.exit(1);

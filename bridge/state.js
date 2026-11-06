@@ -1,6 +1,10 @@
 import { SITES, siteUrl } from "./sites.js";
 
-const MAX_TIMING_RECORDS = 20;
+// Recent per-request timings kept for /health and the A/B report. Keep at least
+// 50 per site so a real-site A/B run has enough samples, with a hard total cap
+// so memory cannot grow without bound (sites x 50, plus slack).
+const MAX_TIMING_RECORDS_PER_SITE = 50;
+const MAX_TIMING_RECORDS_TOTAL = 500;
 // Keys that make up one timing record, in the order they happen. Kept here so
 // the bridge log, /health and the dashboard all agree on the same stage names.
 const TIMING_STAGES = ["composer", "typed", "sent", "firstText", "complete"];
@@ -124,7 +128,7 @@ export class Bridge {
     const bySite = {};
     for (const site of new Set(this.timings.map((r) => r.site || "any"))) {
       const records = this.timings.filter((r) => (r.site || "any") === site);
-      bySite[site] = { avg: averageTimings(records), last: records[records.length - 1] };
+      bySite[site] = { avg: averageTimings(records), last: records[records.length - 1], recent: records };
     }
     return {
       stages: TIMING_STAGES,
@@ -375,7 +379,17 @@ export class Bridge {
       if (Number.isFinite(Number(timings.resubmits))) entry.resubmits = Number(timings.resubmits);
     }
     this.timings.push(entry);
-    if (this.timings.length > MAX_TIMING_RECORDS) this.timings.shift();
+    // Trim the oldest record of THIS site once it has more than the per-site
+    // cap, so every site keeps at least 50 recent requests; then enforce the
+    // overall cap so a spray of site names cannot grow memory without bound.
+    const siteKey = entry.site || "any";
+    let mine = 0;
+    for (const r of this.timings) if ((r.site || "any") === siteKey) mine++;
+    if (mine > MAX_TIMING_RECORDS_PER_SITE) {
+      const i = this.timings.findIndex((r) => (r.site || "any") === siteKey);
+      if (i !== -1) this.timings.splice(i, 1);
+    }
+    if (this.timings.length > MAX_TIMING_RECORDS_TOTAL) this.timings.shift();
     const stats = this.statsFor(record.site);
     if (entry.completedBy === "stop-button") stats.completedByStop += 1;
     else if (entry.completedBy === "fallback-2200") stats.completedByFallback += 1;
