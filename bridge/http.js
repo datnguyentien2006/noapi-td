@@ -8,7 +8,7 @@ import http from "node:http";
 import fs from "node:fs";
 import { SITES, SITE_KEYS } from "./sites.js";
 import { requestAllowed } from "./security.js";
-import { buildPrompt, parseToolCalls, toolList, toolsHash, isTitleRequest, localTitle } from "./toolproto.js";
+import { buildPrompt, parseToolCalls, toolList, toolsHash, isTitleRequest, localTitle, repairToolCall } from "./toolproto.js";
 import { autoreadReport } from "./consult.js";
 import { StreamFilter, streamEnabled } from "./streamfilter.js";
 import { tuningFromEnv, sseTextFromEnv } from "./tuning.js";
@@ -303,10 +303,35 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
                 tuning,
                 sseText,
               });
+        // NOAPI_TOOL_REPAIR (default ON): when a reply carries a TOOL_CALL marker
+        // but no valid block, send a short follow-up to the same chat and try
+        // again (max 2 per user turn) instead of handing the broken block to
+        // OpenCode. The follow-up is plain text: it must not repeat the preamble.
+        const repairEnabled = process.env.NOAPI_TOOL_REPAIR !== "0";
+        const askRepair = (repairPrompt) =>
+          bridge.requestPrompt({
+            prompt: repairPrompt,
+            site: model,
+            signal: abort.signal,
+            toolsEnabled: tools.length > 0,
+            earlyReturn,
+            earlyReturnMs,
+            toolNames,
+            sse,
+            newChat: false,
+            tuning,
+            sseText,
+          });
+        const askAndRepair = async (onProgress, onPartial) => {
+          const reply = await ask(onProgress, onPartial);
+          if (titleOnly) return reply;
+          const repaired = await repairToolCall({ reply, tools, ask: askRepair, log, enabled: repairEnabled });
+          return repaired.reply;
+        };
 
         if (!stream) {
           try {
-            const { calls, text } = finish(await ask());
+            const { calls, text } = finish(await askAndRepair());
             sendJson(res, 200, completionResponse(model, text, calls));
           } catch (err) {
             log(`chat completion failed: ${err.message}`);
@@ -364,7 +389,7 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         };
 
         try {
-          const reply = await ask((status) => think(status), onPartial);
+          const reply = await askAndRepair((status) => think(status), onPartial);
           if (res.writableEnded) return;
           const { calls, text } = finish(reply);
           // `text` is the cleaned reply (tool blocks removed). send only what

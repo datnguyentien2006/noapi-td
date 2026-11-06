@@ -11,6 +11,9 @@ import {
   promptBreakdown,
   renderPreamble,
   parseToolCalls,
+  toolRepairPrompt,
+  repairToolCall,
+  TOOL_REPAIR_MAX,
   isPriorityTool,
   descMax,
   paramDescMax,
@@ -307,6 +310,151 @@ ok("plain text parses as no calls", plain.calls.length === 0 && plain.text === "
     JSON.stringify(c)
   );
   ok("continuation: other covers the continue hint", c.other >= "Continue the task".length, JSON.stringify(c));
+}
+
+// ---- malformed / flattened TOOL_CALL blocks ------------------------------
+{
+  const shellTool = {
+    type: "function",
+    function: {
+      name: "shell",
+      description: "Run a shell command.",
+      parameters: {
+        type: "object",
+        properties: { command: { type: "string" }, workdir: { type: "string" } },
+        required: ["command"],
+      },
+    },
+  };
+  const tools = [shellTool];
+  const block = (json) => "```\nTOOL_CALL\n" + json + "\n```";
+
+  // A valid block is untouched.
+  const good = parseToolCalls(block('{"name":"shell","arguments":{"command":"echo hi","workdir":"."}}'), tools);
+  ok("valid block: one call", good.calls.length === 1, JSON.stringify(good));
+  ok("valid block: arguments preserved", good.calls[0]?.function.arguments === '{"command":"echo hi","workdir":"."}', good.calls[0]?.function.arguments);
+  ok("valid block: no issue", good.issue === null, JSON.stringify(good.issue));
+
+  // Flattened arguments, every key a schema parameter -> accepted.
+  const flat = parseToolCalls(block('{"name":"shell","command":"echo hi","workdir":"."}'), tools);
+  ok("flattened block: accepted", flat.calls.length === 1, JSON.stringify(flat));
+  ok("flattened block: keys become arguments", flat.calls[0]?.function.arguments === '{"command":"echo hi","workdir":"."}', flat.calls[0]?.function.arguments);
+
+  // Flattened with an unknown key -> refused (no guessing), repair reason set.
+  const flatBad = parseToolCalls(block('{"name":"shell","command":"echo hi","bogus":1}'), tools);
+  ok("flattened unknown key: not accepted", flatBad.calls.length === 0, JSON.stringify(flatBad));
+  ok(
+    "flattened unknown key: reason no-arguments",
+    flatBad.issue?.reason === "no-arguments" && flatBad.issue?.tool === "shell",
+    JSON.stringify(flatBad.issue)
+  );
+
+  // STEP 1: arguments flattened next to the name AND broken at the boundary.
+  const BAD_JSON = String.raw`{"name":"shell","command":"python -c \"print(1)\",\"workdir":"C:\\dataset"}`;
+  const step1 = parseToolCalls(block(BAD_JSON), tools);
+  ok("STEP 1 example: never executes", step1.calls.length === 0, JSON.stringify(step1));
+  ok("STEP 1 example: reason invalid-json", step1.issue?.reason === "invalid-json", JSON.stringify(step1.issue));
+  ok("STEP 1 example: tool name recovered", step1.issue?.tool === "shell", JSON.stringify(step1.issue));
+  ok("STEP 1 example: returned as text", step1.text.includes("TOOL_CALL"), JSON.stringify(step1.text).slice(0, 80));
+}
+
+// ---- auto-correction round trip ------------------------------------------
+{
+  const shellTool = {
+    type: "function",
+    function: {
+      name: "shell",
+      description: "Run a shell command.",
+      parameters: {
+        type: "object",
+        properties: { command: { type: "string" }, workdir: { type: "string" } },
+        required: ["command"],
+      },
+    },
+  };
+  const tools = [shellTool];
+  const block = (json) => "```\nTOOL_CALL\n" + json + "\n```";
+  const GOOD = block('{"name":"shell","arguments":{"command":"echo hi"}}');
+  const BADJSON = block(String.raw`{"name":"shell","command":"python -c \"print(1)\",\"workdir":"C:\\dataset"}`);
+  const FLATBAD = block('{"name":"shell","command":"echo hi","bogus":1}');
+
+  // Broken JSON -> one repair -> valid block.
+  {
+    const logs = [];
+    const asks = [];
+    const r = await repairToolCall({
+      reply: BADJSON,
+      tools,
+      log: (s) => logs.push(s),
+      ask: async (p) => {
+        asks.push(p);
+        return GOOD;
+      },
+    });
+    ok("repair: broken JSON recovers", r.calls.length === 1 && r.calls[0].function.name === "shell", JSON.stringify(r.calls));
+    ok(
+      "repair: follow-up states the problem, gives an example and asks to resend",
+      asks.length === 1 && /could not be parsed/.test(asks[0]) && /TOOL_CALL \{/.test(asks[0]) && /resend only the corrected block/i.test(asks[0]),
+      asks[0]
+    );
+    ok("repair: follow-up repeats no preamble", !/AVAILABLE TOOLS/.test(asks[0]) && !/You are being used as the brain/.test(asks[0]), asks[0]);
+    ok("repair: logged attempt 1/2 with the reason", logs[0] === "tool repair: attempt 1/2 reason=invalid-json tool=shell", logs.join(" | "));
+  }
+
+  // Flattened with an unknown key -> repair (no-arguments), then valid.
+  {
+    const logs = [];
+    const r = await repairToolCall({ reply: FLATBAD, tools, log: (s) => logs.push(s), ask: async () => GOOD });
+    ok("repair: flattened unknown key recovers", r.calls.length === 1, JSON.stringify(r.calls));
+    ok("repair: reason no-arguments", logs[0] === "tool repair: attempt 1/2 reason=no-arguments tool=shell", logs.join(" | "));
+  }
+
+  // Two failed repairs -> fall through with the last reply and a log line.
+  {
+    const logs = [];
+    let sent = 0;
+    const r = await repairToolCall({
+      reply: BADJSON,
+      tools,
+      log: (s) => logs.push(s),
+      ask: async () => {
+        sent += 1;
+        return BADJSON;
+      },
+    });
+    ok("repair: gives up after two attempts", sent === 2 && r.calls.length === 0, `sent=${sent}`);
+    ok("repair: last reply returned as text", r.text.includes("TOOL_CALL"), JSON.stringify(r.text).slice(0, 80));
+    ok(
+      "repair: logs every attempt and the failure",
+      logs[0].includes("attempt 1/2") && logs[1].includes("attempt 2/2") && logs[2] === "tool repair: failed after 2/2 reason=invalid-json tool=shell",
+      logs.join(" | ")
+    );
+    ok("repair: no more than two follow-ups", sent === TOOL_REPAIR_MAX, String(sent));
+  }
+
+  // Disabled -> no follow-up, unchanged behaviour.
+  {
+    const logs = [];
+    let sent = 0;
+    const r = await repairToolCall({
+      reply: BADJSON,
+      tools,
+      enabled: false,
+      log: (s) => logs.push(s),
+      ask: async () => {
+        sent += 1;
+        return GOOD;
+      },
+    });
+    ok("repair off: no follow-up sent", sent === 0, String(sent));
+    ok("repair off: no repair log", logs.length === 0, logs.join(" | "));
+    ok("repair off: reply still returned as text", r.calls.length === 0 && r.text.includes("TOOL_CALL"));
+  }
+
+  // The prompt builder itself names the tool and stays short.
+  const p = toolRepairPrompt({ reason: "no-arguments", tool: "shell", toolDef: shellTool });
+  ok("repair prompt: one line example with the tool", /TOOL_CALL \{"name":"shell","arguments":\{"command":"<command>"\}\}/.test(p), p);
+  ok("repair prompt: no preamble", !/AVAILABLE TOOLS|RULES:/.test(p), p);
 }
 
 if (failed) {

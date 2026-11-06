@@ -66,6 +66,10 @@ const FIRST_MS = env("NOAPI_FAKE_FIRST_MS", 1200);
 const STREAM_CHUNKS = env("NOAPI_FAKE_STREAM_CHUNKS", 0);
 const STREAM_STEP_MS = env("NOAPI_FAKE_STREAM_STEP_MS", 150);
 const FORCED_REPLY = process.env.NOAPI_FAKE_REPLY || "";
+// Auto-correction tests: "1" drugs the first tool reply with a flattened call
+// (unknown key) and answers the repair prompt with a valid block; "2" always
+// dumps a malformed block; "" leaves the normal fake behaviour untouched.
+const REPAIR = process.env.NOAPI_FAKE_REPAIR || "";
 const TOOL_CALLS = env("NOAPI_FAKE_TOOL_CALLS", 1);
 const TOOL_TAIL = process.env.NOAPI_FAKE_TOOL_TAIL || "";
 // The content script returns ~400ms after a complete tool block settles.
@@ -318,6 +322,14 @@ function sendProgress(id, status) {
 function replyFor(prompt) {
   if (FORCED_REPLY) return FORCED_REPLY;
   const p = String(prompt);
+  if (REPAIR) {
+    // A valid block only in response to the repair follow-up (which asks the
+    // model to "resend only the corrected block").
+    if (REPAIR === "1" && p.includes("corrected block")) {
+      return '```\nTOOL_CALL\n{"name":"bash","arguments":{"command":"mkdir repaired"}}\n```';
+    }
+    return '```\nTOOL_CALL\n{"name":"bash","command":"mkdir broken","bogus":1}\n```';
+  }
   // Checked before the tool branch: the MCP `chat` tool prepends an
   // "AVAILABLE TOOLS:" block whenever the global OpenCode config lists MCP
   // servers, so we need a marker that is stable across machines.

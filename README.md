@@ -320,6 +320,7 @@ Supporting knobs, not fast paths: `NOAPI_MAX_TOOL_RESULT` (`16000`), `NOAPI_DESC
 | `NOAPI_TOOL_DENY` | empty | Comma-separated tool names to leave out of the preamble. They stay fully callable: the bridge validates a call against the request's tool list, not the rendered preamble. |
 | `NOAPI_DUMP_PREAMBLE` | off | Set to `1` to write the exact prompt (preamble + first turn) sent to the site into `./noapi-preamble.txt` and log its length. |
 | `NOAPI_STREAM` | on | Set to `0` to stop streaming live deltas and emit the reply once at the end (the old behaviour). |
+| `NOAPI_TOOL_REPAIR` | on | Set to `0` to return a malformed `TOOL_CALL` block to OpenCode as plain text instead of asking the site to resend it. When on, a reply that carries a `TOOL_CALL` marker but no usable block triggers at most two short follow-ups (the problem, one correct one-line example for that tool, and "please resend only the corrected block"); each attempt logs `tool repair: attempt N/2 reason=… tool=…`. Flattened calls are accepted only when every key is a parameter of the named tool, and invalid JSON is never repaired by guessing. |
 
 ### Timing knobs (for A/B runs)
 

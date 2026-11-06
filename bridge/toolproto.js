@@ -403,41 +403,118 @@ function tryParse(raw) {
   return null;
 }
 
-function normalizeCall(obj, names) {
-  if (!obj || typeof obj !== "object") return null;
-  const name = obj.name || obj.tool || obj.tool_name || obj.function?.name;
-  let args = obj.arguments ?? obj.parameters ?? obj.args ?? obj.input ?? obj.function?.arguments ?? {};
-  if (typeof name !== "string") return null;
-  const match = names.find((n) => n === name) || names.find((n) => n.toLowerCase() === name.toLowerCase());
-  if (!match) return null;
-  if (typeof args === "string") {
-    const p = tryParse(args);
-    args = p && typeof p === "object" ? p : {};
+// Object keys that name the tool rather than carry arguments. A flattened call
+// puts the arguments next to the name, so these are not arguments themselves.
+const NAME_KEYS = new Set(["name", "tool", "tool_name"]);
+
+// Per-tool schema the lenient parser validates against: the set of accepted
+// parameter names, or null when the tool declares no object schema.
+function toolSpecs(tools) {
+  const specs = new Map();
+  for (const f of toolList(tools)) {
+    const props = f.parameters?.properties;
+    specs.set(f.name.toLowerCase(), {
+      name: f.name,
+      props: props && typeof props === "object" ? new Set(Object.keys(props)) : null,
+      def: f,
+    });
   }
-  if (!args || typeof args !== "object" || Array.isArray(args)) args = {};
+  return specs;
+}
+
+function findTool(tools, name) {
+  if (typeof name !== "string") return null;
+  const want = name.toLowerCase();
+  return toolList(tools).find((f) => f.name.toLowerCase() === want) || null;
+}
+
+function normalizeCall(obj, specs) {
+  if (!obj || typeof obj !== "object") return null;
+  const rawName = obj.name || obj.tool || obj.tool_name || obj.function?.name;
+  if (typeof rawName !== "string") return null;
+  const spec = specs.get(rawName.toLowerCase());
+  if (!spec) return null;
+
+  const explicit = [obj.arguments, obj.parameters, obj.args, obj.input, obj.function?.arguments].find(
+    (v) => v !== undefined && v !== null
+  );
+  let args;
+  if (explicit !== undefined) {
+    if (typeof explicit === "string") {
+      // An arguments string that will not parse is broken JSON, not an empty
+      // call: never guess (STEP 2b).
+      const parsed = tryParse(explicit);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      args = parsed;
+    } else if (typeof explicit === "object" && !Array.isArray(explicit)) {
+      args = explicit;
+    } else {
+      return null;
+    }
+  } else {
+    // No "arguments". Accept a flattened call ONLY when every extra key is a
+    // parameter of this tool's schema; otherwise do not guess.
+    const extra = Object.keys(obj).filter((k) => !NAME_KEYS.has(k) && k !== "function");
+    if (!extra.length) {
+      args = {};
+    } else if (spec.props && extra.every((k) => spec.props.has(k))) {
+      args = {};
+      for (const k of extra) args[k] = obj[k];
+    } else {
+      return null;
+    }
+  }
   return {
     id: `call_${crypto.randomBytes(8).toString("hex")}`,
     type: "function",
-    function: { name: match, arguments: JSON.stringify(args) },
+    function: { name: spec.name, arguments: JSON.stringify(args) },
   };
 }
 
-// Returns { calls: [...openai tool_calls], text: reply without the call blocks }
+// Returns { calls: [...openai tool_calls], text: reply without the call blocks,
+// issue: null | { reason, tool } }. `issue` is set only when the reply contains
+// a TOOL_CALL marker that produced no valid block, and drives auto-repair.
 export function parseToolCalls(reply, tools) {
-  const names = toolList(tools).map((f) => f.name);
+  const specs = toolSpecs(tools);
   const text = String(reply || "");
-  if (!names.length) return { calls: [], text: text.trim() };
+  if (!specs.size) return { calls: [], text: text.trim(), issue: null };
 
   const spans = [];
   const calls = [];
+  let issue = null;
+  const noteIssue = (reason, tool) => {
+    if (!issue) issue = { reason, tool: typeof tool === "string" ? tool : null };
+  };
+  // Best-effort tool name for a block, even when its JSON does not parse.
+  const nameNear = (s) => {
+    const m = /"(?:name|tool|tool_name)"\s*:\s*"([^"\\]+)"/.exec(String(s));
+    return m ? m[1] : null;
+  };
 
   const tryAt = (markerStart, searchFrom) => {
     const brace = text.indexOf("{", searchFrom);
-    if (brace === -1 || brace - searchFrom > 80) return;
+    if (brace === -1 || brace - searchFrom > 80) {
+      noteIssue("no-json", null);
+      return;
+    }
     const ext = extractJsonObject(text, brace);
-    if (!ext) return;
-    const call = normalizeCall(tryParse(ext.raw), names);
-    if (!call) return;
+    if (!ext) {
+      noteIssue("invalid-json", nameNear(text.slice(markerStart)));
+      return;
+    }
+    const obj = tryParse(ext.raw);
+    if (!obj || typeof obj !== "object") {
+      noteIssue("invalid-json", nameNear(ext.raw));
+      return;
+    }
+    const rawName = obj.name || obj.tool || obj.tool_name || obj.function?.name;
+    const call = normalizeCall(obj, specs);
+    if (!call) {
+      if (typeof rawName !== "string") noteIssue("no-name", null);
+      else if (specs.has(rawName.toLowerCase())) noteIssue("no-arguments", rawName);
+      else noteIssue("unknown-tool", rawName);
+      return;
+    }
     calls.push(call);
     spans.push([markerStart, ext.end]);
   };
@@ -457,14 +534,14 @@ export function parseToolCalls(reply, tools) {
       if (spans.some(([a, b]) => m.index >= a && m.index < b)) continue;
       const ext = extractJsonObject(text, m.index);
       if (!ext) continue;
-      const call = normalizeCall(tryParse(ext.raw), names);
+      const call = normalizeCall(tryParse(ext.raw), specs);
       if (!call) continue;
       calls.push(call);
       spans.push([m.index, ext.end]);
     }
   }
 
-  if (!calls.length) return { calls: [], text: text.trim() };
+  if (!calls.length) return { calls: [], text: text.trim(), issue };
 
   spans.sort((a, b) => a[0] - b[0]);
   let out = "";
@@ -478,7 +555,60 @@ export function parseToolCalls(reply, tools) {
   }
   out += text.slice(cursor);
   out = out.replace(/```[\w-]*\s*```/g, "").replace(/\n{3,}/g, "\n\n").trim();
-  return { calls, text: out };
+  return { calls, text: out, issue: null };
+}
+
+// ------------------------------------------------------- auto-correction
+
+export const TOOL_REPAIR_MAX = 2;
+
+const REPAIR_PROBLEM = {
+  "invalid-json": "the JSON in your TOOL_CALL block could not be parsed as valid JSON",
+  "no-json": "there was no JSON object after the TOOL_CALL marker",
+  "no-arguments": "the arguments must be inside an \"arguments\" object, not spread next to the tool name",
+  "unknown-tool": "the tool name in the block is not a tool that is available here",
+  "no-name": "the block has no tool name",
+};
+
+// One short follow-up: the problem in a sentence, one correct one-line example
+// for the tool, and a request to resend only the corrected block. No preamble.
+export function toolRepairPrompt({ reason, tool, toolDef } = {}) {
+  const problem = REPAIR_PROBLEM[reason] || "the TOOL_CALL block was not in the expected format";
+  const def = toolDef ? toolList([toolDef])[0] : null;
+  const exampleObj = def
+    ? { name: def.name, arguments: exampleArgs(def) }
+    : { name: tool || "<tool name>", arguments: {} };
+  return [
+    `Your last reply contained a TOOL_CALL block that could not be used: ${problem}.`,
+    `A correct call looks like this: TOOL_CALL ${JSON.stringify(exampleObj)}`,
+    "Please resend only the corrected block.",
+  ].join("\n");
+}
+
+// Auto-correction round trip. `ask(prompt, attempt)` sends a short follow-up to
+// the same chat and returns the next raw reply. At most `maxRepairs` prompts per
+// user turn; if the reply is still unusable the last parse is returned as-is so
+// the caller can hand it back to OpenCode. `enabled=false` is a no-op.
+export async function repairToolCall({ reply, tools, ask, log = () => {}, enabled = true, maxRepairs = TOOL_REPAIR_MAX } = {}) {
+  let parsed = parseToolCalls(reply, tools);
+  let lastReply = reply;
+  let attempt = 0;
+  while (enabled && attempt < maxRepairs && !parsed.calls.length && parsed.issue) {
+    attempt += 1;
+    const { reason, tool } = parsed.issue;
+    log(`tool repair: attempt ${attempt}/${maxRepairs} reason=${reason} tool=${tool || "?"}`);
+    try {
+      lastReply = await ask(toolRepairPrompt({ reason, tool, toolDef: findTool(tools, tool) }), attempt);
+    } catch (err) {
+      log(`tool repair: failed after ${attempt}/${maxRepairs} reason=${reason} tool=${tool || "?"}`);
+      return { ...parsed, reply: lastReply };
+    }
+    parsed = parseToolCalls(lastReply, tools);
+  }
+  if (enabled && parsed.issue && attempt > 0) {
+    log(`tool repair: failed after ${attempt}/${maxRepairs} reason=${parsed.issue.reason} tool=${parsed.issue.tool || "?"}`);
+  }
+  return { ...parsed, reply: lastReply };
 }
 
 // OpenCode asks the model for a session title with a tiny tool-less request.

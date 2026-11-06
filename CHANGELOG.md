@@ -34,6 +34,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `NOAPI_DESC_MODE=lean` and `NOAPI_TOOL_DENY=<comma list>` (both off by default) shrink the tool preamble for the same tool set; denied tools stay callable because a call is validated against the request's tool list
 - An optional `sseText` extension flag (with `NOAPI_SSE_TEXT=1`) lets the SSE observer decode the page's own stream and post the accumulated reply text as an earlier tool-call trigger. The returned reply still comes from the DOM, and a mismatch counter records any stream-vs-DOM disagreement. The ChatGPT stream parser is a documented placeholder until a captured sample is provided, so nothing is decoded yet
 - Tests for `bridge/tuning.js`, the per-request tuning resolver, the lean/deny preamble controls, the lossless tool-result cleanup and `tools/report-latency.js`
+- **Malformed `TOOL_CALL` recovery** (`NOAPI_TOOL_REPAIR`, on by default): when a reply carries a `TOOL_CALL` marker but no usable block, the bridge sends one short follow-up to the same chat — the problem, a one-line correct example for that tool, and "please resend only the corrected block" — and parses the answer instead of handing the broken block to OpenCode. At most two repairs per user turn; after that the last reply is returned as before and the reason is logged (`tool repair: attempt 1/2 reason=… tool=…`). The follow-up never repeats the preamble. Flattened calls (arguments beside `name` instead of inside an `arguments` object) are accepted only when every key is a parameter of that tool's schema; invalid JSON is never repaired by guessing quotes
 
 ### Changed
 
@@ -48,6 +49,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Tool results are trimmed to 16,000 characters by default (`NOAPI_MAX_TOOL_RESULT`); the truncation marker reports how many characters were cut and suggests a narrower re-run (offset/limit, grep, head/tail)
 - Tool descriptions are no longer clipped uniformly: tools whose semantics are subtle (edit, write, bash, read, patch-like, or anything with an `oldString`/`newString`/`replace` parameter) keep up to 400 characters, while the rest stay short
 - The preamble is only re-sent when tool names or parameter schemas change, not when descriptions change
+- The tool-call parser is stricter: a `TOOL_CALL` block whose `arguments` string does not parse as JSON, or whose flattened keys are not all parameters of the named tool, is refused instead of being executed with empty arguments
 
 ### Fixed
 
