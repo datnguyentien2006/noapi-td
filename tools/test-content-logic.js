@@ -50,6 +50,96 @@ ok("stop never seen: waits for the long fallback", !complete(50, false, false, 2
 ok("stop never seen: completes at the long fallback", complete(50, false, false, 2200, 400, 2200));
 ok("faster debounce completes sooner", complete(50, false, true, 350, 350, 2200) && !complete(50, false, true, 350, 400, 2200));
 
+// ---- tick scheduling (Phase 1) --------------------------------------------
+// The completion loop's coalescing scheduler: a burst of mutations must wake
+// exactly one tick, and two ticks must never run at the same time.
+const makeScheduler = loadShared("tickScheduler", { fn: "createTickScheduler" });
+const flush = async () => {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+};
+
+{
+  const q = [];
+  let runs = 0;
+  const s = makeScheduler(() => {
+    runs++;
+  }, (fn) => q.push(fn));
+  s.schedule();
+  s.schedule();
+  s.schedule();
+  ok("a burst of schedules coalesces into one pending run", q.length === 1, String(q.length));
+  q.shift()();
+  await flush();
+  ok("the coalesced run executed exactly once", runs === 1, String(runs));
+  ok("nothing extra was queued", q.length === 0, String(q.length));
+}
+
+{
+  const q = [];
+  let runs = 0;
+  let active = 0;
+  let maxActive = 0;
+  let release = () => {};
+  const s = makeScheduler(() => {
+    runs++;
+    active++;
+    maxActive = Math.max(maxActive, active);
+    return new Promise((r) => {
+      release = () => {
+        active--;
+        r();
+      };
+    });
+  }, (fn) => q.push(fn));
+  s.schedule();
+  q.shift()();
+  await flush();
+  ok("the first tick started", runs === 1 && active === 1, `runs=${runs} active=${active}`);
+  s.schedule();
+  s.schedule();
+  ok("a schedule during a running tick does not start a second one", q.length === 0 && runs === 1, `q=${q.length} runs=${runs}`);
+  release();
+  await flush();
+  ok("a follow-up tick is queued once the running tick finishes", q.length === 1 && runs === 1, `q=${q.length} runs=${runs}`);
+  q.shift()();
+  await flush();
+  ok("the follow-up tick ran", runs === 2, String(runs));
+  ok("ticks never overlapped", maxActive === 1, String(maxActive));
+  release();
+  await flush();
+  ok("no extra ticks afterwards", runs === 2 && q.length === 0, `runs=${runs} q=${q.length}`);
+}
+
+{
+  const q = [];
+  let runs = 0;
+  const s = makeScheduler(() => {
+    runs++;
+  }, (fn) => q.push(fn));
+  s.stop();
+  s.schedule();
+  ok("stop() makes schedule a no-op", q.length === 0 && runs === 0);
+}
+
+{
+  const q = [];
+  let runs = 0;
+  const s = makeScheduler(() => {
+    runs++;
+    if (runs === 1) throw new Error("boom");
+  }, (fn) => q.push(fn));
+  s.schedule();
+  q.shift()();
+  await flush();
+  s.schedule();
+  ok("a throwing tick is caught and does not wedge the scheduler", q.length === 1, String(q.length));
+  q.shift()();
+  await flush();
+  ok("the scheduler runs again after a throw", runs === 2, String(runs));
+}
+
 // ---- early return on a complete TOOL_CALL (Phase 4) -----------------------
 const early = loadShared("toolEarlyReturn", { fn: "toolEarlyReturnDecision" });
 const countBlocks = loadShared("toolEarlyReturn", { fn: "toolBlockCount" });

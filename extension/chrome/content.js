@@ -982,12 +982,13 @@
   // was pure dead time after the last token. The 2200ms rule is kept only as a
   // fallback for sites/cases where the stop button was never observed at all.
   //
-  // A MutationObserver wakes us as soon as the page changes, so extractText only
-  // runs when something actually moved (throttled to ~8/s), with a slow safety
-  // net for sites whose reply lives in a shadow root, where an observer on the
-  // light DOM cannot see the mutation.
+  // The MutationObserver schedules a tick immediately (coalesced, so a burst of
+  // mutations wakes exactly one tick), so extractText only runs when something
+  // actually moved (throttled to ~8/s). This slow interval is only a safety net:
+  // sites whose reply lives in a shadow root fire no observer event, and the
+  // timeout / stop-button checks still need a periodic wake-up.
   const FALLBACK_STABLE_MS = 2200;
-  const OBSERVER_TICK_MS = 250;
+  const FALLBACK_TICK_MS = 400;
   const EXTRACT_THROTTLE_MS = 120;
   const UNSEEN_MUTATION_MS = 1000;
   const STALL_LOG_MS = 20_000;
@@ -1144,6 +1145,50 @@
   }
   /* @noapi-shared-end toolEarlyReturn */
 
+  // Coalescing scheduler for the completion loop. A burst of DOM mutations must
+  // wake exactly ONE tick, and two ticks must never run at the same time (the
+  // tick reads and writes state, so overlap would corrupt it). The observer and
+  // the slow fallback interval both go through `schedule()`. `enqueue` is
+  // injected (queueMicrotask in the browser) so this stays a pure factory that
+  // tools/test-content-logic.js can lift out and exercise without a browser.
+  /* @noapi-shared-start tickScheduler */
+  function createTickScheduler(run, enqueue) {
+    let scheduled = false;
+    let running = false;
+    let again = false;
+    let stopped = false;
+    const pump = () => {
+      scheduled = false;
+      running = true;
+      Promise.resolve()
+        .then(() => run())
+        .catch(() => {})
+        .then(() => {
+          running = false;
+          if (again && !stopped) {
+            again = false;
+            schedule();
+          }
+        });
+    };
+    function schedule() {
+      if (stopped || scheduled) return;
+      if (running) {
+        // A tick is already in flight: remember that the page moved again and
+        // run once more as soon as it finishes (never in parallel).
+        again = true;
+        return;
+      }
+      scheduled = true;
+      enqueue(pump);
+    }
+    function stop() {
+      stopped = true;
+    }
+    return { schedule, stop };
+  }
+  /* @noapi-shared-end tickScheduler */
+
   async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, baseline = null, typedLen, toolsEnabled = false, earlyReturn = true, earlyReturnMs = DEFAULT_EARLY_RETURN_MS, toolNames = [], pipelineT0 = null, timings = null }) {
     const t0 = Date.now();
     return new Promise((resolve, reject) => {
@@ -1159,10 +1204,15 @@
       let done = false;
       let observer = null;
       let timer = null;
+      let scheduler = null;
+      let completionTimer = null;
 
       const cleanup = () => {
         if (timer) clearInterval(timer);
         timer = null;
+        if (completionTimer) clearTimeout(completionTimer);
+        completionTimer = null;
+        scheduler?.stop();
         try {
           observer?.disconnect();
         } catch {}
@@ -1208,6 +1258,7 @@
       try {
         observer = new MutationObserver(() => {
           dirty = true;
+          scheduler?.schedule();
         });
         observer.observe(scope || document.body, { subtree: true, childList: true, characterData: true });
       } catch {}
@@ -1326,6 +1377,11 @@
               if (timings && !timings.firstText) timings.firstText = Date.now() - (pipelineT0 ?? t0);
               setLog(`${SITE.name} is answering... (${text.length} chars)`, "tick");
               sendPartial(text);
+              // Wake once more when the quiet window should have elapsed, so the
+              // turn does not wait for the next fallback interval to notice that
+              // the reply stopped changing.
+              if (completionTimer) clearTimeout(completionTimer);
+              completionTimer = setTimeout(() => scheduler?.schedule(), (Number(SITE.debounce) || 400) + 30);
             }
           }
 
@@ -1384,8 +1440,11 @@
         }
       };
 
-      timer = setInterval(tick, OBSERVER_TICK_MS);
-      tick();
+      // The observer drives the loop; this slow interval only covers mutations it
+      // cannot see (shadow DOM) and keeps the timeout / stop-button checks alive.
+      scheduler = createTickScheduler(tick, (fn) => queueMicrotask(fn));
+      timer = setInterval(() => scheduler?.schedule(), FALLBACK_TICK_MS);
+      scheduler.schedule();
     });
   }
 
