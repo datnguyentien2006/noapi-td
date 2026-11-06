@@ -22,10 +22,20 @@ function averageTimings(records) {
 }
 
 export class Bridge {
-  constructor({ log = () => {} } = {}) {
+  constructor({
+    log = () => {},
+    // How long to wait for the browser to confirm it stopped a cancelled
+    // request before releasing the site queue anyway (and warning).
+    cancelAckMs = 5000,
+    // Give up retrying a request the tab kept answering "busy", after this long.
+    busyGiveUpMs = 10_000,
+    busyBaseMs = 100,
+    busyMaxMs = 500,
+  } = {}) {
     this.log = log;
-    this.clients = new Map(); // wsConn -> { site, url, joinedAt, lastSeen }
+    this.clients = new Map(); // wsConn -> { site, sites, url, joinedAt, lastSeen }
     this.pending = new Map(); // id -> record
+    this.cancelling = new Map(); // id -> record cancelled but not yet acked by the tab
     this.seq = 0;
     this.locks = new Map(); // site -> promise chain (one in-flight prompt per site)
     this.busy = new Map(); // site -> queued + running count
@@ -33,6 +43,10 @@ export class Bridge {
     this.timings = []; // most recent completed requests, oldest first
     this.stats = new Map(); // site -> lifetime counters (debug; see statsSummary)
     this.startedAt = Date.now();
+    this.cancelAckMs = cancelAckMs;
+    this.busyGiveUpMs = busyGiveUpMs;
+    this.busyBaseMs = busyBaseMs;
+    this.busyMaxMs = busyMaxMs;
   }
 
   // Per-site lifetime counters. Cheap to keep and the only way to see, from
@@ -83,6 +97,21 @@ export class Bridge {
     const info = this.clients.get(conn);
     if (info) this.log(`browser client ${conn.id} disconnected (was: ${info.site || "?"})`);
     this.clients.delete(conn);
+    // A gone tab can never confirm a cancel: release any slot it was blocking.
+    for (const id of [...this.cancelling.keys()]) {
+      const record = this.cancelling.get(id);
+      if ((record.conns || []).includes(conn)) this._ackCancelled(id);
+    }
+  }
+
+  // The extension tells us a tab closed and no other tab of that site is left.
+  // Drop the site from the socket that reported it so `sites()` stops offering it.
+  removeSite(conn, site) {
+    const info = this.clients.get(conn);
+    if (!info || !site) return;
+    info.sites?.delete(site);
+    if (info.site === site) info.site = info.sites?.size ? [...info.sites][info.sites.size - 1] : null;
+    this.log(`client ${conn.id} no longer on site: ${site}`);
   }
 
   touch(conn) {
@@ -101,9 +130,11 @@ export class Bridge {
   }
 
   sites() {
-    const available = new Set(
-      [...this.clients.values()].map((c) => c.site).filter(Boolean)
-    );
+    const available = new Set();
+    for (const c of this.clients.values()) {
+      if (c.site) available.add(c.site);
+      if (c.sites) for (const s of c.sites) available.add(s);
+    }
     return SITES.map((s) => ({ ...s, available: available.has(s.key) }));
   }
 
@@ -178,6 +209,23 @@ export class Bridge {
     this.locks.set(key, tail);
     if (this.busy.get(key)) onProgress?.("Waiting for the previous request to finish");
     this.busy.set(key, (this.busy.get(key) || 0) + 1);
+
+    // The site slot is this gate. Normally the finally below releases it. When a
+    // request is cancelled we hand the release to the cancel path: it waits for
+    // the tab's terminal message (or a safety timeout / socket close) so the
+    // next request is not dispatched while the tab is still unwinding this one.
+    const slot = { released: false, deferred: false };
+    slot.release = () => {
+      if (slot.released) return;
+      slot.released = true;
+      release();
+      const left = (this.busy.get(key) || 1) - 1;
+      if (left <= 0) {
+        this.busy.delete(key);
+        if (this.locks.get(key) === tail) this.locks.delete(key);
+      } else this.busy.set(key, left);
+    };
+
     try {
       await prev;
       if (signal?.aborted) throw new Error("Request cancelled.");
@@ -195,14 +243,10 @@ export class Bridge {
         toolNames,
         sse,
         newChat,
+        slot,
       });
     } finally {
-      release();
-      const left = (this.busy.get(key) || 1) - 1;
-      if (left <= 0) {
-        this.busy.delete(key);
-        if (this.locks.get(key) === tail) this.locks.delete(key);
-      } else this.busy.set(key, left);
+      if (!slot.deferred) slot.release();
     }
   }
 
@@ -220,6 +264,7 @@ export class Bridge {
     toolNames = [],
     sse = true,
     newChat = false,
+    slot = null,
   }) {
     return new Promise((resolve, reject) => {
       const id = this._nextId();
@@ -240,8 +285,15 @@ export class Bridge {
       let onAbort = null;
       const cleanup = () => {
         clearTimeout(timer);
+        clearTimeout(retryTimer);
+        retryTimer = null;
+        if (record.ackTimer) {
+          clearTimeout(record.ackTimer);
+          record.ackTimer = null;
+        }
         if (signal && onAbort) signal.removeEventListener("abort", onAbort);
       };
+      let retryTimer = null;
       const record = {
         id,
         prompt,
@@ -251,6 +303,12 @@ export class Bridge {
         onProgress,
         onPartial,
         conns: targets.map(([conn]) => conn),
+        payload: null,
+        slot,
+        ackTimer: null,
+        retryTimer: null,
+        busyAttempts: 0,
+        busySince: 0,
         resolve: (text) => {
           if (this.pending.delete(id)) {
             cleanup();
@@ -283,6 +341,7 @@ export class Bridge {
         // Phase 5: NOAPI_NEW_CHAT=1 asks the tab to open a fresh chat first.
         new_chat: Boolean(newChat),
       });
+      record.payload = payload;
       let delivered = 0;
       for (const [conn] of targets) {
         try {
@@ -297,13 +356,11 @@ export class Bridge {
         return;
       }
       timer = setTimeout(() => {
-        this.cancel(id, "timeout");
-        record.reject(new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the website to answer.`));
+        this._cancelRecord(record, "timeout", `Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the website to answer.`);
       }, timeoutMs);
       if (signal) {
         onAbort = () => {
-          this.cancel(id, "abort");
-          record.reject(new Error("Request cancelled."));
+          this._cancelRecord(record, "abort", "Request cancelled.");
         };
         if (signal.aborted) onAbort();
         else signal.addEventListener("abort", onAbort, { once: true });
@@ -313,19 +370,77 @@ export class Bridge {
     });
   }
 
-  // Tell the browser to stop generating / forget this request.
-  cancel(id, reason = "abort") {
-    const record = this.pending.get(id);
-    if (!record) return;
+  // Reject the caller now (OpenCode must see its cancellation fast) but keep the
+  // site slot held until the browser confirms the tab stopped. A terminal message
+  // for this id (response / error / cancelled), the socket closing, or a safety
+  // timeout releases it. The record moves to `cancelling` so late messages are
+  // recognised and ignored rather than mistaken for the next request.
+  _cancelRecord(record, reason, message) {
+    if (!this.pending.has(record.id)) return;
     const stats = this.statsFor(record.site);
     if (reason === "timeout") stats.timeouts += 1;
     else stats.aborted += 1;
-    const msg = JSON.stringify({ t: "cancel", id });
+    const msg = JSON.stringify({ t: "cancel", id: record.id });
     for (const conn of record.conns || []) {
       try {
         conn.send(msg);
       } catch {}
     }
+    if (record.slot) record.slot.deferred = true;
+    this.cancelling.set(record.id, record);
+    record.reject(new Error(message));
+    record.ackTimer = setTimeout(() => {
+      if (!this.cancelling.has(record.id)) return;
+      this.log(
+        `warning: no cancel acknowledgement for ${record.id} after ${this.cancelAckMs}ms; releasing the site queue anyway`
+      );
+      this._ackCancelled(record.id);
+    }, this.cancelAckMs);
+  }
+
+  // The tab confirmed it stopped (or we gave up waiting): release the site slot.
+  _ackCancelled(id) {
+    const record = this.cancelling.get(id);
+    if (!record) return;
+    this.cancelling.delete(id);
+    if (record.ackTimer) {
+      clearTimeout(record.ackTimer);
+      record.ackTimer = null;
+    }
+    record.slot?.release();
+  }
+
+  ackCancelled(id) {
+    this._ackCancelled(id);
+  }
+
+  // A busy rejection is retryable: the previous request is still unwinding, so
+  // keep the slot and resend after a short backoff instead of surfacing the raw
+  // "already handling a prompt" error to OpenCode.
+  _retryBusy(record) {
+    if (!this.pending.has(record.id)) return;
+    if (!record.busySince) record.busySince = Date.now();
+    const waited = Date.now() - record.busySince;
+    if (waited >= this.busyGiveUpMs) {
+      this.log(`request ${record.id} stayed busy for ${Math.round(waited / 1000)}s; giving up`);
+      record.reject(
+        new Error(`The browser tab stayed busy for ${Math.round(waited / 1000)}s and never freed up; gave up retrying.`)
+      );
+      return;
+    }
+    record.busyAttempts += 1;
+    const delay = Math.min(this.busyMaxMs, this.busyBaseMs * record.busyAttempts);
+    this.log(`request ${record.id} reported busy; retrying in ${delay}ms (attempt ${record.busyAttempts})`);
+    clearTimeout(record.retryTimer);
+    record.retryTimer = setTimeout(() => {
+      record.retryTimer = null;
+      if (!this.pending.has(record.id)) return;
+      for (const conn of record.conns || []) {
+        try {
+          conn.send(record.payload);
+        } catch {}
+      }
+    }, delay);
   }
 
   progress(id, status) {
@@ -348,6 +463,14 @@ export class Bridge {
   }
 
   respond(conn, id, text, timings) {
+    // A terminal message for a cancelled id: the tab may have finished anyway.
+    // Release the slot it was holding, but never resolve the next request with
+    // this answer and never record a timing for a reply the caller abandoned.
+    if (this.cancelling.has(id)) {
+      this.log(`late response for cancelled ${id} ignored`);
+      this._ackCancelled(id);
+      return;
+    }
     const record = this.pending.get(id);
     if (!record) return;
     const clean = String(text ?? "").trim();
@@ -404,9 +527,22 @@ export class Bridge {
     );
   }
 
-  fail(conn, id, error) {
+  fail(conn, id, error, code) {
+    // A terminal message (including the tab's own "Cancelled.") for an id we
+    // already cancelled: release the slot and stop there.
+    if (this.cancelling.has(id)) {
+      this.log(`late error for cancelled ${id} ignored`);
+      this._ackCancelled(id);
+      return;
+    }
     const record = this.pending.get(id);
     if (!record) return;
+    // A busy tab is a transient state (the previous request is still unwinding),
+    // not a real failure: retry instead of surfacing it to OpenCode.
+    if (code === "busy" || /already handling a prompt/i.test(String(error || ""))) {
+      this._retryBusy(record);
+      return;
+    }
     this.log(`request ${id} failed from browser: ${error}`);
     record.reject(new Error(String(error || "browser error")));
   }

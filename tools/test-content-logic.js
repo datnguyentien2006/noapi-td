@@ -306,6 +306,15 @@ ok("toolBlockCount counts complete blocks", countBlocks(completeCall + "\n" + se
 ok("toolBlockCount ignores invalid JSON", countBlocks("```\nTOOL_CALL\n{oops}\n```", TOOL_NAMES) === 0);
 ok("toolBlockCount ignores unknown tools", countBlocks("```\nTOOL_CALL\n{\"name\":\"nope\",\"arguments\":{}}\n```", TOOL_NAMES) === 0);
 
+// ---- waitForIdle's busy check (Phase 8) ------------------------------------
+// The first probe passes prev=null; if the stop control is gone the site is
+// considered idle without the old 700ms sleep. Later probes need text stability.
+const stillBusy = loadShared("idleCheck", { fn: "stillBusy" });
+ok("idle: no stop control, first probe -> not busy", !stillBusy(false, "some text", null));
+ok("busy: stop control visible, first probe", stillBusy(true, "some text", null));
+ok("busy: reply still changing", stillBusy(false, "growing", "grow"));
+ok("idle: stop gone and text stable", !stillBusy(false, "stable", "stable"));
+
 if (failed) {
   console.error(`\n${failed} test(s) failed`);
   process.exit(1);

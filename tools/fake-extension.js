@@ -39,6 +39,15 @@
 //                               site would keep streaming it, but the content
 //                               script returns as soon as the tool blocks settle,
 //                               so this fake drops it when tools are enabled
+//   NOAPI_FAKE_CANCEL_ACK_MS    delay before the tab confirms a cancel (default 0).
+//                               The tab stays "busy" during the delay, like the
+//                               real content script while it unwinds.
+//   NOAPI_FAKE_CANCEL_ACK       "cancelled" (default) or "error": the ack a real
+//                               tab sends once it has stopped.
+//   NOAPI_FAKE_IGNORE_CANCEL    "1" = never ack a cancel (tests the bridge's
+//                               safety timeout).
+//   NOAPI_FAKE_BUSY_TIMES       reply "busy" to the first N requests, like the
+//                               content script's busy guard, to test retry.
 import net from "node:net";
 import crypto from "node:crypto";
 
@@ -78,6 +87,13 @@ const FINAL_RENDER_MS = env("NOAPI_FAKE_FINAL_RENDER_MS", 260);
 const COMPLETION_DEBOUNCE_MS = env("NOAPI_FAKE_COMPLETION_DEBOUNCE_MS", env("NOAPI_FAKE_DEBOUNCE_MS", 400));
 const STABLE_MS = env("NOAPI_FAKE_STABLE_MS", 2200);
 const FINAL_RENDER_SUFFIX = process.env.NOAPI_FAKE_FINAL_RENDER_SUFFIX ?? "\n";
+// Cancel / busy behaviour (see the header). The tab keeps the request in
+// `inFlight` for CANCEL_ACK_MS after a cancel, so a second request that arrives
+// in that window hits the busy guard exactly like the real content script.
+const CANCEL_ACK_MS = env("NOAPI_FAKE_CANCEL_ACK_MS", 0);
+const CANCEL_ACK = String(process.env.NOAPI_FAKE_CANCEL_ACK || "cancelled").toLowerCase();
+const IGNORE_CANCEL = process.env.NOAPI_FAKE_IGNORE_CANCEL === "1";
+let busyRemaining = env("NOAPI_FAKE_BUSY_TIMES", 0);
 
 const socket = net.createConnection({ host, port }, () => {
   const key = crypto.randomBytes(16).toString("base64");
@@ -139,6 +155,22 @@ socket.on("data", (chunk) => {
 
 function handleRequest(msg) {
   console.log(`[fake-ext] request ${msg.id}: ${String(msg.prompt).slice(0, 120).replace(/\n/g, " ")}`);
+
+  // Emulate the content script's busy guard: one request per tab at a time.
+  // Used to model the cancel/queue race (a request arriving before the previous
+  // one has finished unwinding) and the bridge's busy-retry path.
+  if (busyRemaining > 0) {
+    busyRemaining -= 1;
+    console.log(`[fake-ext] busy (forced) for ${msg.id}`);
+    send({ t: "error", id: msg.id, error: "This tab is already handling a prompt.", code: "busy" });
+    return;
+  }
+  if (inFlight.size > 0) {
+    console.log(`[fake-ext] busy for ${msg.id} (still handling another request)`);
+    send({ t: "error", id: msg.id, error: "This tab is already handling a prompt.", code: "busy" });
+    return;
+  }
+
   send({ t: "progress", id: msg.id, status: "Typing prompt into fake site..." });
 
   const record = { timers: [], cancelled: false };
@@ -249,13 +281,34 @@ function handleRequest(msg) {
 }
 
 function handleCancel(msg) {
+  if (IGNORE_CANCEL) {
+    // The tab never saw (or ignored) the cancel: it keeps generating and will
+    // reply normally. Tests the bridge's safety timeout + late-response release.
+    console.log(`[fake-ext] ignoring cancel ${msg.id}`);
+    return;
+  }
   const record = inFlight.get(msg.id);
-  if (!record) return;
+  if (!record) {
+    // Nothing running for this id. A real tab would have the background ack
+    // immediately; if we got here it is a duplicate cancel, so ack anyway.
+    sendCancelAck(msg.id);
+    return;
+  }
   record.cancelled = true;
   for (const t of record.timers) clearTimeout(t);
-  inFlight.delete(msg.id);
+  record.timers = [];
   console.log(`[fake-ext] cancelled ${msg.id}`);
-  send({ t: "error", id: msg.id, error: "Cancelled." });
+  // Keep the id "in flight" while the tab unwinds so a request arriving now hits
+  // the busy guard, exactly like the real content script during cancel.
+  record.timers.push(setTimeout(() => {
+    inFlight.delete(msg.id);
+    sendCancelAck(msg.id);
+  }, Math.max(0, CANCEL_ACK_MS)));
+}
+
+function sendCancelAck(id) {
+  if (CANCEL_ACK === "error") send({ t: "error", id, error: "Cancelled." });
+  else send({ t: "cancelled", id });
 }
 
 function sendProgress(id, status) {

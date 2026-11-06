@@ -31,6 +31,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Cancelling a request no longer releases the site's queue slot before the browser tab has actually stopped. The caller still gets its cancellation immediately, but the next request waits for the tab's terminal message (`cancelled` ack, `response` or `error`), the socket closing, or a 5 s safety timeout (`NOAPI_CANCEL_ACK_MS`). Late messages for a cancelled id are recognised and ignored instead of being mistaken for the next request's answer
+- A tab that reports `busy` ("already handling a prompt") is now retried with short backoff (100 ms growing to 500 ms, giving up after ~10 s) instead of surfacing a 503 to OpenCode
+- The extension background only serves a request from a tab of the requested site (no cross-site fallback), accepts `noapi-tab` ports only from the top frame, sends `hello-update` only on a real change, and tells the bridge when a closed tab leaves a site with no tab (`site-gone`)
+- The content script's busy guard reports `code: "busy"`; cancelling now wakes sleeps immediately, is checked in `waitForComposer` / `ensureTyped` / `submitComposer` / `waitForIdle`, and clears typed-but-unsent text so it cannot leak into the next request
 - Tests can no longer reach a real bridge or type into a real chat tab: each runner binds an ephemeral port (`--port=0`) and hands it to the fake tab, and refuses to use the default port at all
 
 ## [0.1.0] - 2026-10-11

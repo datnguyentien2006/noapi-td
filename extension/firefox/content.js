@@ -269,7 +269,39 @@
   const SITE = detectSite();
   if (!SITE) return;
 
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Cancel-aware sleep: cancelCurrent() wakes every waiter immediately, so a
+  // cancel is noticed during typing/polling instead of only after the current
+  // sleep (which could otherwise keep the tab "busy" for 700ms+ while the bridge
+  // already wants to dispatch the next request).
+  const sleepWaiters = new Set();
+  const sleep = (ms) =>
+    new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        sleepWaiters.delete(done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      sleepWaiters.add(done);
+    });
+  function wakeSleepers() {
+    for (const done of [...sleepWaiters]) done();
+  }
+  // A cancel during typing can leave typed-but-unsent text in the box; the next
+  // request would then send it as its own prompt. Clear it (both composer kinds).
+  function clearComposerText(el) {
+    if (!el) return;
+    try {
+      if (!el.isContentEditable) {
+        setNativeValue(el, "");
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } else {
+        el.innerHTML = "";
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
+      }
+    } catch {}
+  }
   const normalize = (s) => String(s || "").replace(/\n{3,}/g, "\n\n").trim();
 
   // ---------------- TEXT EXTRACTION ----------------
@@ -825,6 +857,7 @@
   async function waitForComposer(ms = 15_000) {
     const t0 = Date.now();
     while (Date.now() - t0 < ms) {
+      if (state.cancel) return null;
       const c = await findComposer();
       if (c) return c;
       await sleep(300);
@@ -990,6 +1023,7 @@
   async function ensureTyped(composer, text) {
     let el = composer;
     for (let attempt = 1; attempt <= 4; attempt++) {
+      if (state.cancel) return el;
       await typePromptIntoComposer(el, text);
       if (FLAGS.eagerSend) {
         const waitForSend = createSendGate({
@@ -1062,11 +1096,13 @@
     // findSendButton already means "visible and enabled" (and, on icon-send
     // sites, "the icon-only arrow is live"), so its first non-null answer is the
     // page accepting the prompt.
+    if (state.cancel) return false;
     const eager = FLAGS.eagerSend;
     const pollMs = eager ? SUBMIT_POLL_MS : 150;
     const tries = eager ? Math.max(1, Math.ceil(SEND_READY_TIMEOUT_MS / pollMs) + 1) : 8;
     let btn = null;
     for (let i = 0; i < tries && !btn; i++) {
+      if (state.cancel) return false;
       btn = findSendButton(composer);
       if (!btn && i + 1 < tries) await sleep(pollMs);
     }
@@ -1185,7 +1221,19 @@
 
   function cancelCurrent() {
     state.cancel = true;
+    // Wake any in-progress sleep so the pipeline notices the cancel now.
+    wakeSleepers();
+    const generating = isStopVisible();
     stopGeneration();
+    // If nothing was sent yet (cancel during typing), remove the text we typed so
+    // it cannot be sent by the next request and the tab is left clean.
+    if (!generating) {
+      findComposer()
+        .then((c) => {
+          if (c && composerText(c).length) clearComposerText(c);
+        })
+        .catch(() => {});
+    }
     setLog("Stopped.");
   }
 
@@ -1193,6 +1241,12 @@
   // not still streaming the previous answer: typing/sending then would hit the
   // STOP button or get swallowed. Idle = no stop button and the last reply did
   // not change between two samples. Bounded, so it can never hang.
+  /* @noapi-shared-start idleCheck */
+  // Is the site still busy with the previous answer? `prev` is the last reply
+  // text (null on the very first probe). Busy while the stop control is visible,
+  // or (once we have a previous sample) while the reply text is still changing.
+  const stillBusy = (stopVisible, cur, prev) => stopVisible || (prev !== null && cur !== prev);
+  /* @noapi-shared-end idleCheck */
   async function waitForIdle(maxMs = 60_000) {
     // If the previous request was ended deliberately (we returned a complete
     // tool call and clicked stop ourselves), the page is already idle — skip
@@ -1206,13 +1260,15 @@
       const n = replyNodes();
       return n.length ? extractText(n[n.length - 1]) : "";
     };
-    let prev = snap();
+    // Probe immediately: if the stop control is already gone we return without
+    // paying the old 700ms sleep before the first look.
+    let prev = null;
     while (Date.now() - t0 < maxMs) {
-      await sleep(700);
       if (state.cancel) throw new Error("Cancelled.");
       const cur = snap();
-      if (!isStopVisible() && cur === prev) return;
+      if (!stillBusy(isStopVisible(), cur, prev)) return;
       prev = cur;
+      await sleep(700);
       setLog(SITE.name + " is still answering the previous message, waiting…", true);
     }
   }
@@ -1795,7 +1851,9 @@
     const sseEnabled = opts.sse !== false;
     if (state.busy) {
       if (reqId) {
-        ext.runtime.sendMessage({ type: "noapi_error", id: reqId, error: "This tab is already handling a prompt." }).catch(() => {});
+        ext.runtime
+          .sendMessage({ type: "noapi_error", id: reqId, error: "This tab is already handling a prompt.", code: "busy" })
+          .catch(() => {});
       }
       return;
     }
@@ -1861,7 +1919,9 @@
 
       const typedLen = scope.textContent.length;
       setLog("Sending prompt to " + SITE.name + "…", true);
-      if (!(await submitComposer(composerNow, prompt))) throw new Error("Could not click Send or trigger Enter on " + SITE.name);
+      const sent = await submitComposer(composerNow, prompt);
+      if (state.cancel) throw new Error("Cancelled.");
+      if (!sent) throw new Error("Could not click Send or trigger Enter on " + SITE.name);
       timings.sent = Date.now() - t0;
 
       setLog("Waiting for " + SITE.name + " to answer…", true);

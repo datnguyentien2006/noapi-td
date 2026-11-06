@@ -191,11 +191,17 @@ const outcome = (p) => p.then((text) => ({ text }), (err) => ({ err: err.message
   const ac = new AbortController();
   const aborted = outcome(b.requestPrompt({ prompt: "hi", site: "stats-site", signal: ac.signal, timeoutMs: 5000 }));
   await sleep(10);
+  const abortId = b.listPending()[0].id;
   ac.abort();
   await aborted;
+  // The slot is now held until the tab acks; release it so the next request runs.
+  b.ackCancelled?.(abortId);
 
   const timedOut = outcome(b.requestPrompt({ prompt: "hi", site: "stats-site", timeoutMs: 40 }));
+  await sleep(10);
+  const timeoutId = b.listPending()[0].id;
   await timedOut;
+  b.ackCancelled?.(timeoutId);
 
   const sseDone = outcome(b.requestPrompt({ prompt: "hi", site: "stats-site", timeoutMs: 5000 }));
   await sleep(10);
@@ -237,6 +243,228 @@ const outcome = (p) => p.then((text) => ({ text }), (err) => ({ err: err.message
   // A flood of distinct site names must not grow memory without bound.
   for (let i = 0; i < 600; i++) b.recordTiming({ id: "x" + i, site: "flood-" + i, startedAt: Date.now() }, { total: 1 });
   ok("overall record count stays bounded", b.timings.length <= 500, String(b.timings.length));
+}
+
+// ---- cancel / queue release race ------------------------------------------
+// A cancelled request must reject its caller immediately, but its per-site slot
+// must stay held until the browser confirms it stopped (ack / terminal message /
+// socket close / safety timeout), so the next request is never delivered while
+// the tab is still unwinding the cancelled one.
+
+// abort: B and C wait for A's ack, then run one at a time.
+{
+  const b = new Bridge();
+  const conn = makeConn();
+  b.register(conn, { site: "race-ack" });
+  const ac = new AbortController();
+  const A = outcome(b.requestPrompt({ prompt: "A", site: "race-ack", signal: ac.signal, timeoutMs: 5000 }));
+  await sleep(10);
+  const idA = b.listPending()[0].id;
+  const B = outcome(b.requestPrompt({ prompt: "B", site: "race-ack", timeoutMs: 5000 }));
+  const C = outcome(b.requestPrompt({ prompt: "C", site: "race-ack", timeoutMs: 5000 }));
+  await sleep(10);
+  ok("only A is dispatched while B and C are queued", conn.sent.filter((m) => m.t === "request").length === 1);
+
+  ac.abort();
+  const rA = await A;
+  ok("A rejects immediately on abort", /cancelled/i.test(rA.err || ""), rA.err);
+  ok("A told the browser to cancel", conn.sent.some((m) => m.t === "cancel" && m.id === idA));
+
+  await sleep(80);
+  ok(
+    "B is NOT dispatched before A's cancel is acked",
+    conn.sent.filter((m) => m.t === "request").length === 1,
+    String(conn.sent.filter((m) => m.t === "request").length)
+  );
+
+  b.ackCancelled?.(idA);
+  await sleep(20);
+  const reqs2 = conn.sent.filter((m) => m.t === "request");
+  ok("B is dispatched after the ack", reqs2.length === 2 && reqs2[1].prompt === "B", JSON.stringify(reqs2.map((r) => r.prompt)));
+  b.respond(conn, reqs2[1].id, "b-answer");
+  const rB = await B;
+  ok("B resolved with its own answer", rB.text === "b-answer", JSON.stringify(rB));
+  const reqs3 = conn.sent.filter((m) => m.t === "request");
+  ok("C is dispatched only after B completes", reqs3.length === 3 && reqs3[2].prompt === "C", JSON.stringify(reqs3.map((r) => r.prompt)));
+  b.respond(conn, reqs3[2].id, "c-answer");
+  const rC = await C;
+  ok("C resolved", rC.text === "c-answer", JSON.stringify(rC));
+  ok("the site queue is empty at the end", b.listPending().length === 0);
+}
+
+// timeout: same deferral on the timeout path.
+{
+  const b = new Bridge();
+  const conn = makeConn();
+  b.register(conn, { site: "race-timeout" });
+  const A = outcome(b.requestPrompt({ prompt: "A", site: "race-timeout", timeoutMs: 60 }));
+  await sleep(10);
+  const idA = b.listPending()[0].id;
+  const B = outcome(b.requestPrompt({ prompt: "B", site: "race-timeout", timeoutMs: 5000 }));
+  const rA = await A;
+  ok("timeout rejects A", /Timed out/.test(rA.err || ""), rA.err);
+  await sleep(30);
+  ok("B waits for the timeout cancel ack", conn.sent.filter((m) => m.t === "request").length === 1);
+  b.ackCancelled?.(idA);
+  await sleep(20);
+  const reqs = conn.sent.filter((m) => m.t === "request");
+  ok("B is dispatched after the timeout ack", reqs.length === 2 && reqs[1].prompt === "B", JSON.stringify(reqs.map((r) => r.prompt)));
+  b.respond(conn, reqs[1].id, "b-answer");
+  const rB = await B;
+  ok("B resolved after the timeout cancel", rB.text === "b-answer", JSON.stringify(rB));
+}
+
+// no ack at all: the safety timeout releases the slot and warns.
+{
+  const logs = [];
+  const b = new Bridge({ log: (m) => logs.push(m), cancelAckMs: 70 });
+  const conn = makeConn();
+  b.register(conn, { site: "race-noack" });
+  const ac = new AbortController();
+  const A = outcome(b.requestPrompt({ prompt: "A", site: "race-noack", signal: ac.signal, timeoutMs: 5000 }));
+  await sleep(10);
+  const B = outcome(b.requestPrompt({ prompt: "B", site: "race-noack", timeoutMs: 5000 }));
+  ac.abort();
+  await A;
+  await sleep(30);
+  ok("B is still queued before the ack timeout", conn.sent.filter((m) => m.t === "request").length === 1);
+  await sleep(80);
+  const reqs = conn.sent.filter((m) => m.t === "request");
+  ok("B proceeds after the safety timeout", reqs.length === 2, String(reqs.length));
+  ok("a warning is logged when no ack arrives", logs.some((l) => /no cancel acknowledgement/i.test(l)), JSON.stringify(logs));
+  b.respond(conn, reqs[1].id, "b-answer");
+  const rB = await B;
+  ok("B resolved after the safety timeout", rB.text === "b-answer", JSON.stringify(rB));
+}
+
+// socket closes while A is being cancelled: the queue is released, B settles.
+{
+  const b = new Bridge();
+  const conn = makeConn();
+  b.register(conn, { site: "race-close" });
+  const ac = new AbortController();
+  const A = outcome(b.requestPrompt({ prompt: "A", site: "race-close", signal: ac.signal, timeoutMs: 5000 }));
+  await sleep(10);
+  const B = outcome(b.requestPrompt({ prompt: "B", site: "race-close", timeoutMs: 5000 }));
+  ac.abort();
+  await A;
+  await sleep(20);
+  ok("B is queued while A's cancel is unacked", conn.sent.filter((m) => m.t === "request").length === 1);
+  conn.closed = true;
+  b.unregister(conn);
+  const rB = await B;
+  ok("closing the socket releases the queue (B settles)", rB.err !== undefined, JSON.stringify(rB));
+  ok("B fails because its tab is gone", /No browser tab/.test(rB.err || ""), rB.err);
+}
+
+// busy: the bridge retries instead of surfacing the busy error.
+{
+  const logs = [];
+  const b = new Bridge({ log: (m) => logs.push(m), busyGiveUpMs: 2000 });
+  const conn = makeConn();
+  b.register(conn, { site: "busy-retry" });
+  const p = outcome(b.requestPrompt({ prompt: "hi", site: "busy-retry", timeoutMs: 5000 }));
+  await sleep(10);
+  const id = b.listPending()[0].id;
+  b.fail(conn, id, "This tab is already handling a prompt.", "busy");
+  await sleep(150);
+  const reqs = conn.sent.filter((m) => m.t === "request");
+  ok("busy triggers a retry with the same id", reqs.length >= 2 && reqs.every((r) => r.id === id), JSON.stringify(reqs.map((r) => r.id)));
+  b.respond(conn, id, "done");
+  const r = await p;
+  ok("a busy rejection is retried, never surfaced", r.text === "done", JSON.stringify(r));
+  ok("busy retries are logged", logs.some((l) => /busy/i.test(l)), JSON.stringify(logs));
+}
+
+// busy forever: give up with a clear error, and free the slot.
+{
+  const b = new Bridge({ log: () => {}, busyGiveUpMs: 120 });
+  const conn = makeConn();
+  b.register(conn, { site: "busy-giveup" });
+  const p = outcome(b.requestPrompt({ prompt: "hi", site: "busy-giveup", timeoutMs: 5000 }));
+  await sleep(10);
+  const id = b.listPending()[0].id;
+  for (let i = 0; i < 6; i++) {
+    b.fail(conn, id, "This tab is already handling a prompt.", "busy");
+    await sleep(60);
+  }
+  const r = await p;
+  ok("busy gives up with a clear error", /stayed busy/i.test(r.err || ""), r.err);
+  ok("the give-up error is not the raw busy text", !/already handling a prompt/i.test(r.err || ""), r.err);
+  ok("the site slot is free after giving up", b.listPending().length === 0);
+}
+
+// a late response/error for a cancelled id releases the slot and is never
+// mistaken for the next request's answer.
+{
+  const b = new Bridge();
+  const conn = makeConn();
+  b.register(conn, { site: "late-site" });
+  const ac = new AbortController();
+  const A = outcome(b.requestPrompt({ prompt: "A", site: "late-site", signal: ac.signal, timeoutMs: 5000 }));
+  await sleep(10);
+  const idA = b.listPending()[0].id;
+  const B = outcome(b.requestPrompt({ prompt: "B", site: "late-site", timeoutMs: 5000 }));
+  ac.abort();
+  await A;
+  b.respond(conn, idA, "late answer for A");
+  await sleep(20);
+  const reqs = conn.sent.filter((m) => m.t === "request");
+  ok("a late response releases the slot", reqs.length === 2, String(reqs.length));
+  ok("the next request keeps its own identity", reqs[1].prompt === "B");
+  b.respond(conn, reqs[1].id, "b-answer");
+  const rB = await B;
+  ok("the next request gets its own answer, not the late one", rB.text === "b-answer", JSON.stringify(rB));
+  ok(
+    "no timing is recorded for the cancelled late response",
+    !(b.timingsSummary().bySite["late-site"]?.recent || []).some((r) => r.id === idA),
+    JSON.stringify(b.timingsSummary().bySite["late-site"])
+  );
+}
+
+// a late error for a cancelled id does the same.
+{
+  const b = new Bridge();
+  const conn = makeConn();
+  b.register(conn, { site: "late-error" });
+  const ac = new AbortController();
+  const A = outcome(b.requestPrompt({ prompt: "A", site: "late-error", signal: ac.signal, timeoutMs: 5000 }));
+  await sleep(10);
+  const idA = b.listPending()[0].id;
+  const B = outcome(b.requestPrompt({ prompt: "B", site: "late-error", timeoutMs: 5000 }));
+  ac.abort();
+  await A;
+  b.fail(conn, idA, "Cancelled.");
+  await sleep(20);
+  const reqs = conn.sent.filter((m) => m.t === "request");
+  ok("a late error releases the slot", reqs.length === 2, String(reqs.length));
+  b.respond(conn, reqs[1].id, "b-answer");
+  const rB = await B;
+  ok("B still resolves after a late error for A", rB.text === "b-answer", JSON.stringify(rB));
+}
+
+// a site with no tab is never served by another site's tab.
+{
+  const b = new Bridge();
+  const claude = makeConn("claude");
+  b.register(claude, { site: "claude" });
+  const r = await outcome(b.requestPrompt({ prompt: "hi", site: "chatgpt", timeoutMs: 5000 }));
+  ok("a site with no tab does not fall back to another site", /No browser tab on "chatgpt"/.test(r.err || ""), r.err);
+  ok("nothing was delivered to the claude tab", claude.sent.filter((m) => m.t === "request").length === 0, JSON.stringify(claude.sent));
+}
+
+// sites() reflects the tabs that are actually connected.
+{
+  const b = new Bridge();
+  const conn = makeConn();
+  b.register(conn, { site: "chatgpt" });
+  b.register(conn, { site: "claude" });
+  const avail = () => b.sites().filter((s) => s.available).map((s) => s.key);
+  ok("one socket can report several sites", avail().includes("chatgpt") && avail().includes("claude"), JSON.stringify(avail()));
+  b.removeSite?.(conn, "claude");
+  ok("removing a site stops reporting it", avail().includes("chatgpt") && !avail().includes("claude"), JSON.stringify(avail()));
+  b.removeSite?.(conn, "chatgpt");
+  ok("a socket with no sites reports none", avail().length === 0, JSON.stringify(avail()));
 }
 
 if (failed) {

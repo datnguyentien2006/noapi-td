@@ -12,6 +12,7 @@
     reconnectDelay: 1000,
     tabs: new Map(), // tabId -> { site, url, port }
     pending: new Map(), // reqId -> tabId
+    cancelling: new Map(), // reqId -> tabId (cancel sent, waiting for the tab's terminal message)
     heartbeatTimer: null,
   };
 
@@ -146,13 +147,20 @@
       const tid = state.pending.get(m.id);
       state.pending.delete(m.id);
       updateAction();
-      if (tid !== undefined) {
-        const info = state.tabs.get(tid);
+      const info = tid !== undefined ? state.tabs.get(tid) : null;
+      if (tid !== undefined && info) {
+        // The tab is (or may be) still running this id. Forward the cancel and
+        // ack the bridge only once the tab reports its terminal message, so the
+        // next request is not delivered while the tab is still unwinding.
+        state.cancelling.set(m.id, tid);
         const cmsg = { type: "noapi_cancel", id: m.id };
         try {
-          if (info?.port) info.port.postMessage(cmsg);
+          if (info.port) info.port.postMessage(cmsg);
           else ext.tabs.sendMessage(tid, cmsg).catch(() => {});
         } catch {}
+      } else {
+        // No tab is running it: ack immediately.
+        sendWs({ t: "cancelled", id: m.id });
       }
       return;
     }
@@ -173,10 +181,8 @@
             break;
           }
         }
-      }
-
-      // Fallback: pick any active tab
-      if (targetTabId === null) {
+      } else {
+        // No site requested: any active tab will do.
         for (const [tid, info] of state.tabs) {
           targetTabId = tid;
           targetInfo = info;
@@ -243,6 +249,11 @@
   // Handle port connections from content scripts (MV3 persistent channel)
   ext.runtime.onConnect.addListener((port) => {
     if (port.name === "noapi-tab") {
+      // Only the top frame may own the tab's port; an iframe must not be able to
+      // overwrite it (and claim to be the site). Firefox may omit frameId, in
+      // which case only the top frame gets a port anyway.
+      const frameId = port.sender?.frameId;
+      if (frameId !== undefined && frameId !== 0) return;
       const tabId = port.sender?.tab?.id;
       if (tabId !== undefined) {
         const existing = state.tabs.get(tabId) || {};
@@ -268,6 +279,9 @@
 
   // Handle one-off messages
   ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    // Only the top frame may drive the tab; an iframe must not impersonate it.
+    const frameId = sender?.frameId;
+    if (frameId !== undefined && frameId !== 0) return;
     const tabId = sender?.tab?.id;
     handleContentMessage(msg, tabId, sendResponse);
     return true; // async
@@ -280,11 +294,12 @@
       case "noapi_hello": {
         if (tabId !== undefined && msg.site) {
           const entry = state.tabs.get(tabId) || {};
+          const changed = entry.site !== msg.site || entry.url !== msg.url;
           entry.site = msg.site;
           entry.url = msg.url;
           state.tabs.set(tabId, entry);
 
-          if (state.connected) {
+          if (state.connected && changed) {
             sendWs({ t: "hello-update", site: msg.site, url: msg.url });
           }
           log(`tab ${tabId} registered on ${msg.site}`);
@@ -313,6 +328,14 @@
       case "noapi_reply": {
         if (msg.id) {
           state.pending.delete(msg.id);
+          if (state.cancelling.has(msg.id)) {
+            // The tab finished a cancelled request anyway; acknowledge the stop
+            // instead of forwarding a reply the caller already gave up on.
+            state.cancelling.delete(msg.id);
+            sendWs({ t: "cancelled", id: msg.id });
+            updateAction();
+            break;
+          }
           sendWs({ t: "response", id: msg.id, text: msg.text, timings: msg.timings || null });
           log(`replied to bridge for request ${msg.id}`);
           updateAction();
@@ -324,7 +347,14 @@
       case "noapi_error": {
         if (msg.id) {
           state.pending.delete(msg.id);
-          sendWs({ t: "error", id: msg.id, error: msg.error });
+          if (state.cancelling.has(msg.id)) {
+            state.cancelling.delete(msg.id);
+            sendWs({ t: "cancelled", id: msg.id });
+            log(`request ${msg.id} confirmed cancelled by the tab`);
+            updateAction();
+            break;
+          }
+          sendWs({ t: "error", id: msg.id, error: msg.error, code: msg.code });
           log(`error for request ${msg.id}: ${msg.error}`);
           updateAction();
         }
@@ -343,12 +373,25 @@
   }
 
   ext.tabs.onRemoved.addListener((tabId) => {
+    const info = state.tabs.get(tabId);
     state.tabs.delete(tabId);
+    // Any cancel this tab still owed: it can never arrive now.
+    for (const [id, tid] of state.cancelling) {
+      if (tid === tabId) {
+        state.cancelling.delete(id);
+        sendWs({ t: "cancelled", id });
+      }
+    }
     for (const [id, tid] of state.pending) {
       if (tid === tabId) {
         state.pending.delete(id);
         sendWs({ t: "error", id, error: "The AI site tab was closed by the user." });
       }
+    }
+    // If no tab serves that site any more, tell the bridge so it stops
+    // advertising it.
+    if (info?.site && ![...state.tabs.values()].some((t) => t.site === info.site)) {
+      sendWs({ t: "site-gone", site: info.site });
     }
     updateAction();
   });

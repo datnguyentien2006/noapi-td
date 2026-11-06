@@ -58,7 +58,7 @@ async function main() {
   let bridge = null;
   let server = null;
   try {
-    const b = new Bridge({ log });
+    const b = new Bridge({ log, cancelAckMs: Number(process.env.NOAPI_CANCEL_ACK_MS) || 5000 });
     server = createHttpServer(b, log, { host: args.host });
     function handleProxyMessage(conn, msg) {
       if (msg.t === "proxy-status") {
@@ -125,12 +125,18 @@ async function main() {
           if (msg.site) b.register(conn, { site: msg.site, url: msg.url });
         } else if (msg.t === "response") {
           b.respond(conn, msg.id, msg.text, msg.timings);
+        } else if (msg.t === "cancelled") {
+          // The tab (or its background) confirms it stopped a cancelled request.
+          b.ackCancelled(msg.id);
+        } else if (msg.t === "site-gone") {
+          // A tab closed and no tab of that site is left.
+          b.removeSite(conn, msg.site);
         } else if (msg.t === "progress") {
           b.progress(msg.id, msg.status);
         } else if (msg.t === "partial") {
           b.partial(msg.id, msg.text);
         } else if (msg.t === "error") {
-          b.fail(conn, msg.id, msg.error);
+          b.fail(conn, msg.id, msg.error, msg.code);
         } else if (msg.t === "ping") {
           conn.send(JSON.stringify({ t: "pong" }));
         } else if (conn.isProxy) {
