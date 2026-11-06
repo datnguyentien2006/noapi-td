@@ -18,6 +18,7 @@ import { createHttpServer } from "./http.js";
 import { attachWebSocketServer } from "./ws.js";
 import { requestAllowed } from "./security.js";
 import { runMcpStdio, ProxyGateway } from "./mcp.js";
+import { tuningFromEnv, sseTextFromEnv } from "./tuning.js";
 
 function parseArgs(argv) {
   const args = { port: 8787, host: "127.0.0.1", mcp: false };
@@ -77,6 +78,8 @@ async function main() {
             earlyReturn: msg.early_return !== false,
             earlyReturnMs: Number(msg.early_return_ms) || 400,
             toolNames: Array.isArray(msg.tool_names) ? msg.tool_names : [],
+            tuning: tuningFromEnv(),
+            sseText: sseTextFromEnv(),
           })
           .then((text) => {
             conn.send(JSON.stringify({ t: "proxy-response", id: msg.id, data: text }));
@@ -132,7 +135,7 @@ async function main() {
           // A tab closed and no tab of that site is left.
           b.removeSite(conn, msg.site);
         } else if (msg.t === "progress") {
-          b.progress(msg.id, msg.status);
+          b.progress(msg.id, msg.status, { site: msg.site, lateGrowth: msg.lateGrowth });
         } else if (msg.t === "partial") {
           b.partial(msg.id, msg.text);
         } else if (msg.t === "error") {

@@ -222,6 +222,11 @@
         sse: m.sse !== false,
         // Phase 5: NOAPI_NEW_CHAT=1 asks the tab to open a fresh chat first.
         newChat: m.new_chat === true,
+        // Task 1: timing knobs the bridge read from its environment and forwarded
+        // because a content script cannot read process.env.
+        tuning: m.tuning && typeof m.tuning === "object" ? m.tuning : null,
+        // Task 5: optional SSE-text fast path (default off).
+        sseText: m.sse_text === true,
       };
 
       try {
@@ -314,7 +319,18 @@
       }
 
       case "noapi_progress": {
-        if (msg.id) sendWs({ t: "progress", id: msg.id, status: msg.status });
+        // A late-growth report can arrive with no request in flight (the
+        // truncation canary fires ~1s after a turn ended), so forward it even
+        // without an id and let the bridge count it per site.
+        if (msg.id || Number(msg.lateGrowth) > 0) {
+          sendWs({
+            t: "progress",
+            id: msg.id,
+            status: msg.status,
+            site: msg.site,
+            lateGrowth: Number(msg.lateGrowth) || 0,
+          });
+        }
         sendResponse?.({ ok: true });
         break;
       }

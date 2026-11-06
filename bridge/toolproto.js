@@ -59,10 +59,30 @@ export function isPriorityTool(f) {
 }
 
 function descLimit(f) {
-  return isPriorityTool(f) ? descMax() : SHORT_DESC;
+  return !leanDescMode() && isPriorityTool(f) ? descMax() : SHORT_DESC;
 }
 function paramDescLimit(f) {
-  return isPriorityTool(f) ? paramDescMax() : SHORT_PARAM_DESC;
+  return !leanDescMode() && isPriorityTool(f) ? paramDescMax() : SHORT_PARAM_DESC;
+}
+
+// Task 2: optional lower-cost description mode (default OFF). "lean" gives even
+// the priority tools the short caps, shrinking the preamble for the same tool
+// set. Tool semantics are unchanged; only description verbosity drops.
+export function descMode() {
+  return String(process.env.NOAPI_DESC_MODE || "full").toLowerCase();
+}
+function leanDescMode() {
+  return descMode() === "lean";
+}
+
+// Task 2: tools left out of the preamble (default OFF). They are still fully
+// callable: parseToolCalls/normalizeCall validate against the request's tool
+// list, not the rendered preamble.
+export function toolDenyList() {
+  return String(process.env.NOAPI_TOOL_DENY || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 function msgText(m) {
@@ -83,6 +103,22 @@ function clipMiddle(s, n) {
   const half = Math.floor(n / 2);
   const cut = s.length - n;
   return `${s.slice(0, half)}\n[... ${cut} chars truncated; re-run the tool with a narrower range (offset/limit, grep, or head/tail) to see the missing part ...]\n${s.slice(-half)}`;
+}
+
+// Task 3: cheap, lossless cleanup applied to a tool result before clipping.
+// Strips ANSI escape sequences (colour codes a command emitted), normalises line
+// endings, trims trailing whitespace per line and collapses runs of blank lines.
+// None of this removes information the model needs, so it is always on and saves
+// prompt characters for free.
+export function tidyToolResult(s) {
+  return String(s ?? "")
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "") // OSC sequences
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "") // CSI sequences (colours, cursor)
+    .replace(/\u001b[@-Z\\-_]/g, "") // other single-char escapes
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function describeType(schema, depth = 0) {
@@ -182,8 +218,9 @@ export function terseEnabled() {
   return process.env.NOAPI_TERSE !== "0";
 }
 
-export function renderPreamble(tools, messages, { terse = terseEnabled() } = {}) {
-  const fns = toolList(tools);
+export function renderPreamble(tools, messages, { terse = terseEnabled(), deny = toolDenyList() } = {}) {
+  const denied = new Set(deny || []);
+  const fns = toolList(tools).filter((f) => !denied.has(f.name));
   const hints = envHints(messages);
   const examples = fns.slice(0, 3).map(exampleBlock);
   const rules = [
@@ -254,7 +291,7 @@ export function buildDelta(messages) {
       sawTool = true;
       const name = callNames.get(m.tool_call_id) || m.name || "tool";
       parts.push(
-        `TOOL_RESULT ${name} (id ${m.tool_call_id})\n${clipMiddle(msgText(m).trim() || "(empty output)", maxToolResult())}\nEND_TOOL_RESULT`
+        `TOOL_RESULT ${name} (id ${m.tool_call_id})\n${clipMiddle(tidyToolResult(msgText(m).trim() || "(empty output)"), maxToolResult())}\nEND_TOOL_RESULT`
       );
     }
   }

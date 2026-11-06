@@ -5,10 +5,12 @@
 //  - /health               JSON status
 //  - /                     human status dashboard
 import http from "node:http";
+import fs from "node:fs";
 import { SITES, SITE_KEYS } from "./sites.js";
 import { requestAllowed } from "./security.js";
 import { buildPrompt, parseToolCalls, toolList, toolsHash, isTitleRequest, localTitle } from "./toolproto.js";
 import { StreamFilter, streamEnabled } from "./streamfilter.js";
+import { tuningFromEnv, sseTextFromEnv } from "./tuning.js";
 
 function readBody(req, limit = 5 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
@@ -102,20 +104,20 @@ async function render() {
     const t = s.timings || {};
     const fmt = v => (v == null ? "" : Math.round(v) + " ms");
     const timingRows = Object.entries(t.bySite || {}).map(([site, v]) =>
-      \`<tr><td>\${site}</td><td>\${v.avg.count}</td><td>\${fmt(v.last.total)}</td><td>\${fmt(v.last.composer)}</td><td>\${fmt(v.last.typed)}</td><td>\${fmt(v.last.sent)}</td><td>\${fmt(v.last.firstText)}</td><td>\${fmt(v.last.complete)}</td><td>\${fmt(v.avg.total)}</td></tr>\`
-    ).join("") || '<tr><td colspan="9">no completed requests yet</td></tr>';
+      \`<tr><td>\${site}</td><td>\${v.avg.count}</td><td>\${fmt(v.last.total)}</td><td>\${fmt(v.last.composer)}</td><td>\${fmt(v.last.typed)}</td><td>\${fmt(v.last.sent)}</td><td>\${fmt(v.last.firstText)}</td><td>\${fmt(v.last.complete)}</td><td>\${fmt(v.last.postToken)}</td><td>\${v.last.replyChars ?? ""}</td><td>\${fmt(v.avg.total)}</td></tr>\`
+    ).join("") || '<tr><td colspan="11">no completed requests yet</td></tr>';
     const statRows = Object.entries(s.stats || {}).map(([site, v]) =>
-      \`<tr><td>\${site}</td><td>\${v.requests}</td><td>\${v.completedBySse}</td><td>\${v.completedByStop}</td><td>\${v.completedByFallback}</td><td>\${v.sseSeen}</td><td>\${v.earlyReturn}</td><td>\${v.resubmits}</td><td>\${v.aborted}</td><td>\${v.timeouts}</td></tr>\`
-    ).join("") || '<tr><td colspan="10">no requests yet</td></tr>';
+      \`<tr><td>\${site}</td><td>\${v.requests}</td><td>\${v.completedBySse}</td><td>\${v.completedByStop}</td><td>\${v.completedByFallback}</td><td>\${v.sseSeen}</td><td>\${v.earlyReturn}</td><td>\${v.resubmits}</td><td>\${v.aborted}</td><td>\${v.timeouts}</td><td class="\${v.lateGrowth ? "bad" : ""}">\${v.lateGrowth || 0}</td></tr>\`
+    ).join("") || '<tr><td colspan="11">no requests yet</td></tr>';
     el.innerHTML = \`
       <h2>browser clients</h2>
       <table><tr><th>id</th><th>site</th><th>url</th></tr>\${clientRows}</table>
       <h2>pending requests</h2>
       <table><tr><th>id</th><th>site</th><th>chars</th><th>waiting</th></tr>\${pendingRows}</table>
       <h2>timings (last request per site, and average)</h2>
-      <table><tr><th>site</th><th>n</th><th>total</th><th>composer</th><th>typed</th><th>sent</th><th>first&nbsp;text</th><th>complete</th><th>avg&nbsp;total</th></tr>\${timingRows}</table>
+      <table><tr><th>site</th><th>n</th><th>total</th><th>composer</th><th>typed</th><th>sent</th><th>first&nbsp;text</th><th>complete</th><th>post&nbsp;tok</th><th>reply&nbsp;chars</th><th>avg&nbsp;total</th></tr>\${timingRows}</table>
       <h2>debug counters (per site, since start)</h2>
-      <table><tr><th>site</th><th>requests</th><th>by sse</th><th>by stop</th><th>by fallback</th><th>sse seen</th><th>early</th><th>resubmits</th><th>aborted</th><th>timeouts</th></tr>\${statRows}</table>
+      <table><tr><th>site</th><th>requests</th><th>by sse</th><th>by stop</th><th>by fallback</th><th>sse seen</th><th>early</th><th>resubmits</th><th>aborted</th><th>timeouts</th><th>late growth</th></tr>\${statRows}</table>
       <h2>models</h2>
       <table><tr><th>id</th><th>name</th><th>status</th></tr>\${siteRows}</table>\`;
   } catch (e) {
@@ -198,6 +200,11 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         // Phase 3: observe the page's own SSE stream as a completion signal.
         // NOAPI_SSE=0 disables it (forwarded as sse:false).
         const sse = process.env.NOAPI_SSE !== "0";
+        // Task 1: timing knobs for the content script (read here, forwarded per
+        // request; a content script cannot read process.env). Task 5: optional
+        // SSE-text fast path, default off.
+        const tuning = tuningFromEnv();
+        const sseText = sseTextFromEnv();
         const toolNames = tools.map((t) => t.name);
 
         // Re-send the tool protocol for new conversations or when the tool set changed.
@@ -211,6 +218,16 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         if (newChat) bridge.toolHashes.delete(model);
         const includePreamble = tools.length > 0 && (fresh || bridge.toolHashes.get(model) !== hash);
         const { prompt } = buildPrompt(messages, tools, { includePreamble });
+        // Task 2: dump the exact prompt (preamble + first turn) sent to the site
+        // so its size and per-tool cost can be measured without a live change.
+        if (process.env.NOAPI_DUMP_PREAMBLE === "1") {
+          try {
+            fs.writeFileSync("noapi-preamble.txt", prompt);
+            log(`dumped preamble (${prompt.length} chars) to noapi-preamble.txt`);
+          } catch (err) {
+            log(`could not dump preamble: ${err.message}`);
+          }
+        }
         const titleOnly = isTitleRequest(messages, tools);
         if (!prompt && !titleOnly) {
           errorJson(res, 400, "No user message found in request.");
@@ -243,6 +260,8 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
                 toolNames,
                 sse,
                 newChat,
+                tuning,
+                sseText,
               });
 
         if (!stream) {

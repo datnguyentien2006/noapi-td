@@ -85,7 +85,18 @@ async function run() {
   for (const stage of ["composer", "typed", "sent", "firstText", "complete"]) {
     if (typeof t.last[stage] !== "number") throw new Error(`timing stage ${stage} missing: ${JSON.stringify(t.last)}`);
   }
-  console.log(`   ✓ timings exposed (total=${t.last.total}ms, firstText=${t.last.firstText}ms, complete=${t.last.complete}ms)`);
+  // Task 0: the report is only useful if the size fields and the post-token
+  // overhead (the number every fast path is chasing) are present.
+  if (typeof t.last.promptChars !== "number" || t.last.promptChars < 1) {
+    throw new Error(`promptChars missing from timings: ${JSON.stringify(t.last)}`);
+  }
+  if (typeof t.last.replyChars !== "number" || t.last.replyChars < 1) {
+    throw new Error(`replyChars missing from timings: ${JSON.stringify(t.last)}`);
+  }
+  if (typeof t.last.postToken !== "number" || t.last.postToken < 0) {
+    throw new Error(`postToken missing from timings: ${JSON.stringify(t.last)}`);
+  }
+  console.log(`   ✓ timings exposed (total=${t.last.total}ms, firstText=${t.last.firstText}ms, complete=${t.last.complete}ms, postToken=${t.last.postToken}ms, prompt=${t.last.promptChars}ch, reply=${t.last.replyChars}ch)`);
 
   // Step 4: Test HTTP chat completions (streaming)
   console.log("4. Testing POST /v1/chat/completions (streaming)...");

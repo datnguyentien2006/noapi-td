@@ -297,20 +297,39 @@ Every latency fast path can be turned off to compare a run with it on against a 
 | `observerDriven` | extension storage (panel) | on | Wake the completion loop on DOM events instead of polling every 400ms. Off = the old interval-only loop. |
 | `eagerSend` | extension storage (panel) | on | Click Send the moment the site enables it instead of after a fixed 150ms. Off = the old fixed settle. |
 | `sseObserver` | extension storage (panel) | on | Use the page's own SSE stream as a completion signal. Off = the DOM-only completion path. |
+| `sseText` | extension storage (panel) | off | **Experimental.** Let the SSE observer decode the page's stream for an even earlier tool-call trigger. The reply text still comes from the DOM. Also needs `NOAPI_SSE_TEXT=1` on the bridge (the two are ANDed). |
 | `NOAPI_SSE` | env (bridge) | on | Set to `0` to stop using the page's SSE stream for this bridge. The panel flag and this env var are ANDed. |
 | `NOAPI_EARLY_RETURN` | env (bridge) | on | Set to `0` to disable the early return on a complete `TOOL_CALL` block **and** the stop click; the turn then falls back to normal completion detection. |
 | `NOAPI_EARLY_RETURN_MS` | env (bridge) | `400` | Grace window after the last reply text before an early return is allowed. Clamped to 50–5000. |
 | `NOAPI_TERSE` | env (bridge) | on | Set to `0` to drop the "terse output" rules from the tool preamble (no prose between tool calls, concise final answers). |
 | `NOAPI_NEW_CHAT` | env (bridge) | off | Set to `1` to open a fresh chat for every new OpenCode conversation (see below). |
+| `NOAPI_SSE_TEXT` | env (bridge) | off | Arms the stream-decoding path. ANDed with the panel `sseText` flag. |
 
-Supporting knobs, not fast paths: `NOAPI_MAX_TOOL_RESULT` (`16000`), `NOAPI_DESC_MAX` (`400`), `NOAPI_PARAM_DESC_MAX` (`400`) and `NOAPI_STREAM` (on) — see below.
+Supporting knobs, not fast paths: `NOAPI_MAX_TOOL_RESULT` (`16000`), `NOAPI_DESC_MAX` (`400`), `NOAPI_PARAM_DESC_MAX` (`400`), `NOAPI_DESC_MODE`, `NOAPI_TOOL_DENY`, `NOAPI_DUMP_PREAMBLE` and `NOAPI_STREAM` (on) — see below.
 
 | Env var | Default | What it does |
 |---|---|---|
-| `NOAPI_MAX_TOOL_RESULT` | `16000` | Characters of a tool result sent back to the site (head + tail). Truncation always says how much was cut. |
+| `NOAPI_MAX_TOOL_RESULT` | `16000` | Characters of a tool result sent back to the site (head + tail). Truncation always says how much was cut. A lower value such as `6000`–`8000` shrinks every tool-result turn and can cut latency, at the cost of the model seeing less of a long output (re-run the tool with a narrower range for the rest). |
 | `NOAPI_DESC_MAX` | `400` | Description cap for priority tools (edit, write, bash, read, patch-like, or any tool with an `oldString`/`newString`/`replace` parameter). Other tools stay at 180. |
 | `NOAPI_PARAM_DESC_MAX` | `400` | Parameter-description cap for those same priority tools. Other tools stay at 90. |
+| `NOAPI_DESC_MODE` | `full` | Set to `lean` to give even the priority tools the short caps, shrinking the preamble for the same tool set. Tool semantics are unchanged. |
+| `NOAPI_TOOL_DENY` | empty | Comma-separated tool names to leave out of the preamble. They stay fully callable: the bridge validates a call against the request's tool list, not the rendered preamble. |
+| `NOAPI_DUMP_PREAMBLE` | off | Set to `1` to write the exact prompt (preamble + first turn) sent to the site into `./noapi-preamble.txt` and log its length. |
 | `NOAPI_STREAM` | on | Set to `0` to stop streaming live deltas and emit the reply once at the end (the old behaviour). |
+
+### Timing knobs (for A/B runs)
+
+Every timing constant the content script uses can be overridden per request without editing source, so you can measure a value before changing a default. The bridge reads each variable at request time and forwards it to the tab (a content script cannot read `process.env`). All values are clamped, and an unset, empty or invalid variable keeps the shipped default.
+
+| Env var | Default | What it does | Range |
+|---|---|---|---|
+| `NOAPI_DEBOUNCE_MS` | per site (`350`–`550`) | How long the reply must be unchanged before the DOM path calls it complete. | 30–5000 |
+| `NOAPI_SSE_END_REREAD_MS` | `120` | Re-read the reply node after the page's SSE stream closes, to catch a final paint. | 0–5000 |
+| `NOAPI_EARLY_RETURN_REREAD_MS` | `120` | Re-read after the early-return stop click, so a block mid-write is not cut. | 0–5000 |
+| `NOAPI_EXTRACT_THROTTLE_MS` | `120` | Minimum gap between DOM reads of the growing reply. | 10–5000 |
+| `NOAPI_FALLBACK_TICK_MS` | `400` | Safety-net poll interval (shadow-DOM sites and the timeout/stop checks). | 50–10000 |
+| `NOAPI_PARTIAL_THROTTLE_MS` | `150` | Minimum gap between live partials forwarded to OpenCode. | 20–5000 |
+| `NOAPI_EARLY_RETURN_HARD_CAP_MS` | `1500` | Longest wait for a possible second tool block before stopping early. | 50–30000 |
 
 ### `NOAPI_NEW_CHAT=1` — a fresh chat per session
 
@@ -345,6 +364,35 @@ Only one fresh chat is opened per session (the first request); later turns in th
    Prints, per site: request count, median and p90 of `firstText` / `complete` / `total`, and the share of each `completedBy` value (`sse`, `stop-button`, `fallback-2200`, `early-return`). Below 5 requests it says *too few samples to compare* instead of pretending.
 
 Flip only **one** flag per pair so the table reflects that flag. `/health` keeps at least 50 recent requests per site, so a single capture covers a normal A/B pair; for a clean read, capture right after a run so old turns are not mixed in.
+
+### Measuring latency in more detail
+
+`tools/report-latency.js` reads the same `/health` counters and prints, per site, the **median and p90** of every stage, plus the median prompt size and the truncation canary. It needs a running bridge:
+
+```bash
+node tools/report-latency.js            # defaults to http://127.0.0.1:8787
+node tools/report-latency.js http://127.0.0.1:8788 --json
+```
+
+Output covers `composer`, `typed`, `sent`, `firstText`, `lastToken`, `complete`, `postToken` (the client overhead *after* the model's last token — the number every fast path is chasing), `total`, the median `promptChars`, and `lateGrowth`. **`lateGrowth` must stay 0**: any other value means a completion fast path returned a reply that the page kept painting afterwards, i.e. the reply was truncated. The content script re-reads the last reply node ~1s after a turn and reports the growth, and the bridge logs and counts it per site.
+
+`tools/prompt-report.js` measures the prompt the bridge sends, without a browser. It reads a tool-set fixture (a representative OpenCode set ships in `tools/fixtures/opencode-tools.json` — replace it with a captured real request body for exact numbers) and reports the full first-turn prompt length, the marginal preamble cost of each tool, what `NOAPI_DESC_MODE=lean` and `NOAPI_TOOL_DENY` save, and the characters the lossless tool-result cleanup removes:
+
+```bash
+node tools/prompt-report.js
+```
+
+### A manual real-site check
+
+To sanity-check the tuning against the real ChatGPT page:
+
+1. With the defaults, run **20 real turns** in one OpenCode session, then `node tools/report-latency.js` and note `postToken`, `total`, the median `promptChars` and `lateGrowth`.
+2. Re-run with the tuned values, for example:
+   ```bash
+   NOAPI_EARLY_RETURN_MS=200 NOAPI_DEBOUNCE_MS=250 NOAPI_SSE_END_REREAD_MS=60 npm start
+   ```
+   Run another 20 turns and `node tools/report-latency.js` again.
+3. Compare `postToken` and `total` per site. `lateGrowth` must still be 0 in both runs; if it is not, the faster value is cutting replies and should not be adopted.
 
 The MCP server offers three tools: `chat` (ask a site), `status` and `sites`.
 
@@ -451,6 +499,7 @@ I would rather tell you now than have you find out later.
 - 🏠 The bridge listens on `127.0.0.1` only. Nothing is exposed to your network.
 - 🚫 No analytics, no tracking, no external servers.
 - 🍪 The extension never reads or stores your passwords or cookies. It only types into and reads from the chat page you already opened.
+- 🔒 To tell when an answer is finished, a small observer watches the page's *own* network calls. By default it never reads the response body — it only notes when the site's stream starts and ends. Only if you opt in to the experimental `sseText` flag (and `NOAPI_SSE_TEXT=1`) does it decode the stream inside your browser to notice a tool call slightly earlier. That text never leaves your machine, and the reply that is returned still comes from the page itself.
 - 👀 It is plain JavaScript with no build step, so what you read is what runs.
 
 <br>

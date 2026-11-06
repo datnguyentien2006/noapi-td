@@ -13,6 +13,9 @@ import {
   descMax,
   paramDescMax,
   terseEnabled,
+  descMode,
+  toolDenyList,
+  tidyToolResult,
 } from "../bridge/toolproto.js";
 
 let failed = 0;
@@ -203,6 +206,41 @@ for (const [label, p] of [
   ok(`${label}: still teaches batching and STOP`, /batch/i.test(p) && /ONE reply/i.test(p) && /STOP writing/.test(p));
   ok(`${label}: still ends with the AVAILABLE TOOLS section`, /AVAILABLE TOOLS:/.test(p));
 }
+
+// ---- Task 3: lossless tool-result cleanup --------------------------------
+// Only whitespace/escape noise is removed; every visible character survives.
+const ansi = "\u001b[32m✓\u001b[39m all good   \r\n\r\n\r\n\r\ndone   \n";
+ok("cleanup strips ANSI colour codes", !tidyToolResult(ansi).includes("\u001b["));
+ok("cleanup keeps the visible text and marks", tidyToolResult(ansi).includes("✓ all good"));
+ok("cleanup normalises CRLF to LF", !tidyToolResult(ansi).includes("\r"));
+ok("cleanup trims trailing whitespace per line", tidyToolResult("a   \nb\t\n").split("\n")[0] === "a");
+ok("cleanup collapses runs of blank lines", tidyToolResult("a\n\n\n\n\nb") === "a\n\nb", JSON.stringify(tidyToolResult("a\n\n\n\n\nb")));
+ok("cleanup leaves a single blank line alone", tidyToolResult("a\n\nb") === "a\n\nb");
+ok("cleanup trims the ends", tidyToolResult("\n\n  hi  \n\n") === "hi");
+ok("cleanup on empty/undefined is an empty string", tidyToolResult(undefined) === "" && tidyToolResult("") === "");
+// A tool result is cleaned before clipping (the cleanup is always on).
+ok("buildDelta applies the cleanup to tool results", buildDelta(toolMsg("\u001b[31mboom\u001b[39m   ")).text.includes("boom") && !buildDelta(toolMsg("\u001b[31mboom\u001b[39m   ")).text.includes("\u001b[31m"));
+
+// ---- Task 2: lean description mode (default OFF) --------------------------
+ok("description mode defaults to full", descMode() === "full", descMode());
+ok("deny list is empty by default", toolDenyList().length === 0);
+process.env.NOAPI_DESC_MODE = "lean";
+ok("lean mode is reported", descMode() === "lean");
+const leanPre = renderPreamble(openCodeTools, []);
+ok("lean: a priority tool is clipped to the short cap", leanPre.includes(`* bash: ${"L".repeat(179)}...`) && !leanPre.includes(`* bash: ${LONG}`));
+ok("lean: semantics are unchanged", leanPre.includes("* bash:") && leanPre.includes("command (required)") && /AVAILABLE TOOLS:/.test(leanPre));
+delete process.env.NOAPI_DESC_MODE;
+ok("description mode returns to full", descMode() === "full");
+
+// ---- Task 2: NOAPI_TOOL_DENY leaves tools out of the preamble -------------
+process.env.NOAPI_TOOL_DENY = "web_search, mystery";
+ok("deny list is parsed and trimmed", JSON.stringify(toolDenyList()) === JSON.stringify(["web_search", "mystery"]), JSON.stringify(toolDenyList()));
+const deniedPre = renderPreamble(openCodeTools, []);
+ok("a denied tool is left out of the preamble", !deniedPre.includes("* web_search:") && !deniedPre.includes("* mystery:"));
+ok("non-denied tools are still listed", deniedPre.includes("* bash:") && deniedPre.includes("* read:"));
+ok("denied tools stay parseable (not the preamble that validates)", parseToolCalls('TOOL_CALL\n{"name":"web_search","arguments":{"query":"x"}}', [fn("web_search", { query: { type: "string" } })]).calls.length === 1);
+delete process.env.NOAPI_TOOL_DENY;
+ok("deny list is empty again", toolDenyList().length === 0);
 
 // ---- parsing is unaffected ---------------------------------------------
 const twoCalls = [

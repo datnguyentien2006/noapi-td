@@ -1,12 +1,19 @@
-// NOAPI? SSE observer. OBSERVATION ONLY.
+// NOAPI? SSE observer.
 //
 // This file runs in the page's MAIN world so it can see the page's own
-// window.fetch. It wraps fetch for exactly one reason: to learn when the website
-// starts and finishes a text/event-stream (SSE) response, so the content script
-// can treat "the site's stream ended" as "the answer is complete" instead of
-// waiting for the debounce. It never reads or parses the body, never changes a
-// request or a response, never calls a site API, and never hardcodes a URL - it
-// only watches the traffic the page already makes by itself.
+// window.fetch. It wraps fetch for two reasons:
+//
+//   1. (always) learn when the website starts and finishes a text/event-stream
+//      (SSE) response, so the content script can treat "the site's stream ended"
+//      as "the answer is complete" instead of waiting for the debounce. It never
+//      changes a request or a response, never calls a site API, and never
+//      hardcodes a URL - it only watches the traffic the page already makes.
+//
+//   2. (only when the page sets data-noapi-sse-text="1", default off) decode the
+//      stream body to extract the reply text as it arrives and post it as an
+//      earlier trigger for the content script. This is opt-in per request: with
+//      the flag off, the body is never read, exactly as before. The content
+//      script still uses the DOM text as the authoritative reply.
 //
 // Events posted to the content script:
 //   "started" - an SSE response just began.
@@ -14,6 +21,7 @@
 //   "error"   - the stream errored, was aborted, or its end cannot be observed.
 //               This is deliberately NOT "ended": an errored/aborted stream must
 //               not be reported as a complete answer (it could truncate a reply).
+//   "delta"   - (only with the text flag) the accumulated reply text so far.
 //
 // Chrome loads this as a "world": "MAIN" content script (see manifest.json).
 // Firefox does not support MAIN-world content scripts on our minimum version, so
@@ -48,11 +56,32 @@
     else el.setAttribute(ATTR, token);
   } catch {}
 
-  const post = (event) => {
+  const post = (event, extra) => {
     try {
-      window.postMessage({ source: "noapi-sse", token, event, at: Date.now() }, location.origin);
+      window.postMessage({ source: "noapi-sse", token, event, at: Date.now(), ...(extra || {}) }, location.origin);
     } catch {}
   };
+
+  // Task 5: opt-in stream-body decoding. "1" means the content script wants
+  // "delta" events for this request; anything else leaves the body untouched.
+  const TEXT_ATTR = "data-noapi-sse-text";
+  const textEnabled = () => {
+    try {
+      return document.documentElement.getAttribute(TEXT_ATTR) === "1";
+    } catch {
+      return false;
+    }
+  };
+
+  // ChatGPT stream parser placeholder. The stream format is undocumented, so the
+  // parser must be written against a captured sample
+  // (tools/fixtures/chatgpt-stream.txt). That sample is not present in this
+  // checkout, so this returns null and no "delta" events are posted; everything
+  // else (UTF-8 decoding, SSE frame splitting, token-guarded posting, content
+  // script handling) is wired and ready for the parser.
+  function extractChatGptText(_frame) {
+    return null;
+  }
 
   const origFetch = window.fetch;
   if (typeof origFetch !== "function") return;
@@ -72,11 +101,41 @@
             // Drain a clone in the background so we can tell when the stream
             // ends. The page keeps its own body untouched, byte for byte.
             const clone = res.clone ? res.clone() : null;
+            const wantText = textEnabled() && typeof TextDecoder === "function";
+            const decoder = wantText ? new TextDecoder() : null;
+            let sseBuf = "";
+            let acc = "";
             if (clone && clone.body && typeof clone.body.getReader === "function") {
               const reader = clone.body.getReader();
               const pump = () =>
                 reader.read().then(
-                  ({ done }) => (done ? post("ended") : pump()),
+                  ({ done, value }) => {
+                    if (done) {
+                      post("ended");
+                      return;
+                    }
+                    if (decoder && value) {
+                      try {
+                        sseBuf += decoder.decode(value, { stream: true });
+                        let idx;
+                        while ((idx = sseBuf.indexOf("\n\n")) !== -1) {
+                          const frame = sseBuf.slice(0, idx);
+                          sseBuf = sseBuf.slice(idx + 2);
+                          const t = extractChatGptText(frame);
+                          if (t) {
+                            acc += t;
+                            post("delta", { text: acc });
+                          }
+                        }
+                      } catch {
+                        // A decode/parse failure must never turn into an "ended":
+                        // fall back to the DOM path for the rest of the turn.
+                        post("error");
+                        return;
+                      }
+                    }
+                    pump();
+                  },
                   // A rejected read means the stream errored or the user
                   // aborted it. The answer is NOT complete: report an error so
                   // the content script falls back to the DOM path instead of

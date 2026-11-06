@@ -65,6 +65,11 @@ export class Bridge {
         resubmits: 0,
         aborted: 0,
         timeouts: 0,
+        // Truncation canary: how many times the page grew the last reply after
+        // the turn was already returned, and the total extra characters. Both
+        // must stay 0 for the fast paths to be trustworthy.
+        lateGrowth: 0,
+        lateGrowthChars: 0,
       };
       this.stats.set(key, s);
     }
@@ -200,6 +205,8 @@ export class Bridge {
     toolNames = [],
     sse = true,
     newChat = false,
+    tuning = null,
+    sseText = false,
   }) {
     const key = site || "*";
     const prev = this.locks.get(key) || Promise.resolve();
@@ -243,6 +250,8 @@ export class Bridge {
         toolNames,
         sse,
         newChat,
+        tuning,
+        sseText,
         slot,
       });
     } finally {
@@ -264,6 +273,8 @@ export class Bridge {
     toolNames = [],
     sse = true,
     newChat = false,
+    tuning = null,
+    sseText = false,
     slot = null,
   }) {
     return new Promise((resolve, reject) => {
@@ -340,6 +351,12 @@ export class Bridge {
         sse: Boolean(sse),
         // Phase 5: NOAPI_NEW_CHAT=1 asks the tab to open a fresh chat first.
         new_chat: Boolean(newChat),
+        // Task 1: timing knobs read from the bridge environment and forwarded
+        // because a content script cannot read process.env. Absent keys keep the
+        // content script's shipped defaults.
+        tuning: tuning && typeof tuning === "object" ? tuning : null,
+        // Task 5: optional SSE-text fast path (default off).
+        sse_text: Boolean(sseText),
       });
       record.payload = payload;
       let delivered = 0;
@@ -443,12 +460,28 @@ export class Bridge {
     }, delay);
   }
 
-  progress(id, status) {
+  progress(id, status, { site = null, lateGrowth = 0 } = {}) {
+    // The truncation canary may arrive with no request in flight (it fires ~1s
+    // after a turn ended), so count it before the request lookup.
+    const extra = Number(lateGrowth);
+    if (Number.isFinite(extra) && extra > 0) this.lateGrowth(site, extra);
+    if (!status) return;
     const record = this.pending.get(id);
-    if (!record || !status) return;
+    if (!record) return;
     try {
       record.onProgress?.(String(status));
     } catch {}
+  }
+
+  // Truncation canary: the page grew the last reply after the turn was already
+  // returned. Any occurrence means a completion fast path may have cut a reply.
+  lateGrowth(site, chars) {
+    const stats = this.statsFor(site);
+    stats.lateGrowth += 1;
+    stats.lateGrowthChars += Math.max(0, Math.round(Number(chars) || 0));
+    this.log(
+      `warning: late reply growth after completion on ${site || "any"} (+${chars} chars) - a fast path may have truncated a reply`
+    );
   }
 
   // Streaming text so far, from the browser. Advisory only: the final
@@ -478,14 +511,19 @@ export class Bridge {
       record.reject(new Error("The browser returned an empty response."));
       return;
     }
-    this.recordTiming(record, timings);
+    this.recordTiming(record, timings, clean.length);
     this.log(`response ${id} received (${clean.length} chars)`);
     record.resolve(clean);
   }
 
   // Keep the last few timing records and log a one-line summary per request.
-  recordTiming(record, timings) {
+  recordTiming(record, timings, replyChars = null) {
     const entry = { id: record.id, site: record.site, at: Date.now(), total: Date.now() - record.startedAt };
+    // Prompt / reply sizes make the A/B report able to tell a slow reply from a
+    // big one, and postToken = the client overhead after the model's last token.
+    const promptChars = String(record.prompt || "").length;
+    if (promptChars) entry.promptChars = promptChars;
+    if (Number.isFinite(Number(replyChars))) entry.replyChars = Number(replyChars);
     if (timings && typeof timings === "object") {
       for (const k of TIMING_STAGES) {
         if (Number.isFinite(Number(timings[k]))) entry[k] = Number(timings[k]);
@@ -498,6 +536,11 @@ export class Bridge {
       // When the model produced its last token, so the benchmark can separate
       // model time from the overhead the client adds after it.
       if (Number.isFinite(Number(timings.lastToken))) entry.lastToken = Number(timings.lastToken);
+      // Client overhead after the model's final token: what every completion
+      // fast path is chasing. Only meaningful when both stages were reported.
+      if (Number.isFinite(Number(entry.lastToken)) && Number.isFinite(Number(entry.complete))) {
+        entry.postToken = Math.max(0, Number(entry.complete) - Number(entry.lastToken));
+      }
       if (timings.completedBy) entry.completedBy = String(timings.completedBy);
       if (Number.isFinite(Number(timings.resubmits))) entry.resubmits = Number(timings.resubmits);
     }
@@ -523,6 +566,9 @@ export class Bridge {
     const parts = TIMING_STAGES.filter((k) => entry[k] != null).map((k) => `${k}=${entry[k]}ms`);
     this.log(
       `timing ${record.site || "any"}: total=${entry.total}ms${parts.length ? " " + parts.join(" ") : ""}` +
+        `${entry.postToken != null ? ` post-token=${entry.postToken}ms` : ""}` +
+        `${entry.promptChars != null ? ` prompt=${entry.promptChars}ch` : ""}` +
+        `${entry.replyChars != null ? ` reply=${entry.replyChars}ch` : ""}` +
         `${entry.stopSeen ? " stop=yes" : ""}${entry.sseSeen ? " sse=yes" : ""}${entry.earlyReturn ? " early-return=yes" : ""}`
     );
   }

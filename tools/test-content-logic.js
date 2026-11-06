@@ -315,6 +315,23 @@ ok("busy: stop control visible, first probe", stillBusy(true, "some text", null)
 ok("busy: reply still changing", stillBusy(false, "growing", "grow"));
 ok("idle: stop gone and text stable", !stillBusy(false, "stable", "stable"));
 
+// ---- Task 1: per-request tuning resolver ------------------------------------
+// The bridge forwards timing overrides; anything missing or invalid must keep
+// the shipped default so a bad env var can never break a turn.
+const resolveTuning = loadShared("tuning", { fn: "resolveTuning" });
+const TUNE_DEFAULTS = { debounce: null, sseEndReread: 120, extractThrottle: 120, fallbackTick: 400 };
+ok("tuning: no overrides keeps every default", JSON.stringify(resolveTuning(TUNE_DEFAULTS, null)) === JSON.stringify(TUNE_DEFAULTS));
+ok("tuning: undefined overrides keeps every default", JSON.stringify(resolveTuning(TUNE_DEFAULTS, undefined)) === JSON.stringify(TUNE_DEFAULTS));
+{
+  const merged = resolveTuning(TUNE_DEFAULTS, { debounce: 200, fallbackTick: 250, unknown: 999 });
+  ok("tuning: a numeric override wins", merged.debounce === 200 && merged.fallbackTick === 250, JSON.stringify(merged));
+  ok("tuning: unknown keys are ignored", !("unknown" in merged));
+  ok("tuning: untouched keys keep their default", merged.sseEndReread === 120 && merged.extractThrottle === 120);
+  ok("tuning: null is a valid override (use the site default)", resolveTuning(TUNE_DEFAULTS, { debounce: 0 }).debounce === 0);
+  const bad = resolveTuning(TUNE_DEFAULTS, { debounce: "fast", fallbackTick: -5, extractThrottle: NaN });
+  ok("tuning: invalid values keep the default", bad.debounce === null && bad.fallbackTick === 400 && bad.extractThrottle === 120, JSON.stringify(bad));
+}
+
 if (failed) {
   console.error(`\n${failed} test(s) failed`);
   process.exit(1);
