@@ -164,6 +164,7 @@ export class Bridge {
     earlyReturnMs = 400,
     toolNames = [],
     sse = true,
+    newChat = false,
   }) {
     const key = site || "*";
     const prev = this.locks.get(key) || Promise.resolve();
@@ -189,6 +190,7 @@ export class Bridge {
         earlyReturnMs,
         toolNames,
         sse,
+        newChat,
       });
     } finally {
       release();
@@ -213,6 +215,7 @@ export class Bridge {
     earlyReturnMs = 400,
     toolNames = [],
     sse = true,
+    newChat = false,
   }) {
     return new Promise((resolve, reject) => {
       const id = this._nextId();
@@ -273,6 +276,8 @@ export class Bridge {
         tool_names: Array.isArray(toolNames) ? toolNames : [],
         // Phase 3: NOAPI_SSE=0 disables the page-SSE completion signal.
         sse: Boolean(sse),
+        // Phase 5: NOAPI_NEW_CHAT=1 asks the tab to open a fresh chat first.
+        new_chat: Boolean(newChat),
       });
       let delivered = 0;
       for (const [conn] of targets) {
@@ -361,6 +366,7 @@ export class Bridge {
       if (timings.stopSeen) entry.stopSeen = true;
       if (timings.earlyReturn) entry.earlyReturn = true;
       if (timings.sseSeen) entry.sseSeen = true;
+      if (timings.newChat) entry.newChat = true;
       if (Number.isFinite(Number(timings.idleMs))) entry.idleMs = Number(timings.idleMs);
       // When the model produced its last token, so the benchmark can separate
       // model time from the overhead the client adds after it.

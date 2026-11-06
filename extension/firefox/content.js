@@ -15,6 +15,13 @@
       name: "ChatGPT",
       debounce: 350,
       hosts: ["chatgpt.com", "chat.openai.com"],
+      // Phase 5 (NOAPI_NEW_CHAT=1): best-effort "new chat" controls. Clicking one
+      // is an in-page (SPA) navigation on these sites, so the request survives.
+      newChat: [
+        'a[data-testid="create-new-chat-button"]',
+        'button[data-testid="create-new-chat-button"]',
+        'a[href="/"]',
+      ],
       input: [
         "#prompt-textarea",
         'div#prompt-textarea[contenteditable="true"]',
@@ -50,6 +57,7 @@
       name: "Claude",
       debounce: 400,
       hosts: ["claude.ai"],
+      newChat: ['a[href="/new"]', 'button[aria-label*="new chat" i]'],
       input: [
         'div[contenteditable="true"].ProseMirror',
         'div[contenteditable="true"][data-testid="cm-editor-content"]',
@@ -77,6 +85,7 @@
       name: "Gemini",
       debounce: 550,
       hosts: ["gemini.google.com", "gemini.google"],
+      newChat: ['button[aria-label*="New chat" i]', 'a[href="/app"]'],
       input: [
         'div.ql-editor[contenteditable="true"]',
         'rich-textarea div[contenteditable="true"]',
@@ -105,6 +114,7 @@
       name: "Perplexity",
       debounce: 450,
       hosts: ["perplexity.ai"],
+      newChat: ['a[href="/"]', 'button[aria-label*="New" i]'],
       input: [
         'textarea[placeholder*="Ask" i]',
         'textarea[placeholder*="Search" i]',
@@ -124,6 +134,7 @@
       name: "Grok",
       debounce: 350,
       hosts: ["grok.com"],
+      newChat: ['a[href="/"]', 'button[aria-label*="New" i]'],
       input: [
         'div[contenteditable="true"][role="textbox"]',
         'textarea[placeholder*="Grok" i]',
@@ -142,6 +153,7 @@
        name: "Mistral Chat",
        debounce: 450,
        hosts: ["chat.mistral.ai"],
+       newChat: ['a[href="/chat"]', 'button[aria-label*="new" i]'],
        input: [
          'textarea[placeholder*="message" i]',
          'div[contenteditable="true"][role="textbox"]',
@@ -159,6 +171,7 @@
        name: "DeepSeek",
        debounce: 450,
        hosts: ["chat.deepseek.com", "deepseek.com"],
+       newChat: ['a[href="/"]', 'div[role="button"][aria-label*="New" i]'],
        iconSend: true,
        input: [
          "textarea#chat-input",
@@ -635,6 +648,7 @@
         earlyReturnMs: msg.earlyReturnMs,
         toolNames: msg.toolNames,
         sse: msg.sse,
+        newChat: msg.newChat,
       }).catch(() => {});
     } else if (msg.type === "noapi_cancel") {
       if (state.busy && (!msg.id || msg.id === state.reqId)) cancelCurrent();
@@ -710,6 +724,25 @@
       await sleep(300);
     }
     return null;
+  }
+
+  // Phase 5 (NOAPI_NEW_CHAT=1): click the site's own "new chat" control so a new
+  // OpenCode session starts on a blank page. Clicking is an in-page (SPA)
+  // navigation on these sites, so this script and the in-flight request survive.
+  // Returns true when a control was clicked; false when none was found, so the
+  // caller can continue in the current chat.
+  function startNewChat() {
+    for (const sel of SITE.newChat || []) {
+      try {
+        for (const el of document.querySelectorAll(sel)) {
+          if (visible(el) && !el.closest("#noapi-host") && !el.disabled) {
+            el.click();
+            return true;
+          }
+        }
+      } catch {}
+    }
+    return false;
   }
 
   const composerText = (el) => String(el?.value ?? el?.innerText ?? el?.textContent ?? "").replace(/\s+/g, " ").trim();
@@ -1645,6 +1678,22 @@
 
     try {
       setLog("Finding " + SITE.name + " chat input…", true);
+      if (opts.newChat) {
+        // Phase 5: a new OpenCode session can start on a fresh chat page so old
+        // context cannot leak in. Off unless NOAPI_NEW_CHAT=1. On any failure we
+        // log it and continue in the current chat.
+        setLog(`Opening a new ${SITE.name} chat...`, true);
+        try {
+          if (startNewChat()) {
+            await sleep(400); // let the site re-mount the composer on the blank chat
+            timings.newChat = true;
+          } else {
+            setLog(`No "new chat" control found on ${SITE.name}; continuing in the current chat.`, true);
+          }
+        } catch (e) {
+          setLog(`Could not open a new ${SITE.name} chat (${e.message}); continuing in the current chat.`, true);
+        }
+      }
       const composer = await waitForComposer();
       if (!composer) throw new Error("Could not find chat input on " + SITE.name + ". Is the chat page fully loaded?");
       timings.composer = Date.now() - t0;

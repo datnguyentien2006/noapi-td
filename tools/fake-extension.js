@@ -239,6 +239,8 @@ function handleRequest(msg) {
       completedBy: earlyReturn ? "early-return" : MODE === "old" ? "fallback-2200" : "stop-button",
       // Simulate the page-SSE signal being observed in the "new" mode.
       sseSeen: MODE !== "old",
+      // Phase 5: echo whether the bridge asked for a fresh chat.
+      newChat: Boolean(msg.new_chat),
       resubmits: 0,
     };
     send({ t: "response", id: msg.id, text: finalText, timings });

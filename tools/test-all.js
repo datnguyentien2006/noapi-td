@@ -343,6 +343,31 @@ async function run() {
   }
   console.log("   ✓ NOAPI_STREAM=0 emits the reply once at the end");
 
+  // Step 4g: NOAPI_NEW_CHAT=1 is forwarded to the tab for a fresh conversation.
+  console.log("4g. Testing the new-chat flag...");
+  {
+    const { port: ncPort, proc: ncBridge } = await startBridge({ env: { NOAPI_NEW_CHAT: "1" } });
+    const ncFake = startFake({ port: ncPort, site: "chatgpt", env: { NOAPI_FAKE_FIRST_MS: "120" } });
+    await waitForHealth(ncPort, { clients: true });
+    const ncResp = await fetch(`http://127.0.0.1:${ncPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "chatgpt", messages: [{ role: "user", content: "fresh chat please" }] }),
+    });
+    const ncJson = await ncResp.json();
+    if (!String(ncJson.choices?.[0]?.message?.content || "").includes("[fake chatgpt]")) {
+      throw new Error(`new-chat request failed: ${JSON.stringify(ncJson)}`);
+    }
+    const ncHealth = await (await fetch(`http://127.0.0.1:${ncPort}/health`)).json();
+    if (ncHealth.timings?.last?.newChat !== true) {
+      throw new Error(`new_chat was not requested: ${JSON.stringify(ncHealth.timings?.last)}`);
+    }
+    ncBridge.kill();
+    ncFake.kill();
+    await sleep(300);
+  }
+  console.log("   ✓ NOAPI_NEW_CHAT=1 asks the tab for a fresh chat");
+
   // Step 5: Test MCP in PROXY mode (bridge is running on the test port)
   console.log("5. Testing MCP stdio in proxy mode (forwarding to running bridge)...");
   const mcpProxy = spawnProxy(PORT);

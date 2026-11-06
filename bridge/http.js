@@ -203,6 +203,12 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         // Re-send the tool protocol for new conversations or when the tool set changed.
         const hash = toolsHash(tools);
         const fresh = !messages.some((m) => m.role === "assistant");
+        // Phase 5: NOAPI_NEW_CHAT=1 opens a fresh chat for a new OpenCode session
+        // (no assistant message yet). Default OFF. Opening a new chat also means
+        // the site forgets the tool preamble, so drop the hash (the preamble is
+        // re-sent because the conversation is fresh anyway).
+        const newChat = process.env.NOAPI_NEW_CHAT === "1" && fresh;
+        if (newChat) bridge.toolHashes.delete(model);
         const includePreamble = tools.length > 0 && (fresh || bridge.toolHashes.get(model) !== hash);
         const { prompt } = buildPrompt(messages, tools, { includePreamble });
         const titleOnly = isTitleRequest(messages, tools);
@@ -236,6 +242,7 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
                 earlyReturnMs,
                 toolNames,
                 sse,
+                newChat,
               });
 
         if (!stream) {

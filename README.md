@@ -296,6 +296,20 @@ node bridge/index.js [--mcp] [--port=8787] [--host=127.0.0.1]
 | `NOAPI_DESC_MAX` | `400` | Description cap for priority tools (edit, write, bash, read, patch-like, or any tool with an `oldString`/`newString`/`replace` parameter). Other tools stay at 180. |
 | `NOAPI_PARAM_DESC_MAX` | `400` | Parameter-description cap for those same priority tools. Other tools stay at 90. |
 | `NOAPI_STREAM` | on | Set to `0` to stop streaming live deltas and emit the reply once at the end (the old behaviour). |
+| `NOAPI_TERSE` | on | Set to `0` to drop the "terse output" rules from the tool preamble (no prose between tool calls, concise final answers). |
+| `NOAPI_SSE` | on | Set to `0` to stop using the page's own SSE stream as a completion signal. Requires a page reload after changing it: the observer is loaded by the extension, not per request. |
+| `NOAPI_NEW_CHAT` | off | Set to `1` to open a fresh chat for every new OpenCode conversation (see below). |
+
+### `NOAPI_NEW_CHAT=1` — a fresh chat per session
+
+When a request starts a new OpenCode conversation (no assistant message yet), the extension clicks the site's *new chat* control before typing. The trade-off:
+
+- **Faster pages** — a blank chat has a tiny DOM and no old context, so the site responds and paints sooner.
+- **No pollution** — previous OpenCode sessions never bleed into the new one.
+- **It changes your chat history** — the site keeps the old conversations, but your *current* tab moves to a blank chat each session, so the chat you were reading is left behind. That is why it is **off by default**.
+- If no new-chat control is found, the turn continues in the current chat and says so in the status panel.
+
+Only one fresh chat is opened per session (the first request); later turns in the same OpenCode conversation stay in that chat, because the request then has an assistant message.
 
 The MCP server offers three tools: `chat` (ask a site), `status` and `sites`.
 

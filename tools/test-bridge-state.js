@@ -127,6 +127,8 @@ const outcome = (p) => p.then((text) => ({ text }), (err) => ({ err: err.message
   b.register(kill, { site: "tools-kill" });
   const sseKill = makeConn("sse-kill");
   b.register(sseKill, { site: "sse-kill" });
+  const newChatConn = makeConn("new-chat");
+  b.register(newChatConn, { site: "new-chat" });
   const p1 = outcome(
     b.requestPrompt({
       prompt: "hi",
@@ -143,11 +145,13 @@ const outcome = (p) => p.then((text) => ({ text }), (err) => ({ err: err.message
     b.requestPrompt({ prompt: "hi", site: "tools-kill", toolsEnabled: true, earlyReturn: false, timeoutMs: 5000 })
   );
   const p4 = outcome(b.requestPrompt({ prompt: "hi", site: "sse-kill", sse: false, timeoutMs: 5000 }));
+  const p5 = outcome(b.requestPrompt({ prompt: "hi", site: "new-chat", newChat: true, timeoutMs: 5000 }));
   await sleep(30);
   const reqOn = on.sent.find((m) => m.t === "request");
   const reqOff = off.sent.find((m) => m.t === "request");
   const reqKill = kill.sent.find((m) => m.t === "request");
   const reqSse = sseKill.sent.find((m) => m.t === "request");
+  const reqNewChat = newChatConn.sent.find((m) => m.t === "request");
   ok("tools_enabled=true is forwarded", reqOn?.tools_enabled === true, JSON.stringify(reqOn));
   ok("early_return defaults to true", reqOn?.early_return === true, JSON.stringify(reqOn));
   ok("early_return_ms is forwarded", reqOn?.early_return_ms === 650, JSON.stringify(reqOn));
@@ -156,11 +160,14 @@ const outcome = (p) => p.then((text) => ({ text }), (err) => ({ err: err.message
   ok("the kill switch is forwarded as early_return=false", reqKill?.early_return === false, JSON.stringify(reqKill));
   ok("sse defaults to true", reqOn?.sse === true, JSON.stringify(reqOn));
   ok("the SSE kill switch is forwarded as sse=false", reqSse?.sse === false, JSON.stringify(reqSse));
+  ok("new_chat defaults to false", reqOn?.new_chat === false, JSON.stringify(reqOn));
+  ok("the new-chat flag is forwarded as new_chat=true", reqNewChat?.new_chat === true, JSON.stringify(reqNewChat));
   b.respond(on, reqOn.id, "ok");
   b.respond(off, reqOff.id, "ok");
   b.respond(kill, reqKill.id, "ok");
   b.respond(sseKill, reqSse.id, "ok");
-  await Promise.all([p1, p2, p3, p4]);
+  b.respond(newChatConn, reqNewChat.id, "ok");
+  await Promise.all([p1, p2, p3, p4, p5]);
 }
 
 // ---- per-site debug counters (/health) -----------------------------------

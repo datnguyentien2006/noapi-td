@@ -214,6 +214,8 @@
         toolNames: Array.isArray(m.tool_names) ? m.tool_names : [],
         // Phase 3: NOAPI_SSE=0 disables the page-SSE completion signal.
         sse: m.sse !== false,
+        // Phase 5: NOAPI_NEW_CHAT=1 asks the tab to open a fresh chat first.
+        newChat: m.new_chat === true,
       };
 
       try {
