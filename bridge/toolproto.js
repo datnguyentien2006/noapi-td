@@ -14,16 +14,75 @@
 // into real OpenAI `tool_calls` so OpenCode executes them.
 import crypto from "node:crypto";
 
-const DEFAULT_MAX_TOOL_RESULT = 10_000;
-const MAX_DESC = 180;
-const MAX_PARAM_DESC = 90;
+const DEFAULT_MAX_TOOL_RESULT = 16_000;
+// Descriptions are clipped, but not uniformly: tools whose semantics are subtle
+// keep a long description (so the model is not guessing at an edit/write/bash
+// contract), while the rest get a short one to keep the preamble small.
+const LONG_DESC = 400;
+const LONG_PARAM_DESC = 400;
+const SHORT_DESC = 180;
+const SHORT_PARAM_DESC = 90;
 
-// How much of a tool result is sent back to the website chat. 10k characters
+// How much of a tool result is sent back to the website chat. 16k characters
 // (head+tail, see clipMiddle) is enough for the model to act on while keeping
 // the prompt small; override with NOAPI_MAX_TOOL_RESULT when needed.
 export function maxToolResult() {
   const v = Number(process.env.NOAPI_MAX_TOOL_RESULT);
   return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_MAX_TOOL_RESULT;
+}
+
+function envInt(name, fallback) {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : fallback;
+}
+
+// Description caps for a priority tool; NOAPI_DESC_MAX and
+// NOAPI_PARAM_DESC_MAX override the 400-character defaults.
+export function descMax() {
+  return envInt("NOAPI_DESC_MAX", LONG_DESC);
+}
+export function paramDescMax() {
+  return envInt("NOAPI_PARAM_DESC_MAX", LONG_PARAM_DESC);
+}
+
+// A tool is "priority" when its contract is easy to get wrong. That covers the
+// file/command tools by name and, more robustly, any tool that takes an
+// oldString/newString/replace style argument.
+const PRIORITY_NAME = /(edit|write|patch|bash|read|shell|replace|apply|rename|move|create|delete|notebook)/i;
+const PRIORITY_PARAM = /(oldstring|newstring|replace|old_string|new_string)/i;
+
+export function isPriorityTool(f) {
+  if (!f) return false;
+  if (PRIORITY_NAME.test(String(f.name || ""))) return true;
+  const props = f.parameters?.properties || {};
+  return Object.keys(props).some((k) => PRIORITY_PARAM.test(k));
+}
+
+function descLimit(f) {
+  return !leanDescMode() && isPriorityTool(f) ? descMax() : SHORT_DESC;
+}
+function paramDescLimit(f) {
+  return !leanDescMode() && isPriorityTool(f) ? paramDescMax() : SHORT_PARAM_DESC;
+}
+
+// Task 2: optional lower-cost description mode (default OFF). "lean" gives even
+// the priority tools the short caps, shrinking the preamble for the same tool
+// set. Tool semantics are unchanged; only description verbosity drops.
+export function descMode() {
+  return String(process.env.NOAPI_DESC_MODE || "full").toLowerCase();
+}
+function leanDescMode() {
+  return descMode() === "lean";
+}
+
+// Task 2: tools left out of the preamble (default OFF). They are still fully
+// callable: parseToolCalls/normalizeCall validate against the request's tool
+// list, not the rendered preamble.
+export function toolDenyList() {
+  return String(process.env.NOAPI_TOOL_DENY || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 function msgText(m) {
@@ -35,14 +94,31 @@ function msgText(m) {
 
 function clip(s, n) {
   s = String(s || "").replace(/\s+/g, " ").trim();
-  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+  return s.length > n ? s.slice(0, n - 1) + "..." : s;
 }
 
 function clipMiddle(s, n) {
   s = String(s || "");
   if (s.length <= n) return s;
   const half = Math.floor(n / 2);
-  return `${s.slice(0, half)}\n[... ${s.length - n} chars truncated ...]\n${s.slice(-half)}`;
+  const cut = s.length - n;
+  return `${s.slice(0, half)}\n[... ${cut} chars truncated; re-run the tool with a narrower range (offset/limit, grep, or head/tail) to see the missing part ...]\n${s.slice(-half)}`;
+}
+
+// Task 3: cheap, lossless cleanup applied to a tool result before clipping.
+// Strips ANSI escape sequences (colour codes a command emitted), normalises line
+// endings, trims trailing whitespace per line and collapses runs of blank lines.
+// None of this removes information the model needs, so it is always on and saves
+// prompt characters for free.
+export function tidyToolResult(s) {
+  return String(s ?? "")
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "") // OSC sequences
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "") // CSI sequences (colours, cursor)
+    .replace(/\u001b[@-Z\\-_]/g, "") // other single-char escapes
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function describeType(schema, depth = 0) {
@@ -93,13 +169,14 @@ export function toolsHash(tools) {
 function renderTool(f) {
   const props = f.parameters?.properties || {};
   const req = new Set(f.parameters?.required || []);
+  const cap = paramDescLimit(f);
   const params = Object.entries(props)
     .map(([k, v]) => {
-      const d = v?.description ? ` - ${clip(v.description, MAX_PARAM_DESC)}` : "";
+      const d = v?.description ? ` - ${clip(v.description, cap)}` : "";
       return `    - ${k}${req.has(k) ? " (required)" : " (optional)"}: ${describeType(v)}${d}`;
     })
     .join("\n");
-  return `* ${f.name}: ${clip(f.description, MAX_DESC)}\n${params || "    (no parameters)"}`;
+  return `* ${f.name}: ${clip(f.description, descLimit(f))}\n${params || "    (no parameters)"}`;
 }
 
 // A minimal but real call for the format example: only required arguments,
@@ -133,10 +210,33 @@ function envHints(messages) {
   return out;
 }
 
-export function renderPreamble(tools, messages) {
-  const fns = toolList(tools);
+// Terse mode (Phase 4) asks the model for shorter output: no prose between tool
+// calls and concise final answers. It is most of the remaining wall-clock time
+// on a real site, because the answer is generated token by token. NOAPI_TERSE=0
+// restores the original wording; the tool semantics are identical either way.
+export function terseEnabled() {
+  return process.env.NOAPI_TERSE !== "0";
+}
+
+export function renderPreamble(tools, messages, { terse = terseEnabled(), deny = toolDenyList() } = {}) {
+  const denied = new Set(deny || []);
+  const fns = toolList(tools).filter((f) => !denied.has(f.name));
   const hints = envHints(messages);
   const examples = fns.slice(0, 3).map(exampleBlock);
+  const rules = [
+    "1. Batch every independent call into the same reply: several TOOL_CALL blocks back to back, with no text between them.",
+    "2. Prefer grep/glob to locate things and read only the files you need, instead of reading files one by one across many turns.",
+    "3. Use only the tools listed below and give every required argument.",
+    "4. After the TOOL_CALL block(s) STOP writing. Do not guess the result. The agent runs the tools and replies with TOOL_RESULT messages.",
+    "5. When the task is finished, or no tool is needed, answer normally in plain text WITHOUT any TOOL_CALL block.",
+    "6. Keep text outside TOOL_CALL blocks short. Do not narrate between tool calls and do not repeat these instructions.",
+  ];
+  if (terse) {
+    rules.push(
+      "7. Between and around TOOL_CALL blocks output NOTHING but the blocks themselves - no prose, no headings, no commentary before or after them.",
+      "8. Keep the final answer terse: state the result and stop. No preamble, no restating the request, no offers of further help."
+    );
+  }
   return [
     "You are being used as the brain of OpenCode, a coding agent that runs on the user's computer.",
     "You cannot run anything yourself in this chat, BUT the agent can run tools for you: when you need to act (create files or folders, run commands, read or edit files, search...), request a tool call using the exact format below. Never say that you are unable to access the computer or the file system - request the tool instead.",
@@ -152,12 +252,7 @@ export function renderPreamble(tools, messages) {
     ...examples,
     "",
     "RULES:",
-    "1. Batch every independent call into the same reply: several TOOL_CALL blocks back to back, with no text between them.",
-    "2. Prefer grep/glob to locate things and read only the files you need, instead of reading files one by one across many turns.",
-    "3. Use only the tools listed below and give every required argument.",
-    "4. After the TOOL_CALL block(s) STOP writing. Do not guess the result. The agent runs the tools and replies with TOOL_RESULT messages.",
-    "5. When the task is finished, or no tool is needed, answer normally in plain text WITHOUT any TOOL_CALL block.",
-    "6. Keep text outside TOOL_CALL blocks short. Do not narrate between tool calls and do not repeat these instructions.",
+    ...rules,
     ...(hints.length ? ["", ...hints] : []),
     "",
     "AVAILABLE TOOLS:",
@@ -196,7 +291,7 @@ export function buildDelta(messages) {
       sawTool = true;
       const name = callNames.get(m.tool_call_id) || m.name || "tool";
       parts.push(
-        `TOOL_RESULT ${name} (id ${m.tool_call_id})\n${clipMiddle(msgText(m).trim() || "(empty output)", maxToolResult())}\nEND_TOOL_RESULT`
+        `TOOL_RESULT ${name} (id ${m.tool_call_id})\n${clipMiddle(tidyToolResult(msgText(m).trim() || "(empty output)"), maxToolResult())}\nEND_TOOL_RESULT`
       );
     }
   }

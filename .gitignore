@@ -1,0 +1,8 @@
+# Local A/B run captures (see tools/ab-report.js)
+ab-results/
+
+# Prompt dump written by NOAPI_DUMP_PREAMBLE=1 (see tools/prompt-report.js)
+noapi-preamble.txt
+
+# Node modules (dependencies are installed locally, never committed)
+node_modules/

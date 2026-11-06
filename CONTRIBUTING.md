@@ -142,11 +142,19 @@ Short and in the imperative, for example `Fix DeepSeek send button` or `Retry wh
 
 `npm test` starts a bridge and a **fake browser tab**, then checks plain replies, streaming content deltas, MCP in both modes, early return on a single and on several `TOOL_CALL` blocks, browser errors (including mid-stream), cancellation mid-stream, and a full tool call round trip. It does not need a real browser or any account.
 
-It also runs the small pure functions lifted out of `content.js` (`tools/test-content-logic.js`), the `TOOL_CALL` protocol without a browser (`tools/test-toolproto.js`), the bridge request queue without a browser (`tools/test-bridge-state.js`), and the security checks (`tools/test-security.js`). Every suite uses its own port, so it can never talk to a bridge you have running or type test prompts into a real chat tab.
+It also runs the small pure functions lifted out of `content.js` (`tools/test-content-logic.js`), the `TOOL_CALL` protocol without a browser (`tools/test-toolproto.js`), the bridge request queue without a browser (`tools/test-bridge-state.js`), and the security checks (`tools/test-security.js`).
 
-`npm run bench` uses the same fake tab to print time-to-first-streamed-content and full round-trip numbers, which is the easiest way to show that a latency change actually helped.
+Every suite asks the OS for an ephemeral port (`--port=0`) through `tools/lib/harness.js` and passes that exact port to the fake tab, so it can never talk to a bridge you have running or type test prompts into a real chat tab. `tools/test-isolation.js` checks that guarantee and fails if a runner ever hardcodes the default port.
+
+`npm run bench` runs the same simulated model twice — once with the old behaviour (fixed typing sleeps, no streaming, 2200 ms stability rule) and once with the new one (condition-based typing, streaming, stop-button completion) — and prints four numbers side by side: time to first streamed content, overhead after the last token, typing + send overhead, and full round trip.
+
+The benchmark is a **simulation**: the fake tab stands in for a real website and its timings are modelled, not measured. Only the per-stage timings that `/health` reports on a real site are ground truth. Use the bench to compare changes, not to predict a specific site.
 
 The fake tab cannot know how a real website behaves, so changes to the extension still need a quick manual try. If you fix a bug in the bridge, a test that would have caught it is the best kind of pull request.
+
+`tools/test-fallback-browser.js` drives `content.js` in a real browser to prove the reply fallback still finds an answer after a site changes its markup. It uses Playwright only if it is already installed; otherwise it prints `skipped: playwright not installed` and passes, so CI (which has no browser) is unaffected.
+
+> 🖐️ **Manual check: a stall with no answer.** Selector changes cannot be tested here, so after touching `SITES.*.reply` please try this once: open ChatGPT and send one prompt from OpenCode. If you see *"Prompt sent, but no answer detected on ChatGPT yet ... [sel=[...]]"*, copy the `sel=[...]` part (for example `sel=[0,0,0,0,0,0] scope=main url=/c/abc`) into your bug report — it shows how many elements each reply selector matches right now, which is exactly what a selector fix needs.
 
 <br>
 

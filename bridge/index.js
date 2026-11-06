@@ -18,6 +18,7 @@ import { createHttpServer } from "./http.js";
 import { attachWebSocketServer } from "./ws.js";
 import { requestAllowed } from "./security.js";
 import { runMcpStdio, ProxyGateway } from "./mcp.js";
+import { tuningFromEnv, sseTextFromEnv } from "./tuning.js";
 
 function parseArgs(argv) {
   const args = { port: 8787, host: "127.0.0.1", mcp: false };
@@ -46,7 +47,8 @@ async function main() {
     );
     return;
   }
-  if (!Number.isInteger(args.port) || args.port < 1 || args.port > 65535) {
+  // 0 means "let the OS pick a free port"; anything else must be usable.
+  if (!Number.isInteger(args.port) || args.port < 0 || args.port > 65535) {
     process.stderr.write("invalid --port\n");
     process.exit(1);
   }
@@ -57,7 +59,7 @@ async function main() {
   let bridge = null;
   let server = null;
   try {
-    const b = new Bridge({ log });
+    const b = new Bridge({ log, cancelAckMs: Number(process.env.NOAPI_CANCEL_ACK_MS) || 5000 });
     server = createHttpServer(b, log, { host: args.host });
     function handleProxyMessage(conn, msg) {
       if (msg.t === "proxy-status") {
@@ -73,6 +75,11 @@ async function main() {
             site: msg.site || undefined,
             timeoutMs,
             toolsEnabled: Boolean(msg.tools_enabled),
+            earlyReturn: msg.early_return !== false,
+            earlyReturnMs: Number(msg.early_return_ms) || 400,
+            toolNames: Array.isArray(msg.tool_names) ? msg.tool_names : [],
+            tuning: tuningFromEnv(),
+            sseText: sseTextFromEnv(),
           })
           .then((text) => {
             conn.send(JSON.stringify({ t: "proxy-response", id: msg.id, data: text }));
@@ -121,12 +128,18 @@ async function main() {
           if (msg.site) b.register(conn, { site: msg.site, url: msg.url });
         } else if (msg.t === "response") {
           b.respond(conn, msg.id, msg.text, msg.timings);
+        } else if (msg.t === "cancelled") {
+          // The tab (or its background) confirms it stopped a cancelled request.
+          b.ackCancelled(msg.id);
+        } else if (msg.t === "site-gone") {
+          // A tab closed and no tab of that site is left.
+          b.removeSite(conn, msg.site);
         } else if (msg.t === "progress") {
-          b.progress(msg.id, msg.status);
+          b.progress(msg.id, msg.status, { site: msg.site, lateGrowth: msg.lateGrowth });
         } else if (msg.t === "partial") {
           b.partial(msg.id, msg.text);
         } else if (msg.t === "error") {
-          b.fail(conn, msg.id, msg.error);
+          b.fail(conn, msg.id, msg.error, msg.code);
         } else if (msg.t === "ping") {
           conn.send(JSON.stringify({ t: "pong" }));
         } else if (conn.isProxy) {
@@ -140,6 +153,9 @@ async function main() {
     });
     await listen(server, args.port, args.host);
     bridge = b; // only usable after the port is actually bound
+    // --port=0 asks the OS for a free port. Report and use the real one so the
+    // MCP proxy path and the tests do not keep referring to 0.
+    args.port = server.address().port;
     log(`listening on http://${args.host}:${args.port}`);
     log("dashboard: http://127.0.0.1:" + args.port + "/");
   } catch (err) {

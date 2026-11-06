@@ -10,11 +10,79 @@
   const ext = globalThis.browser || globalThis.chrome;
   if (!ext || !ext.runtime) return;
 
+  // ---------------- FEATURE FLAGS (A/B) ----------------
+  // The fast paths that live in this file can be flipped WITHOUT editing source:
+  // the values are read from extension storage (the manifest has "storage") and
+  // toggled from the "?" panel. Every default equals the shipped behaviour, so
+  // an install with no stored flags behaves exactly as before. If storage is
+  // unavailable (unit tests, a stripped harness) the defaults stand.
+  //
+  // Bridge-side fast paths are deliberately NOT here: NOAPI_SSE, NOAPI_TERSE,
+  // NOAPI_NEW_CHAT and the early-return flags are read from the bridge process
+  // environment and forwarded per request. See the README flag table.
+  const FLAG_DEFAULTS = { observerDriven: true, eagerSend: true, sseObserver: true, sseText: false };
+  const FLAGS = { ...FLAG_DEFAULTS };
+  const applyFlags = (v) => {
+    if (!v || typeof v !== "object") return;
+    for (const k of Object.keys(FLAG_DEFAULTS)) if (typeof v[k] === "boolean") FLAGS[k] = v[k];
+  };
+  const flagReady = []; // callbacks to run once the stored flags have been read
+  function whenFlags(fn) {
+    flagReady.push(fn);
+  }
+  function loadFlags() {
+    const keys = Object.keys(FLAG_DEFAULTS);
+    const fire = () => {
+      for (const fn of flagReady.splice(0)) {
+        try {
+          fn();
+        } catch {}
+      }
+    };
+    try {
+      const st = ext.storage && ext.storage.local;
+      if (!st || typeof st.get !== "function") return fire();
+      // Firefox's browser.storage is promise-only; Chrome's chrome.storage takes
+      // a callback (and newer Chrome also returns a promise). Support both.
+      const ret = st.get(keys);
+      if (ret && typeof ret.then === "function") {
+        ret.then(
+          (v) => {
+            applyFlags(v);
+            fire();
+          },
+          fire
+        );
+        return;
+      }
+      st.get(keys, (v) => {
+        applyFlags(v);
+        fire();
+      });
+    } catch {
+      fire();
+    }
+  }
+  function saveFlags(patch) {
+    applyFlags(patch);
+    try {
+      const st = ext.storage && ext.storage.local;
+      if (st && typeof st.set === "function") st.set(patch);
+    } catch {}
+  }
+
   const SITES = {
     chatgpt: {
       name: "ChatGPT",
       debounce: 350,
       hosts: ["chatgpt.com", "chat.openai.com"],
+      // Phase 5 (NOAPI_NEW_CHAT=1): best-effort "new chat" controls. Clicking one
+      // is an in-page (SPA) navigation on these sites, so the request survives.
+      newChat: [
+        'a[data-testid="create-new-chat-button"]',
+        'button[data-testid="create-new-chat-button"]',
+        'a[href="/"]',
+      ],
       input: [
         "#prompt-textarea",
         'div#prompt-textarea[contenteditable="true"]',
@@ -33,12 +101,16 @@
         'button[aria-label*="send" i]',
         "#composer-submit-button",
       ],
-      stop: ['button[data-testid="stop-button"]', 'button[aria-label*="Stop" i]'],
+      stop: ['button[data-testid="stop-button"]', 'button[aria-label*="Stop" i]', 'button[data-testid*="stop" i]'],
       reply: [
         '[data-message-author-role="assistant"]',
         'div[data-testid="assistant-message"]',
         "div.agent-turn",
         "div[data-message-model-slug]",
+        'section[data-turn="assistant"]',
+        '[data-turn="assistant"]',
+        'article[data-testid*="assistant"]',
+        "div.markdown",
       ],
       transcript: '[data-testid="conversation-turns"], main',
     },
@@ -46,6 +118,7 @@
       name: "Claude",
       debounce: 400,
       hosts: ["claude.ai"],
+      newChat: ['a[href="/new"]', 'button[aria-label*="new chat" i]'],
       input: [
         'div[contenteditable="true"].ProseMirror',
         'div[contenteditable="true"][data-testid="cm-editor-content"]',
@@ -73,6 +146,7 @@
       name: "Gemini",
       debounce: 550,
       hosts: ["gemini.google.com", "gemini.google"],
+      newChat: ['button[aria-label*="New chat" i]', 'a[href="/app"]'],
       input: [
         'div.ql-editor[contenteditable="true"]',
         'rich-textarea div[contenteditable="true"]',
@@ -101,6 +175,7 @@
       name: "Perplexity",
       debounce: 450,
       hosts: ["perplexity.ai"],
+      newChat: ['a[href="/"]', 'button[aria-label*="New" i]'],
       input: [
         'textarea[placeholder*="Ask" i]',
         'textarea[placeholder*="Search" i]',
@@ -120,6 +195,7 @@
       name: "Grok",
       debounce: 350,
       hosts: ["grok.com"],
+      newChat: ['a[href="/"]', 'button[aria-label*="New" i]'],
       input: [
         'div[contenteditable="true"][role="textbox"]',
         'textarea[placeholder*="Grok" i]',
@@ -138,6 +214,7 @@
        name: "Mistral Chat",
        debounce: 450,
        hosts: ["chat.mistral.ai"],
+       newChat: ['a[href="/chat"]', 'button[aria-label*="new" i]'],
        input: [
          'textarea[placeholder*="message" i]',
          'div[contenteditable="true"][role="textbox"]',
@@ -155,6 +232,7 @@
        name: "DeepSeek",
        debounce: 450,
        hosts: ["chat.deepseek.com", "deepseek.com"],
+       newChat: ['a[href="/"]', 'div[role="button"][aria-label*="New" i]'],
        iconSend: true,
        input: [
          "textarea#chat-input",
@@ -176,6 +254,35 @@
        ],
        transcript: "main",
      },
+     zai: {
+       name: "Z.ai",
+       debounce: 450,
+       hosts: ["chat.z.ai"],
+       newChat: ['button#sidebar-new-chat-button'],
+       input: [
+         "textarea#chat-input",
+         'textarea[placeholder*="Message" i]',
+         'div[contenteditable="true"][role="textbox"]',
+         "textarea",
+       ],
+       send: [
+         "button#send-message-button",
+         "button.sendMessageButton",
+         'button[type="submit"]',
+       ],
+       // While z.ai generates it REMOVES the send button and shows a small square
+       // "stop" button (button > span.bg-text-inverted) in the same place, with
+       // no id and no aria-label. Matching the span (not the button) avoids
+       // :has(), which Firefox 115 lacks; a click on the span bubbles to the
+       // button's own handler.
+       stop: [
+         "form span.bg-text-inverted",
+         "form button.bg-interactive-bg-primary-default:not(#send-message-button)",
+         'button[aria-label*="Stop" i]',
+       ],
+       reply: [".chat-assistant", "#response-content-container"],
+       transcript: "main",
+     },
    };
 
   function detectSite() {
@@ -191,8 +298,88 @@
   const SITE = detectSite();
   if (!SITE) return;
 
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // ---------------- TUNABLE TIMINGS (Task 1) ----------------
+  // The bridge reads these knobs from its environment and forwards them with
+  // every request (see bridge/tuning.js) because a content script cannot read
+  // process.env. With no overrides every value is exactly the shipped default;
+  // this is what lets a latency A/B run change a constant without editing
+  // source or reloading the extension.
+  const TUNING_DEFAULTS = {
+    debounce: null, // null = use the per-site SITE.debounce
+    sseEndReread: 120,
+    earlyReturnReread: 120,
+    extractThrottle: 120,
+    fallbackTick: 400,
+    partialThrottle: 150,
+    earlyReturnHardCap: 1500,
+  };
+  const TUNE = { ...TUNING_DEFAULTS };
+
+  /* @noapi-shared-start tuning */
+  // Merge the bridge's per-request overrides onto the defaults. Only finite,
+  // non-negative numbers are accepted; anything else keeps the default, so a
+  // typo can never wedge the content script.
+  function resolveTuning(defaults, over) {
+    const out = { ...defaults };
+    if (over && typeof over === "object") {
+      for (const k of Object.keys(out)) {
+        if (!(k in over)) continue;
+        const v = Number(over[k]);
+        if (Number.isFinite(v) && v >= 0) out[k] = v;
+      }
+    }
+    return out;
+  }
+  /* @noapi-shared-end tuning */
+
+  // The per-site completion debounce: the bridge override wins over the site's
+  // own value; null/absent means "use SITE.debounce".
+  const debounceMs = () => (TUNE.debounce != null ? TUNE.debounce : Number(SITE.debounce) || 400);
+
+
+  // Cancel-aware sleep: cancelCurrent() wakes every waiter immediately, so a
+  // cancel is noticed during typing/polling instead of only after the current
+  // sleep (which could otherwise keep the tab "busy" for 700ms+ while the bridge
+  // already wants to dispatch the next request).
+  const sleepWaiters = new Set();
+  const sleep = (ms) =>
+    new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        sleepWaiters.delete(done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      sleepWaiters.add(done);
+    });
+  function wakeSleepers() {
+    for (const done of [...sleepWaiters]) done();
+  }
+  // A cancel during typing can leave typed-but-unsent text in the box; the next
+  // request would then send it as its own prompt. Clear it (both composer kinds).
+  function clearComposerText(el) {
+    if (!el) return;
+    try {
+      if (!el.isContentEditable) {
+        setNativeValue(el, "");
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } else {
+        el.innerHTML = "";
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
+      }
+    } catch {}
+  }
   const normalize = (s) => String(s || "").replace(/\n{3,}/g, "\n\n").trim();
+
+  /* @noapi-shared-start codeFence */
+  // Build a fenced code block from a language and its code, trimming any
+  // trailing newlines so the closing fence always sits on its own line. Used for
+  // <pre> blocks and for editors that have no <pre> (CodeMirror on z.ai).
+  function codeFence(lang, code) {
+    return "```" + (lang || "") + "\n" + String(code || "").replace(/\n+$/, "") + "\n```";
+  }
+  /* @noapi-shared-end codeFence */
 
   // ---------------- TEXT EXTRACTION ----------------
   // Turn a rendered chat message into clean markdown-ish text, skipping UI
@@ -208,6 +395,21 @@
     const nl = () => {
       if (out && !out.endsWith("\n")) out += "\n";
     };
+    // CodeMirror code blocks (z.ai renders every fenced block with one) have no
+    // <pre>: their text lives in .cm-editor and the language label sits in a
+    // sibling div that would otherwise be emitted as plain text. Map the block
+    // wrapper (the element that also holds the label) to its fenced text once, so
+    // the walk can emit the fence and skip both the label and the raw editor.
+    const cmBlocks = new Map();
+    try {
+      for (const cm of root.querySelectorAll(".cm-editor")) {
+        const holder = cm.closest('[class*="language-"]');
+        const wrapper = holder ? holder.parentElement : cm.parentElement;
+        if (!wrapper || !root.contains(wrapper)) continue;
+        const cls = Array.from((holder && holder.classList) || []).find((x) => x.startsWith("language-")) || "";
+        cmBlocks.set(wrapper, codeFence(cls.slice("language-".length), cm.innerText || cm.textContent));
+      }
+    } catch {}
     const walk = (n) => {
       if (n.nodeType === 3) {
         out += n.nodeValue;
@@ -217,11 +419,20 @@
       const tag = n.tagName.toUpperCase();
       if (SKIP_TAGS.has(tag)) return;
       if (n.classList && (n.classList.contains("sr-only") || n.classList.contains("visually-hidden"))) return;
+      // A model reasoning panel must never leak into the reply. z.ai shows one as
+      // .thinking-chain-container (collapsed it holds only a label inside a
+      // <button>, which is skipped anyway, but an expanded panel would not be).
+      if (n.classList && n.classList.contains("thinking-chain-container")) return;
+      if (cmBlocks.has(n)) {
+        nl();
+        out += cmBlocks.get(n) + "\n";
+        return;
+      }
       if (tag === "PRE") {
         const code = n.querySelector("code") || n;
         const lang = (code.className || "").match(/language-([\w+-]+)/)?.[1] || "";
         nl();
-        out += "```" + lang + "\n" + String(code.textContent || "").replace(/\n+$/, "") + "\n```\n";
+        out += codeFence(lang, code.textContent) + "\n";
         return;
       }
       if (tag === "BR") {
@@ -256,7 +467,118 @@
     return i >= 0 ? text.slice(i + tail.length).trim() : text;
   }
 
-  const state = { bridge: false, busy: false, port: null, cancel: false, reqId: null, justStopped: false };
+  const state = { bridge: false, busy: false, port: null, cancel: false, reqId: null, justStopped: false, lateGrowth: 0 };
+
+  // ---------------- SSE OBSERVATION (Phase 3) ----------------
+  // A tiny MAIN-world script (sse-observer.js) watches the page's own fetch for
+  // text/event-stream responses and posts "started"/"ended"/"error" events here.
+  // We only count those events; the reply text still comes from the DOM. If the
+  // observer is missing, the site never streams over fetch, or the "sseObserver"
+  // flag (or NOAPI_SSE=0) is off, the completion loop behaves exactly as before.
+  const SSE_TOKEN_ATTR = "data-noapi-sse-token";
+  // Task 5: when set to "1", sse-observer.js also decodes the stream body and
+  // posts "delta" events. Default off; the content script sets it per request.
+  const SSE_TEXT_ATTR = "data-noapi-sse-text";
+  const SSE = {
+    token: null,
+    started: 0,
+    ended: 0,
+    errored: 0,
+    active: 0,
+    lastAt: 0,
+    wake: null,
+    injected: false,
+    // Task 5: accumulated reply text decoded from the page's own stream (only
+    // used as an earlier trigger, never as the returned reply) and a debug
+    // counter for how often it disagreed with the DOM.
+    streamText: "",
+    streamAt: 0,
+    textMismatches: 0,
+  };
+
+  function injectSseObserver() {
+    if (!FLAGS.sseObserver || SSE.injected) return;
+    SSE.injected = true;
+    try {
+      // Chrome loads sse-observer.js as a MAIN-world content script (manifest),
+      // so the token is already on <html> and there is nothing to inject. Firefox
+      // has no MAIN world on our minimum version, so fall back to a <script> tag.
+      if (document.documentElement.getAttribute(SSE_TOKEN_ATTR)) return;
+      const s = document.createElement("script");
+      s.src = ext.runtime.getURL("sse-observer.js");
+      s.async = false;
+      s.onload = () => { try { s.remove(); } catch {} };
+      s.onerror = () => { try { s.remove(); } catch {} };
+      (document.head || document.documentElement).appendChild(s);
+    } catch {}
+  }
+
+  function readSseToken() {
+    try {
+      const t = document.documentElement.getAttribute(SSE_TOKEN_ATTR);
+      if (t) SSE.token = t;
+    } catch {}
+    return SSE.token;
+  }
+
+  // Task 5: tell sse-observer.js (MAIN world) whether to decode the stream body
+  // for this request. Set before the page makes its fetch.
+  function setSseText(on) {
+    try {
+      document.documentElement.setAttribute(SSE_TEXT_ATTR, on ? "1" : "0");
+    } catch {}
+  }
+
+  // Always listen: whether the events are USED is decided per request from
+  // FLAGS.sseObserver (so flipping the flag off needs no reload to take effect).
+  window.addEventListener("message", (e) => {
+    const d = e && e.data;
+    if (!d || d.source !== "noapi-sse") return;
+    if (!SSE.token || d.token !== SSE.token) return;
+    if (d.event === "delta") {
+      // Task 5: decoded stream text. Advisory only (an earlier trigger for the
+      // tool-call early return); the reply text still comes from the DOM.
+      if (typeof d.text === "string") {
+        SSE.streamText = d.text;
+        SSE.streamAt = Date.now();
+      }
+      SSE.lastAt = Date.now();
+      try {
+        SSE.wake?.();
+      } catch {}
+      return;
+    }
+    if (d.event === "started") {
+      SSE.started++;
+      SSE.active++;
+      SSE.streamText = "";
+    } else if (d.event === "ended") {
+      SSE.ended++;
+      if (SSE.active > 0) SSE.active--;
+    } else if (d.event === "error") {
+      // The stream failed, was aborted, or its end was unobservable. It still
+      // counts as activity, but it must NEVER be treated as a finished answer.
+      SSE.errored++;
+      if (SSE.active > 0) SSE.active--;
+    } else {
+      return;
+    }
+    SSE.lastAt = Date.now();
+    // A stream can start and end without any DOM mutation we can observe, so
+    // wake the completion loop right away.
+    try {
+      SSE.wake?.();
+    } catch {}
+  });
+
+  // Inject/read the token only once the stored flags are known, so the
+  // "sseObserver" flag can suppress the Firefox <script> injection on load.
+  whenFlags(() => {
+    if (FLAGS.sseObserver) injectSseObserver();
+    readSseToken();
+    setTimeout(readSseToken, 500);
+  });
+  loadFlags();
 
   // ---------------- UI CREATION ----------------
   const host = document.createElement("div");
@@ -404,6 +726,17 @@
     font-size: 12px;
     color: #94a3b8;
   }
+  .flags-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 10px;
+    font-size: 12px;
+    color: #cbd5e1;
+  }
+  .flags-row label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  .flags-row input { margin: 0; }
+  .flags-state { color: #64748b; }
   .mode-toggle {
     display: flex;
     align-items: center;
@@ -477,6 +810,13 @@
     <button class="stop-btn" style="padding:2px 8px;font-size:11px" title="Abort the current request" hidden>Stop</button>
   </div>
   <div class="mode-row"><span>Automatic: OpenCode prompts are typed, sent and answered by this tab.</span></div>
+  <div class="mode-row"><span>Fast paths (A/B):</span></div>
+  <div class="flags-row">
+    <label title="Wake the completion loop on DOM events instead of polling every 400ms"><input type="checkbox" data-flag="observerDriven"> event loop</label>
+    <label title="Click Send the moment the site enables it instead of after a fixed 150ms"><input type="checkbox" data-flag="eagerSend"> send on enable</label>
+    <label title="Use the page's own SSE stream as a completion signal (bridge NOAPI_SSE=0 also disables it)"><input type="checkbox" data-flag="sseObserver"> SSE signal</label>
+    <label title="Decode the page's SSE stream for an earlier tool-call trigger; the reply text still comes from the DOM. The bridge NOAPI_SSE_TEXT=1 flag is also required."><input type="checkbox" data-flag="sseText"> SSE text</label>
+  </div>
   <div class="log-box">Ready. Waiting for OpenCode…</div>
 </div>
 <div class="fab" title="NOAPI? — Bridge AI chat to OpenCode">
@@ -493,6 +833,22 @@
   const stopBtn = shadow.querySelector(".stop-btn");
   const reconnectBtn = shadow.querySelector(".reconnect-btn");
   const logBox = shadow.querySelector(".log-box");
+
+  // Feature-flag checkboxes. Opening the panel re-syncs them from the live FLAGS
+  // (storage may have answered after the DOM was built), and toggling writes the
+  // flag straight to storage so an A/B run needs no edit and no reload.
+  const flagBoxes = Array.from(shadow.querySelectorAll("input[data-flag]"));
+  const flagsState = shadow.querySelector(".flags-state");
+  function syncFlagBoxes() {
+    for (const b of flagBoxes) b.checked = FLAGS[b.dataset.flag] !== false;
+    if (flagsState) flagsState.textContent = "defaults";
+  }
+  for (const b of flagBoxes) {
+    b.addEventListener("change", () => {
+      saveFlags({ [b.dataset.flag]: b.checked });
+      if (flagsState) flagsState.textContent = "saved";
+    });
+  }
 
   function attachHost() {
     if (document.body && !document.getElementById("noapi-host")) document.body.appendChild(host);
@@ -517,6 +873,43 @@
     lastProgress = msg;
     lastProgressAt = now;
     ext.runtime.sendMessage({ type: "noapi_progress", id: state.reqId, status: msg }).catch(() => {});
+  }
+
+  // ---- truncation canary (Task 0) -------------------------------------------
+  // After a turn ends, re-read the last reply node once, ~1s later, WITHOUT
+  // blocking the next request. If the page painted more text after we already
+  // returned the reply, that is a truncation event: report the extra character
+  // count so a real A/B run can prove the fast paths never cut an answer. This
+  // value must stay 0; it travels on the next progress message.
+  const LATE_GROWTH_MS = 1000;
+  function flushLateGrowth() {
+    if (!state.lateGrowth) return;
+    const chars = state.lateGrowth;
+    state.lateGrowth = 0;
+    try {
+      ext.runtime
+        .sendMessage({ type: "noapi_progress", id: state.reqId, site: SITE.key, lateGrowth: chars })
+        .catch(() => {});
+    } catch {}
+  }
+  function scheduleLateGrowth() {
+    let node = null;
+    let seen = 0;
+    try {
+      const nodes = replyNodes();
+      node = nodes[nodes.length - 1] || null;
+      seen = node ? extractText(node).length : 0;
+    } catch {}
+    setTimeout(() => {
+      try {
+        if (!node || !node.isConnected) return;
+        const later = extractText(node).length;
+        if (later > seen) {
+          state.lateGrowth += later - seen;
+          flushLateGrowth();
+        }
+      } catch {}
+    }, LATE_GROWTH_MS);
   }
 
   function updateStatusUI() {
@@ -565,11 +958,20 @@
       updateStatusUI();
     } else if (msg.type === "noapi_autosend") {
       setLog("Prompt received from OpenCode…");
-      runPipeline(msg.prompt, msg.id, Boolean(msg.toolsEnabled)).catch(() => {});
+      runPipeline(msg.prompt, msg.id, Boolean(msg.toolsEnabled), {
+        earlyReturn: msg.earlyReturn,
+        earlyReturnMs: msg.earlyReturnMs,
+        toolNames: msg.toolNames,
+        sse: msg.sse,
+        newChat: msg.newChat,
+        tuning: msg.tuning,
+        sseText: msg.sseText,
+      }).catch(() => {});
     } else if (msg.type === "noapi_cancel") {
       if (state.busy && (!msg.id || msg.id === state.reqId)) cancelCurrent();
     } else if (msg.type === "noapi_toggle_panel") {
       panel.hidden = !panel.hidden;
+      if (!panel.hidden) syncFlagBoxes();
     }
   }
 
@@ -582,6 +984,7 @@
   fab.addEventListener("click", () => {
     panel.hidden = !panel.hidden;
     if (!panel.hidden) {
+      syncFlagBoxes();
       ext.runtime
         .sendMessage({ type: "noapi_status_req" })
         .then((r) => {
@@ -635,11 +1038,31 @@
   async function waitForComposer(ms = 15_000) {
     const t0 = Date.now();
     while (Date.now() - t0 < ms) {
+      if (state.cancel) return null;
       const c = await findComposer();
       if (c) return c;
       await sleep(300);
     }
     return null;
+  }
+
+  // Phase 5 (NOAPI_NEW_CHAT=1): click the site's own "new chat" control so a new
+  // OpenCode session starts on a blank page. Clicking is an in-page (SPA)
+  // navigation on these sites, so this script and the in-flight request survive.
+  // Returns true when a control was clicked; false when none was found, so the
+  // caller can continue in the current chat.
+  function startNewChat() {
+    for (const sel of SITE.newChat || []) {
+      try {
+        for (const el of document.querySelectorAll(sel)) {
+          if (visible(el) && !el.closest("#noapi-host") && !el.disabled) {
+            el.click();
+            return true;
+          }
+        }
+      } catch {}
+    }
+    return false;
   }
 
   const composerText = (el) => String(el?.value ?? el?.innerText ?? el?.textContent ?? "").replace(/\s+/g, " ").trim();
@@ -765,14 +1188,36 @@
 
   // Type the prompt and CHECK it stayed there: frameworks like React may
   // re-render the composer right after our programmatic input and reset it to
-  // empty, which leaves the send button disabled and nothing gets sent. The
-  // settle delay only exists to catch that async wipe, so it is short.
+  // empty, which leaves the send button disabled and nothing gets sent.
+  //
+  // Phase 2: instead of sleeping a fixed 150ms to catch that async wipe, wait on
+  // the page's own signal that it accepted the text - the send button turning
+  // enabled - on a 30ms grid. The fixed settle survives only as the DOM fallback
+  // for sites whose send control never enables (or when the eagerSend flag is off).
   const TYPE_SETTLE_MS = 150;
+  const SUBMIT_POLL_MS = 30;
+  const SEND_READY_TIMEOUT_MS = 1200;
+  // Kill switch / A/B flag: FLAGS.eagerSend=false restores the old fixed 150ms
+  // settle and the old 150ms submit poll. The Enter-key fallback is unchanged
+  // in either mode.
+
   async function ensureTyped(composer, text) {
     let el = composer;
     for (let attempt = 1; attempt <= 4; attempt++) {
+      if (state.cancel) return el;
       await typePromptIntoComposer(el, text);
-      await sleep(TYPE_SETTLE_MS);
+      if (FLAGS.eagerSend) {
+        const waitForSend = createSendGate({
+          probe: () => !!findSendButton(el),
+          now: Date.now,
+          sleep,
+          timeoutMs: SEND_READY_TIMEOUT_MS,
+          pollMs: SUBMIT_POLL_MS,
+        });
+        if (!(await waitForSend())) await sleep(TYPE_SETTLE_MS);
+      } else {
+        await sleep(TYPE_SETTLE_MS);
+      }
       el = (await findComposer()) || el;
       if (wantedFilled(el, text)) return el;
       setLog(`Text did not stick in the chat box, typing again (${attempt}/4)...`, true);
@@ -826,17 +1271,39 @@
     return null;
   }
 
-  async function submitComposer(composer) {
+  async function submitComposer(composer, prompt) {
+    // Phase 2: poll for the enabled send control on a short grid (bounded) and
+    // click the moment it is ready, instead of the old fixed 150ms x 8 loop.
+    // findSendButton already means "visible and enabled" (and, on icon-send
+    // sites, "the icon-only arrow is live"), so its first non-null answer is the
+    // page accepting the prompt.
+    if (state.cancel) return false;
+    const eager = FLAGS.eagerSend;
+    const pollMs = eager ? SUBMIT_POLL_MS : 150;
+    const tries = eager ? Math.max(1, Math.ceil(SEND_READY_TIMEOUT_MS / pollMs) + 1) : 8;
     let btn = null;
-    for (let i = 0; i < 8 && !btn; i++) {
+    for (let i = 0; i < tries && !btn; i++) {
+      if (state.cancel) return false;
       btn = findSendButton(composer);
-      if (!btn) await sleep(150);
+      if (!btn && i + 1 < tries) await sleep(pollMs);
     }
     if (btn) {
       btn.click();
+      // Safety check, run once right after the click: a re-render can wipe the
+      // composer between the enable and our click. waitForResponse's recovery
+      // path re-sends (or re-types) so this is a diagnostic, not a hard failure.
+      if (prompt != null && composer && !wantedFilled(composer, prompt)) {
+        setLog(`${SITE.name} chat box emptied as we sent; the recovery loop will re-send if nothing starts.`, true);
+      }
       return true;
     }
+    // No enabled send control appeared within the cap. If the typed text is still
+    // there, the Enter fallback submits it; if it was wiped, say so (the recovery
+    // loop re-types).
     if (composer) {
+      if (prompt != null && !wantedFilled(composer, prompt)) {
+        setLog(`${SITE.name} chat box is empty before send; the recovery loop will type the prompt again.`, true);
+      }
       composer.focus();
       for (const ev of ["keydown", "keypress", "keyup"]) {
         composer.dispatchEvent(
@@ -862,6 +1329,20 @@
   // — but only when we are already stuck, instead of snapshotting every element
   // on the page once per request the way the old code did.
   const GROW_SAMPLE_MS = 350;
+  const FALLBACK_AFTER_MS_BASELINE = 3000;
+
+  // The transcript container can be replaced by the site (a new chat usually
+  // re-mounts it on the first message), so never keep the node captured before
+  // sending: look it up again each time.
+  function currentScope() {
+    for (const s of SITE.transcript.split(",")) {
+      try {
+        const el = document.querySelector(s.trim());
+        if (el) return el;
+      } catch {}
+    }
+    return document.body;
+  }
 
   function elementLengths(scope) {
     const m = new Map();
@@ -873,20 +1354,37 @@
     return m;
   }
 
-  function biggestGrower(before, exclude) {
+  // Walks the CURRENT page, so elements the site created after the baseline was
+  // taken (the reply bubble is a brand-new node!) count as growth from 0. The old
+  // version only looked at elements that already existed in the baseline and
+  // therefore could never find a freshly mounted reply.
+  function biggestGrower(base, exclude) {
     let best = null;
     let bestGrow = 7;
-    for (const [el, prev] of before) {
-      if (!el.isConnected) continue;
+    const scope = currentScope();
+    for (const el of scope.querySelectorAll("*")) {
       if (el === exclude || el.contains?.(exclude) || exclude?.contains?.(el)) continue;
       if (host.contains(el) || el.contains(host)) continue;
-      const g = (el.textContent || "").length - prev;
+      const g = (el.textContent || "").length - (base.get(el) || 0);
       if (g > bestGrow) {
         best = el;
         bestGrow = g;
       }
     }
     return best;
+  }
+
+  // Why no reply was found: counts per selector, so a broken selector is obvious
+  // from the status line alone.
+  function replyDiag() {
+    const per = (SITE.reply || []).map((sel) => {
+      try {
+        return document.querySelectorAll(sel).length;
+      } catch {
+        return "x";
+      }
+    });
+    return `sel=[${per.join(",")}] scope=${currentScope().tagName.toLowerCase()} url=${location.pathname.slice(0, 24)}`;
   }
 
   function stopGeneration() {
@@ -904,7 +1402,19 @@
 
   function cancelCurrent() {
     state.cancel = true;
+    // Wake any in-progress sleep so the pipeline notices the cancel now.
+    wakeSleepers();
+    const generating = isStopVisible();
     stopGeneration();
+    // If nothing was sent yet (cancel during typing), remove the text we typed so
+    // it cannot be sent by the next request and the tab is left clean.
+    if (!generating) {
+      findComposer()
+        .then((c) => {
+          if (c && composerText(c).length) clearComposerText(c);
+        })
+        .catch(() => {});
+    }
     setLog("Stopped.");
   }
 
@@ -912,6 +1422,12 @@
   // not still streaming the previous answer: typing/sending then would hit the
   // STOP button or get swallowed. Idle = no stop button and the last reply did
   // not change between two samples. Bounded, so it can never hang.
+  /* @noapi-shared-start idleCheck */
+  // Is the site still busy with the previous answer? `prev` is the last reply
+  // text (null on the very first probe). Busy while the stop control is visible,
+  // or (once we have a previous sample) while the reply text is still changing.
+  const stillBusy = (stopVisible, cur, prev) => stopVisible || (prev !== null && cur !== prev);
+  /* @noapi-shared-end idleCheck */
   async function waitForIdle(maxMs = 60_000) {
     // If the previous request was ended deliberately (we returned a complete
     // tool call and clicked stop ourselves), the page is already idle — skip
@@ -925,13 +1441,15 @@
       const n = replyNodes();
       return n.length ? extractText(n[n.length - 1]) : "";
     };
-    let prev = snap();
+    // Probe immediately: if the stop control is already gone we return without
+    // paying the old 700ms sleep before the first look.
+    let prev = null;
     while (Date.now() - t0 < maxMs) {
-      await sleep(700);
       if (state.cancel) throw new Error("Cancelled.");
       const cur = snap();
-      if (!isStopVisible() && cur === prev) return;
+      if (!stillBusy(isStopVisible(), cur, prev)) return;
       prev = cur;
+      await sleep(700);
       setLog(SITE.name + " is still answering the previous message, waiting…", true);
     }
   }
@@ -943,15 +1461,33 @@
   // was pure dead time after the last token. The 2200ms rule is kept only as a
   // fallback for sites/cases where the stop button was never observed at all.
   //
-  // A MutationObserver wakes us as soon as the page changes, so extractText only
-  // runs when something actually moved (throttled to ~8/s), with a slow safety
-  // net for sites whose reply lives in a shadow root, where an observer on the
-  // light DOM cannot see the mutation.
+  // The MutationObserver schedules a tick immediately (coalesced, so a burst of
+  // mutations wakes exactly one tick), so extractText only runs when something
+  // actually moved (throttled to ~8/s). This slow interval is only a safety net:
+  // sites whose reply lives in a shadow root fire no observer event, and the
+  // timeout / stop-button checks still need a periodic wake-up.
   const FALLBACK_STABLE_MS = 2200;
-  const OBSERVER_TICK_MS = 250;
-  const EXTRACT_THROTTLE_MS = 120;
+  // The safety-net tick, the DOM-read throttle, the partial-stream throttle and
+  // the early-return re-read/cap windows are tunable per request; their shipped
+  // defaults live in TUNING_DEFAULTS (top of file) and arrive as bridge env vars.
+  // Kill switch / A/B flag: FLAGS.observerDriven=false goes back to the old
+  // interval-only behaviour (the observer then only marks the DOM dirty and the
+  // fallback interval drives every tick).
   const UNSEEN_MUTATION_MS = 1000;
   const STALL_LOG_MS = 20_000;
+
+  /* @noapi-shared-start sseDecision */
+  // Phase 3: read the observed SSE counters. `turn` is the snapshot taken when
+  // this request's wait began, `live` the current counters. "ended" wins over
+  // "started" so a stream that opened and closed between two ticks is still seen,
+  // but only once no other stream is still open.
+  function sseDecision(turn, live) {
+    if (!turn || !live) return "none";
+    if (live.ended > turn.ended && (live.active || 0) <= 0) return "ended";
+    if (live.active > 0 || live.started > turn.started) return "started";
+    return "none";
+  }
+  /* @noapi-shared-end sseDecision */
 
   // Pure decision function, delimited so tools/test-content-logic.js can lift it
   // out of this file and unit-test it without a browser. Keep it self-contained
@@ -970,25 +1506,29 @@
   // the END of the reply is what makes several consecutive blocks safe: while
   // the model is still writing (the next block, or the fence) the tail is not a
   // finished block, and the quiet timer keeps resetting anyway.
-  const EARLY_RETURN_MS = 400;
-  // How often the still-growing reply is forwarded to OpenCode while it streams.
-  const PARTIAL_THROTTLE_MS = 150;
+  const DEFAULT_EARLY_RETURN_MS = 400;
+  // The early-return hard cap, the post-stop / post-SSE re-read windows and the
+  // partial-stream throttle are all tunable per request; see TUNING_DEFAULTS.
 
   // Pure decision functions, delimited so tools/test-content-logic.js can lift
   // them out of this file and unit-test them without a browser. Keep them
   // self-contained (no outer variables).
   /* @noapi-shared-start toolEarlyReturn */
-  function toolCallComplete(text) {
+  // The JSON object of a TOOL_CALL block that ends the reply, or null. "Valid"
+  // means: a closing fence, a balanced JSON object that actually parses, and a
+  // tool name (checked against the current tool list when one is provided).
+  function toolBlockAtEnd(text, toolNames) {
     const s = String(text || "").replace(/\s+$/, "");
-    if (!s.endsWith("```")) return false;
+    if (!s.endsWith("```")) return null;
     const before = s.slice(0, -3);
     const marker = before.lastIndexOf("TOOL_CALL");
-    if (marker === -1) return false;
-    const brace = before.indexOf("{", marker);
-    if (brace === -1) return false;
+    if (marker === -1) return null;
+    const brace = before.indexOf("{", marker + "TOOL_CALL".length);
+    if (brace === -1) return null;
     let depth = 0;
     let inStr = false;
     let esc = false;
+    let end = -1;
     for (let i = brace; i < before.length; i++) {
       const ch = before[i];
       if (inStr) {
@@ -1001,20 +1541,162 @@
       else if (ch === "{") depth++;
       else if (ch === "}") {
         depth--;
-        if (depth === 0) return before.slice(i + 1).trim() === "";
+        if (depth === 0) {
+          end = i + 1;
+          break;
+        }
       }
     }
-    return false;
+    if (end === -1 || before.slice(end).trim() !== "") return null;
+    let obj = null;
+    try {
+      obj = JSON.parse(before.slice(brace, end));
+    } catch {
+      return null;
+    }
+    const name = obj && (obj.name || obj.tool || obj.tool_name || (obj.function && obj.function.name));
+    if (typeof name !== "string") return null;
+    if (Array.isArray(toolNames) && toolNames.length) {
+      const known = toolNames.some((n) => n === name || String(n).toLowerCase() === name.toLowerCase());
+      if (!known) return null;
+    }
+    return { name };
   }
 
-  function toolEarlyReturnDecision(toolsEnabled, replyText, quietMs, earlyReturnMs) {
-    if (!toolsEnabled) return false;
-    if (quietMs < earlyReturnMs) return false;
-    return toolCallComplete(replyText);
+  // How many complete, valid TOOL_CALL blocks the reply contains. Used to tell
+  // whether a re-read after clicking stop captured more than the first read.
+  function toolBlockCount(text, toolNames) {
+    const s = String(text || "");
+    let count = 0;
+    let from = 0;
+    for (;;) {
+      const marker = s.indexOf("TOOL_CALL", from);
+      if (marker === -1) break;
+      const brace = s.indexOf("{", marker + "TOOL_CALL".length);
+      if (brace === -1) break;
+      let depth = 0;
+      let inStr = false;
+      let esc = false;
+      let end = -1;
+      for (let i = brace; i < s.length; i++) {
+        const ch = s[i];
+        if (inStr) {
+          if (esc) esc = false;
+          else if (ch === "\\") esc = true;
+          else if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === "{") depth++;
+        else if (ch === "}") {
+          depth--;
+          if (depth === 0) {
+            end = i + 1;
+            break;
+          }
+        }
+      }
+      if (end === -1) {
+        from = marker + 1;
+        continue;
+      }
+      let obj = null;
+      try {
+        obj = JSON.parse(s.slice(brace, end));
+      } catch {}
+      const name = obj && (obj.name || obj.tool || obj.tool_name || (obj.function && obj.function.name));
+      const known =
+        typeof name === "string" &&
+        (!Array.isArray(toolNames) ||
+          !toolNames.length ||
+          toolNames.some((n) => n === name || String(n).toLowerCase() === name.toLowerCase()));
+      const fenced = s.slice(end).includes("```");
+      if (known && fenced) count++;
+      from = end;
+    }
+    return count;
+  }
+
+  function toolEarlyReturnDecision(opts) {
+    const o = opts || {};
+    if (!o.toolsEnabled || o.enabled === false) return false;
+    if (!toolBlockAtEnd(o.replyText, o.toolNames)) return false;
+    const grace = Number.isFinite(o.earlyReturnMs) ? o.earlyReturnMs : 400;
+    if ((o.quietMs || 0) < grace) return false;
+    // While the site is still generating, a pause is not proof the turn is
+    // over: a second block may start just after the grace window. Wait up to a
+    // hard cap before clicking stop, so that block is not silently lost.
+    if (o.generating) {
+      const cap = Number.isFinite(o.hardCapMs) ? o.hardCapMs : 1500;
+      if ((o.sinceBlockMs || 0) < cap) return false;
+    }
+    return true;
   }
   /* @noapi-shared-end toolEarlyReturn */
 
-  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, typedLen, toolsEnabled = false, pipelineT0 = null, timings = null }) {
+  // Coalescing scheduler for the completion loop. A burst of DOM mutations must
+  // wake exactly ONE tick, and two ticks must never run at the same time (the
+  // tick reads and writes state, so overlap would corrupt it). The observer and
+  // the slow fallback interval both go through `schedule()`. `enqueue` is
+  // injected (queueMicrotask in the browser) so this stays a pure factory that
+  // tools/test-content-logic.js can lift out and exercise without a browser.
+  // Phase 2 submit gate. The page's own "I accept this prompt" signal is the send
+  // control turning enabled; a disabled control means "not yet". `probe()` returns
+  // true once it is enabled. Polls on a short grid and gives up after `timeoutMs`.
+  // The clock and sleep are injected, so tools/test-content-logic.js can lift this
+  // block out and exercise the timing without a browser.
+  /* @noapi-shared-start sendGate */
+  function createSendGate({ probe, now, sleep, timeoutMs, pollMs }) {
+    return async () => {
+      const t0 = now();
+      for (;;) {
+        if (probe()) return true;
+        if (now() - t0 >= timeoutMs) return false;
+        await sleep(pollMs);
+      }
+    };
+  }
+  /* @noapi-shared-end sendGate */
+
+  /* @noapi-shared-start tickScheduler */
+  function createTickScheduler(run, enqueue) {
+    let scheduled = false;
+    let running = false;
+    let again = false;
+    let stopped = false;
+    const pump = () => {
+      scheduled = false;
+      running = true;
+      Promise.resolve()
+        .then(() => run())
+        .catch(() => {})
+        .then(() => {
+          running = false;
+          if (again && !stopped) {
+            again = false;
+            schedule();
+          }
+        });
+    };
+    function schedule() {
+      if (stopped || scheduled) return;
+      if (running) {
+        // A tick is already in flight: remember that the page moved again and
+        // run once more as soon as it finishes (never in parallel).
+        again = true;
+        return;
+      }
+      scheduled = true;
+      enqueue(pump);
+    }
+    function stop() {
+      stopped = true;
+    }
+    return { schedule, stop };
+  }
+  /* @noapi-shared-end tickScheduler */
+
+  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, baseline = null, typedLen, toolsEnabled = false, earlyReturn = true, earlyReturnMs = DEFAULT_EARLY_RETURN_MS, toolNames = [], pipelineT0 = null, timings = null, sseEnabled = true, sseTextOn = false }) {
     const t0 = Date.now();
     return new Promise((resolve, reject) => {
       let lastText = "";
@@ -1029,19 +1711,38 @@
       let done = false;
       let observer = null;
       let timer = null;
+      let scheduler = null;
+      let completionTimer = null;
+      // Phase 3: snapshot the observed SSE counters for THIS request; only events
+      // that arrive after we start waiting can complete it.
+      const sseOn = Boolean(sseEnabled) && FLAGS.sseObserver;
+      if (sseOn) readSseToken();
+      const sseTurn = { started: SSE.started, ended: SSE.ended, errored: SSE.errored };
 
       const cleanup = () => {
         if (timer) clearInterval(timer);
         timer = null;
+        if (completionTimer) clearTimeout(completionTimer);
+        completionTimer = null;
+        SSE.wake = null;
+        scheduler?.stop();
         try {
           observer?.disconnect();
         } catch {}
         observer = null;
       };
-      const finish = (text) => {
+      const finish = (text, completedBy) => {
         if (done) return;
         done = true;
         cleanup();
+        if (timings) {
+          timings.resubmits = resubmits;
+          // How this turn ended: the site's SSE stream closing ("sse"), the stop
+          // button disappearing ("stop-button"), the stable-text fallback
+          // ("fallback-2200"), or the early tool return ("early-return").
+          // /health keeps a per-site counter for each.
+          timings.completedBy = completedBy || (stopSeen ? "stop-button" : "fallback-2200");
+        }
         resolve(text);
       };
       const fail = (err) => {
@@ -1054,12 +1755,13 @@
       // Stream the text so far while it grows (throttled). The bridge forwards
       // it to OpenCode as content deltas for plain answers and buffers it while
       // it might contain a TOOL_CALL; the final `response` stays authoritative.
+      let earlyBlockAt = 0; // when the reply first ended with a complete tool block
       let lastPartialAt = 0;
       let lastPartialText = "";
       const sendPartial = (text) => {
         if (!state.reqId || !text || text === lastPartialText) return;
         const now = Date.now();
-        if (now - lastPartialAt < PARTIAL_THROTTLE_MS) return;
+        if (now - lastPartialAt < TUNE.partialThrottle) return;
         lastPartialAt = now;
         lastPartialText = text;
         try {
@@ -1070,6 +1772,7 @@
       try {
         observer = new MutationObserver(() => {
           dirty = true;
+          if (FLAGS.observerDriven) scheduler?.schedule();
         });
         observer.observe(scope || document.body, { subtree: true, childList: true, characterData: true });
       } catch {}
@@ -1085,9 +1788,12 @@
           const t = dropEcho(extractText(grownNode), prompt);
           if (t) return t;
         }
-        const before = elementLengths(scope || document.body);
-        await sleep(GROW_SAMPLE_MS);
-        grownNode = biggestGrower(before, composer);
+        let base = baseline;
+        if (!base) {
+          base = elementLengths(currentScope());
+          await sleep(GROW_SAMPLE_MS);
+        }
+        grownNode = biggestGrower(base, composer);
         grownAt = Date.now();
         return grownNode ? dropEcho(extractText(grownNode), prompt) : "";
       };
@@ -1106,7 +1812,7 @@
             fromSelector = true;
           }
         }
-        if (!fromSelector && Date.now() - t0 > 8000) {
+        if (!fromSelector && Date.now() - t0 > (baseline ? FALLBACK_AFTER_MS_BASELINE : 8000)) {
           text = await fallbackText();
         }
         return text;
@@ -1134,6 +1840,16 @@
             if (timings) timings.stopSeen = true;
           }
 
+          // Phase 3: the page's own fetch SSE stream started/ended. A live or
+          // newly-started stream proves the send was accepted, so the "swallowed
+          // send" recovery below must not fire.
+          const sseState = sseOn ? sseDecision(sseTurn, SSE) : "none";
+          if (sseState !== "none") {
+            sawActivity = true;
+            if (timings && !timings.sseSeen) timings.sseSeen = true;
+            if (sseState === "started") setLog(`${SITE.name} opened its answer stream...`, "tick");
+          }
+
           // If the site swallowed the send (nothing started), recover. Two cases:
           //  - the composer still holds our text  -> click send again
           //  - the composer is EMPTY (re-render wiped it) and the page did not
@@ -1147,7 +1863,7 @@
               if (composerText(c).length >= 4) {
                 resubmits++;
                 setLog(`Prompt not accepted yet, sending again (${resubmits}/3)...`, true);
-                await submitComposer(c);
+                await submitComposer(c, prompt);
                 return;
               }
               // Box empty and the page shows no trace of our prompt: it was never sent.
@@ -1155,7 +1871,7 @@
                 resubmits++;
                 setLog(`Chat box is empty and nothing was sent, typing the prompt again (${resubmits}/3)...`, true);
                 const c2 = await ensureTyped(c, prompt);
-                await submitComposer(c2);
+                await submitComposer(c2, prompt);
                 return;
               }
             }
@@ -1163,7 +1879,7 @@
 
           // Only read the DOM when it changed (or, at most once a second, in case
           // mutations happen somewhere we cannot observe).
-          if ((dirty || now - lastExtractAt >= UNSEEN_MUTATION_MS) && now - lastExtractAt >= EXTRACT_THROTTLE_MS) {
+          if ((dirty || now - lastExtractAt >= UNSEEN_MUTATION_MS) && now - lastExtractAt >= TUNE.extractThrottle) {
             dirty = false;
             lastExtractAt = now;
             const text = await readText(generating);
@@ -1175,7 +1891,7 @@
               if (waited >= 20 && waited - lastStallLog >= STALL_LOG_MS / 1000) {
                 lastStallLog = waited;
                 const c = (await findComposer()) || composer;
-                const dbg = `nodes=${replyNodes().length}/${before} box=${composerText(c).length}ch stop=${isStopVisible()}`;
+                const dbg = `nodes=${replyNodes().length}/${before} box=${composerText(c).length}ch stop=${isStopVisible()} ${replyDiag()}`;
                 setLog(`Prompt sent, but no answer detected on ${SITE.name} yet (${waited}s) [${dbg}]. Still waiting...`, true);
               }
             } else if (text !== lastText) {
@@ -1185,23 +1901,116 @@
               if (timings && !timings.firstText) timings.firstText = Date.now() - (pipelineT0 ?? t0);
               setLog(`${SITE.name} is answering... (${text.length} chars)`, "tick");
               sendPartial(text);
+              // Wake once more when the quiet window should have elapsed, so the
+              // turn does not wait for the next fallback interval to notice that
+              // the reply stopped changing.
+              if (completionTimer) clearTimeout(completionTimer);
+              completionTimer = setTimeout(() => scheduler?.schedule(), debounceMs() + 30);
+            }
+          }
+
+          // Task 5: the decoded stream can end with a complete TOOL_CALL block a
+          // frame before the DOM paints it. Use it ONLY as an earlier trigger for
+          // one fresh DOM read; the returned text is always the DOM's, so a
+          // parser mismatch can never truncate a reply. streamText stays empty
+          // unless the sseText flag and NOAPI_SSE_TEXT are both on (and the
+          // ChatGPT parser is not shipped yet).
+          if (sseTextOn && SSE.streamText && lastText) {
+            if (SSE.streamText !== lastText && timings && !timings.sseTextMismatch) {
+              SSE.textMismatches += 1;
+              timings.sseTextMismatch = true;
+            }
+            if (toolBlockAtEnd(SSE.streamText, toolNames) && !toolBlockAtEnd(lastText, toolNames)) {
+              const fresh = await readText(generating);
+              if (fresh && fresh.length >= lastText.length) {
+                lastText = fresh;
+                lastTextAt = now;
+              }
+              if (timings) timings.sseTextTriggers = (timings.sseTextTriggers || 0) + 1;
             }
           }
 
           // Tools on: a settled, complete TOOL_CALL block is actionable now.
           // Return it and stop the site so the chat is idle for the next prompt,
-          // instead of waiting for the whole trailing narration.
-          if (toolEarlyReturnDecision(toolsEnabled, lastText, now - (lastTextAt || now), EARLY_RETURN_MS)) {
+          // instead of waiting for the whole trailing narration. The block must
+          // be valid JSON naming a real tool (never return early on a partial or
+          // malformed block), and while the site is still generating we wait up
+          // to a hard cap for a possible second block.
+          if (toolsEnabled && earlyReturn) {
+            if (toolBlockAtEnd(lastText, toolNames)) {
+              if (!earlyBlockAt) earlyBlockAt = now;
+            } else {
+              earlyBlockAt = 0;
+            }
+          }
+          if (
+            toolEarlyReturnDecision({
+              toolsEnabled,
+              enabled: earlyReturn,
+              replyText: lastText,
+              quietMs: now - (lastTextAt || now),
+              earlyReturnMs,
+              generating,
+              sinceBlockMs: earlyBlockAt ? now - earlyBlockAt : 0,
+              hardCapMs: TUNE.earlyReturnHardCap,
+              toolNames,
+            })
+          ) {
             if (timings) timings.earlyReturn = true;
             const stopped = stopGeneration();
             state.justStopped = stopped;
+            // Clicking stop is not instantaneous. Re-read once and keep the
+            // longer text if it now holds more complete blocks, so a block that
+            // was being written when we clicked is not cut off.
+            let finalText = lastText;
+            if (stopped) {
+              await sleep(TUNE.earlyReturnReread);
+              const nodes = replyNodes();
+              const after = nodes.length ? extractText(nodes[nodes.length - 1]) : "";
+              if (after && toolBlockCount(after, toolNames) > toolBlockCount(lastText, toolNames)) finalText = after;
+            }
             setLog(`✓ ${SITE.name} returned a complete tool call — stopping generation.`);
-            finish(lastText);
+            finish(finalText, "early-return");
             return;
           }
 
+          // Phase 3: the page's own SSE stream ended, so the answer is complete.
+          // Read the reply once more and return it without waiting out the
+          // per-site debounce. Falls through if no usable text is there yet.
+          //
+          // `!generating` guards two cases: (1) the site has not yet torn down
+          // its stop button right after the stream closed, and (2) a page script
+          // that observed the token and replayed "ended" cannot cut a reply
+          // short while the site is visibly still generating. An "error" event
+          // never reaches here (sseDecision only returns "ended" for a clean end).
+          if (sseState === "ended" && !generating) {
+            const readNow = () => {
+              const nodes = replyNodes();
+              return (nodes.length ? extractText(nodes[nodes.length - 1]) : "") || lastText;
+            };
+            let text = readNow();
+            if (text && text.length >= 5) {
+              // The site may paint the last tokens just after the stream closes.
+              // Re-read once after a short grace and keep the longer text, so a
+              // late DOM update can never be lost (reply truncated).
+              await sleep(TUNE.sseEndReread);
+              if (state.cancel) {
+                fail(new Error("Cancelled."));
+                return;
+              }
+              const after = readNow();
+              // The latest non-trivial read wins, not the longest: the page's
+              // final paint is the authoritative text (an intermediate read may
+              // be a longer raw stream body with markers still in it).
+              if (after && after.length >= 5) text = after;
+              setLog(`✓ ${SITE.name} stream ended (${text.length} chars).`);
+              finish(text, "sse");
+              return;
+            }
+          }
+
           // Completion. Needs a non-trivial reply and no stop button right now.
-          if (completionDecision(lastText.length, generating, stopSeen, now - (lastTextAt || now), Number(SITE.debounce) || 400, FALLBACK_STABLE_MS)) {
+          if (completionDecision(lastText.length, generating, stopSeen, now - (lastTextAt || now), debounceMs(), FALLBACK_STABLE_MS)) {
             finish(lastText);
           }
         } catch (err) {
@@ -1211,15 +2020,38 @@
         }
       };
 
-      timer = setInterval(tick, OBSERVER_TICK_MS);
-      tick();
+      // The observer drives the loop; this slow interval only covers mutations it
+      // cannot see (shadow DOM) and keeps the timeout / stop-button checks alive.
+      scheduler = createTickScheduler(tick, (fn) => queueMicrotask(fn));
+      SSE.wake = () => scheduler?.schedule();
+      timer = setInterval(() => scheduler?.schedule(), TUNE.fallbackTick);
+      scheduler.schedule();
     });
   }
 
-  async function runPipeline(prompt, reqId, toolsEnabled = false) {
+  async function runPipeline(prompt, reqId, toolsEnabled = false, opts = {}) {
+    // Early return on a complete tool call. The bridge reads the env vars and
+    // forwards the decision, because a content script cannot read process.env.
+    const earlyReturn = opts.earlyReturn !== false;
+    const earlyReturnMs =
+      Number.isFinite(Number(opts.earlyReturnMs)) && Number(opts.earlyReturnMs) > 0
+        ? Number(opts.earlyReturnMs)
+        : DEFAULT_EARLY_RETURN_MS;
+    const toolNames = Array.isArray(opts.toolNames) ? opts.toolNames.filter((n) => typeof n === "string") : [];
+    // Phase 3: NOAPI_SSE=0 in the bridge environment is forwarded as sse:false and
+    // disables the SSE completion signal for this request (the DOM paths remain).
+    const sseEnabled = opts.sse !== false;
+    // Task 1: per-request timing overrides read from the bridge environment.
+    Object.assign(TUNE, resolveTuning(TUNING_DEFAULTS, opts.tuning));
+    // Task 5: optional SSE-text fast path (panel flag AND bridge env), default off.
+    const sseTextOn = Boolean(opts.sseText) && FLAGS.sseText;
+    setSseText(sseTextOn);
+    SSE.streamText = "";
     if (state.busy) {
       if (reqId) {
-        ext.runtime.sendMessage({ type: "noapi_error", id: reqId, error: "This tab is already handling a prompt." }).catch(() => {});
+        ext.runtime
+          .sendMessage({ type: "noapi_error", id: reqId, error: "This tab is already handling a prompt.", code: "busy" })
+          .catch(() => {});
       }
       return;
     }
@@ -1228,6 +2060,7 @@
     state.reqId = reqId || null;
     lastProgress = "";
     lastProgressAt = 0;
+    flushLateGrowth();
     updateStatusUI();
 
     // Per-stage timings (milliseconds since the request reached this tab). Sent to
@@ -1238,6 +2071,22 @@
 
     try {
       setLog("Finding " + SITE.name + " chat input…", true);
+      if (opts.newChat) {
+        // Phase 5: a new OpenCode session can start on a fresh chat page so old
+        // context cannot leak in. Off unless NOAPI_NEW_CHAT=1. On any failure we
+        // log it and continue in the current chat.
+        setLog(`Opening a new ${SITE.name} chat...`, true);
+        try {
+          if (startNewChat()) {
+            await sleep(400); // let the site re-mount the composer on the blank chat
+            timings.newChat = true;
+          } else {
+            setLog(`No "new chat" control found on ${SITE.name}; continuing in the current chat.`, true);
+          }
+        } catch (e) {
+          setLog(`Could not open a new ${SITE.name} chat (${e.message}); continuing in the current chat.`, true);
+        }
+      }
       const composer = await waitForComposer();
       if (!composer) throw new Error("Could not find chat input on " + SITE.name + ". Is the chat page fully loaded?");
       timings.composer = Date.now() - t0;
@@ -1257,6 +2106,9 @@
       const beforeNodes = replyNodes();
       const before = beforeNodes.length;
       const beforeLast = before ? extractText(beforeNodes[before - 1]) : "";
+      // Pre-send baseline for the selector-free fallback. Only needed when no reply was on the page
+      // yet (new chat, small DOM, so cheap); with replies present the selectors evidently work.
+      const baseline = before === 0 ? elementLengths(scope) : null;
 
       let composerNow = (await findComposer()) || composer;
       setLog("Typing prompt into " + SITE.name + "…", true);
@@ -1266,15 +2118,20 @@
 
       const typedLen = scope.textContent.length;
       setLog("Sending prompt to " + SITE.name + "…", true);
-      if (!(await submitComposer(composerNow))) throw new Error("Could not click Send or trigger Enter on " + SITE.name);
+      const sent = await submitComposer(composerNow, prompt);
+      if (state.cancel) throw new Error("Cancelled.");
+      if (!sent) throw new Error("Could not click Send or trigger Enter on " + SITE.name);
       timings.sent = Date.now() - t0;
 
       setLog("Waiting for " + SITE.name + " to answer…", true);
-      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, typedLen, toolsEnabled, pipelineT0: t0, timings });
+      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, baseline, typedLen, toolsEnabled, earlyReturn, earlyReturnMs, toolNames, pipelineT0: t0, timings, sseEnabled, sseTextOn });
       timings.complete = Date.now() - t0;
 
       setLog(`✓ Response captured (${text.length} chars). Sent to OpenCode.`);
       if (reqId) ext.runtime.sendMessage({ type: "noapi_reply", id: reqId, text, timings: { ...timings, total: Date.now() - t0 } }).catch(() => {});
+      // Truncation canary: re-read the reply node once after the turn, without
+      // blocking anything. Any growth means a completion fast path cut a reply.
+      scheduleLateGrowth();
       return text;
     } catch (err) {
       setLog("Error: " + err.message);

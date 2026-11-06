@@ -5,83 +5,56 @@
 //  3. MCP in proxy mode (standalone bridge running, opencode spawns MCP proxy)
 //  4. MCP in local mode (no standalone bridge, opencode spawns bridge + MCP directly)
 //
-// It uses its own port (8797) instead of the default 8787 so it can never talk
-// to a bridge you have running for real — and never type test prompts into the
-// chat tabs of a real browser extension that happens to be connected.
-import { spawn } from "node:child_process";
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const PORT = Number(process.env.NOAPI_TEST_PORT || 8797);
-const BASE = `http://127.0.0.1:${PORT}`;
-
-// Track everything we spawn so a failure cannot leave a bridge or a fake tab
-// behind on the test port.
-const children = new Set();
-function start(args, opts = {}) {
-  const p = spawn("node", args, { cwd: process.cwd(), ...opts });
-  children.add(p);
-  return p;
-}
-function stopAll() {
-  for (const p of children) {
-    try {
-      p.kill();
-    } catch {}
-  }
-  children.clear();
-}
-
-async function fetchJson(url, opts) {
-  const r = await fetch(url, opts);
-  const text = await r.text();
-  try {
-    return { status: r.status, data: JSON.parse(text) };
-  } catch {
-    return { status: r.status, raw: text };
-  }
-}
-
-const fakeEnv = (extra = {}) => ({ ...process.env, NOAPI_PORT: String(PORT), ...extra });
+// Every bridge it starts binds an EPHEMERAL port (`--port=0`) and the fake tab
+// is given that exact port, so the suite can never talk to a real bridge or
+// type test prompts into a real chat tab. See tools/lib/harness.js.
+import {
+  startBridge,
+  startFake,
+  spawnProxy,
+  stopAll,
+  waitForHealth,
+  fetchJson,
+  warnIfDefaultBridge,
+  sleep,
+} from "./lib/harness.js";
 
 async function run() {
+  await warnIfDefaultBridge();
   console.log("=== NOAPI? Test Suite ===\n");
 
-  // Step 1: Start standalone bridge on its own port
-  console.log(`1. Starting standalone bridge on :${PORT}...`);
-  const bridgeProc = start(["bridge/index.js", `--port=${PORT}`], {
-    stdio: ["ignore", "pipe", "pipe"],
+  // Step 1: Start standalone bridge on an ephemeral port
+  const { port: PORT, proc: bridgeProc } = await startBridge({
+    onStderr: (s) => process.stderr.write("  [bridge] " + s),
   });
-  bridgeProc.stderr.on("data", (d) => process.stderr.write("  [bridge] " + d));
-  bridgeProc.stdout.on("data", (d) => process.stderr.write("  [bridge] " + d));
-  await sleep(1000);
+  const BASE = `http://127.0.0.1:${PORT}`;
+  console.log(`1. Started standalone bridge on :${PORT}...`);
 
-  const health1 = await fetchJson(`${BASE}/health`);
-  if (!health1.data?.ok) throw new Error("bridge health check failed");
+  await waitForHealth(PORT);
   console.log("   ✓ bridge is listening, health ok");
 
   // Step 2: Start fake browser extension (with simulated typing + streaming)
   console.log("2. Connecting fake browser extension...");
-  const fakeProc = start(["tools/fake-extension.js", "chatgpt"], {
-    stdio: ["ignore", "pipe", "pipe"],
-    env: fakeEnv({
+  const fakeLogs = [];
+  const fakeProc = startFake({
+    port: PORT,
+    site: "chatgpt",
+    env: {
       NOAPI_FAKE_FIRST_MS: "400",
       NOAPI_FAKE_TYPING_MS: "300",
       NOAPI_FAKE_STREAM_CHUNKS: "4",
       NOAPI_FAKE_STREAM_STEP_MS: "80",
       NOAPI_FAKE_TOOL_CALLS: "2",
       NOAPI_FAKE_TOOL_TAIL: "EXTRA_NARRATION that only arrives if nobody returned early",
-    }),
+    },
+    onStdout: (d) => {
+      fakeLogs.push(d);
+      process.stderr.write("  [fake] " + d);
+    },
   });
-  const fakeLogs = [];
-  fakeProc.stdout.on("data", (d) => {
-    fakeLogs.push(d.toString());
-    process.stderr.write("  [fake] " + d);
-  });
-  await sleep(1500);
 
-  const health2 = await fetchJson(`${BASE}/health`);
-  if (!health2.data?.clients?.length) throw new Error("fake browser did not register");
-  console.log(`   ✓ fake browser connected (clients: ${health2.data.clients.length})`);
+  const health2 = await waitForHealth(PORT, { clients: true });
+  console.log(`   ✓ fake browser connected (clients: ${health2.clients.length})`);
 
   // Step 3: Test HTTP chat completions (non-stream)
   console.log("3. Testing POST /v1/chat/completions (non-stream)...");
@@ -112,7 +85,18 @@ async function run() {
   for (const stage of ["composer", "typed", "sent", "firstText", "complete"]) {
     if (typeof t.last[stage] !== "number") throw new Error(`timing stage ${stage} missing: ${JSON.stringify(t.last)}`);
   }
-  console.log(`   ✓ timings exposed (total=${t.last.total}ms, firstText=${t.last.firstText}ms, complete=${t.last.complete}ms)`);
+  // Task 0: the report is only useful if the size fields and the post-token
+  // overhead (the number every fast path is chasing) are present.
+  if (typeof t.last.promptChars !== "number" || t.last.promptChars < 1) {
+    throw new Error(`promptChars missing from timings: ${JSON.stringify(t.last)}`);
+  }
+  if (typeof t.last.replyChars !== "number" || t.last.replyChars < 1) {
+    throw new Error(`replyChars missing from timings: ${JSON.stringify(t.last)}`);
+  }
+  if (typeof t.last.postToken !== "number" || t.last.postToken < 0) {
+    throw new Error(`postToken missing from timings: ${JSON.stringify(t.last)}`);
+  }
+  console.log(`   ✓ timings exposed (total=${t.last.total}ms, firstText=${t.last.firstText}ms, complete=${t.last.complete}ms, postToken=${t.last.postToken}ms, prompt=${t.last.promptChars}ch, reply=${t.last.replyChars}ch)`);
 
   // Step 4: Test HTTP chat completions (streaming)
   console.log("4. Testing POST /v1/chat/completions (streaming)...");
@@ -194,6 +178,45 @@ async function run() {
     throw new Error("early return leaked the narration on a multi-block reply");
   }
   console.log("   ✓ two consecutive tool calls returned early, neither cut off");
+
+  // Step 4b2: NOAPI_EARLY_RETURN=0 is the kill switch. The bridge must not stop
+  // the site early, so the trailing narration arrives and the tool call is still
+  // parsed normally by the final completion path.
+  console.log("4b2. Testing the early-return kill switch...");
+  {
+    const { port: killPort, proc: killBridge } = await startBridge({ env: { NOAPI_EARLY_RETURN: "0" } });
+    const killFake = startFake({
+      port: killPort,
+      site: "chatgpt",
+      env: {
+        NOAPI_FAKE_FIRST_MS: "200",
+        NOAPI_FAKE_STREAM_CHUNKS: "3",
+        NOAPI_FAKE_STREAM_STEP_MS: "60",
+        NOAPI_FAKE_TOOL_TAIL: "EXTRA_NARRATION after the block",
+      },
+    });
+    await waitForHealth(killPort, { clients: true });
+    const killed = await fetchJson(`http://127.0.0.1:${killPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "chatgpt", messages: [{ role: "user", content: "SINGLE_TOOL now" }], tools: TOOLS }),
+    });
+    const km = killed.data?.choices?.[0]?.message || {};
+    if ((km.tool_calls || []).length !== 1) {
+      throw new Error(`kill switch: expected the tool call anyway, got ${JSON.stringify(killed)}`);
+    }
+    if (!String(km.content || "").includes("EXTRA_NARRATION")) {
+      throw new Error(`kill switch: the trailer should have arrived (no early stop), got ${JSON.stringify(km)}`);
+    }
+    const kh = await fetchJson(`http://127.0.0.1:${killPort}/health`);
+    if (kh.data?.timings?.last?.earlyReturn === true) {
+      throw new Error(`kill switch: earlyReturn was still reported: ${JSON.stringify(kh.data.timings.last)}`);
+    }
+    killBridge.kill();
+    killFake.kill();
+    await sleep(300);
+  }
+  console.log("   ✓ NOAPI_EARLY_RETURN=0 falls back to normal completion");
 
   // Step 4c: Streaming a tool reply must never show the protocol to the user.
   console.log("4c. Testing streaming tool calls...");
@@ -285,9 +308,80 @@ async function run() {
   }
   console.log("   ✓ /health reports earlyReturn for the tool request");
 
+  const counters = health4.data?.stats?.chatgpt;
+  if (!counters || counters.requests < 1) {
+    throw new Error(`/health is missing per-site counters: ${JSON.stringify(health4.data?.stats)}`);
+  }
+  if (counters.completedByStop < 1) {
+    throw new Error(`stop-button completions were not counted: ${JSON.stringify(counters)}`);
+  }
+  if (counters.earlyReturn < 1) {
+    throw new Error(`early returns were not counted: ${JSON.stringify(counters)}`);
+  }
+  if (counters.sseSeen < 1) {
+    throw new Error(`SSE-seen turns were not counted: ${JSON.stringify(counters)}`);
+  }
+  console.log(
+    `   ✓ /health counters: requests=${counters.requests} sse=${counters.completedBySse} stop=${counters.completedByStop} fallback=${counters.completedByFallback} sseSeen=${counters.sseSeen} early=${counters.earlyReturn} resubmits=${counters.resubmits} aborted=${counters.aborted}`
+  );
+
+  // Step 4f: NOAPI_STREAM=0 restores the old "emit once at the end" behaviour.
+  console.log("4f. Testing the streaming kill switch...");
+  {
+    const { port: nsPort, proc: nsBridge } = await startBridge({ env: { NOAPI_STREAM: "0" } });
+    const nsFake = startFake({
+      port: nsPort,
+      site: "chatgpt",
+      env: { NOAPI_FAKE_FIRST_MS: "200", NOAPI_FAKE_STREAM_CHUNKS: "4", NOAPI_FAKE_STREAM_STEP_MS: "40" },
+    });
+    await waitForHealth(nsPort, { clients: true });
+    const nsResp = await fetch(`http://127.0.0.1:${nsPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "chatgpt", messages: [{ role: "user", content: "stream please" }], stream: true }),
+    });
+    const nsEvents = sseEvents(await nsResp.text());
+    const nsDeltas = nsEvents.map((e) => e.choices?.[0]?.delta?.content).filter((c) => typeof c === "string" && c);
+    if (nsDeltas.length !== 1) {
+      throw new Error(`NOAPI_STREAM=0 should emit one content chunk, got ${nsDeltas.length}`);
+    }
+    if (!nsDeltas[0].includes("[fake chatgpt]")) {
+      throw new Error(`NOAPI_STREAM=0 lost the reply: ${JSON.stringify(nsDeltas)}`);
+    }
+    nsBridge.kill();
+    nsFake.kill();
+    await sleep(300);
+  }
+  console.log("   ✓ NOAPI_STREAM=0 emits the reply once at the end");
+
+  // Step 4g: NOAPI_NEW_CHAT=1 is forwarded to the tab for a fresh conversation.
+  console.log("4g. Testing the new-chat flag...");
+  {
+    const { port: ncPort, proc: ncBridge } = await startBridge({ env: { NOAPI_NEW_CHAT: "1" } });
+    const ncFake = startFake({ port: ncPort, site: "chatgpt", env: { NOAPI_FAKE_FIRST_MS: "120" } });
+    await waitForHealth(ncPort, { clients: true });
+    const ncResp = await fetch(`http://127.0.0.1:${ncPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "chatgpt", messages: [{ role: "user", content: "fresh chat please" }] }),
+    });
+    const ncJson = await ncResp.json();
+    if (!String(ncJson.choices?.[0]?.message?.content || "").includes("[fake chatgpt]")) {
+      throw new Error(`new-chat request failed: ${JSON.stringify(ncJson)}`);
+    }
+    const ncHealth = await (await fetch(`http://127.0.0.1:${ncPort}/health`)).json();
+    if (ncHealth.timings?.last?.newChat !== true) {
+      throw new Error(`new_chat was not requested: ${JSON.stringify(ncHealth.timings?.last)}`);
+    }
+    ncBridge.kill();
+    ncFake.kill();
+    await sleep(300);
+  }
+  console.log("   ✓ NOAPI_NEW_CHAT=1 asks the tab for a fresh chat");
+
   // Step 5: Test MCP in PROXY mode (bridge is running on the test port)
   console.log("5. Testing MCP stdio in proxy mode (forwarding to running bridge)...");
-  const mcpProxy = start(["bridge/index.js", "--mcp", `--port=${PORT}`]);
+  const mcpProxy = spawnProxy(PORT);
   const proxyOut = [];
   mcpProxy.stdout.on("data", (d) => {
     for (const line of d.toString("utf8").split("\n")) {
@@ -345,7 +439,7 @@ async function run() {
 
   // Step 6: Test MCP in LOCAL mode (MCP process starts bridge directly)
   console.log("6. Testing MCP in LOCAL mode (no standalone bridge running)...");
-  const mcpLocal = start(["bridge/index.js", "--mcp", `--port=${PORT}`]);
+  const { port: LOCAL_PORT, proc: mcpLocal } = await startBridge({ mcp: true });
   const localOut = [];
   mcpLocal.stdout.on("data", (d) => {
     for (const line of d.toString("utf8").split("\n")) {
@@ -357,13 +451,10 @@ async function run() {
       }
     }
   });
-  await sleep(1000);
 
   // Connect fake browser directly to the MCP process's bridge!
-  const fakeProc2 = start(["tools/fake-extension.js", "claude"], {
-    env: fakeEnv({ NOAPI_FAKE_FIRST_MS: "300" }),
-  });
-  await sleep(1500);
+  const fakeProc2 = startFake({ port: LOCAL_PORT, site: "claude", env: { NOAPI_FAKE_FIRST_MS: "300" } });
+  await waitForHealth(LOCAL_PORT, { clients: true });
 
   mcpLocal.stdin.write(
     JSON.stringify({

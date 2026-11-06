@@ -1,0 +1,181 @@
+{
+  "_note": "Representative OpenCode tool set used by tools/prompt-report.js to measure the preamble. Replace with a captured real request body (the array under `tools`) to get exact numbers for your setup.",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "bash",
+        "description": "Executes a given bash command in a persistent shell session with optional timeout, ensuring proper handling and security measures. Before executing the command, please follow these steps: 1. Directory Verification: If the command will create new directories or files, first use the list tool to verify the parent directory exists. 2. Command Execution: always quote file paths that contain spaces. Avoid using this tool for file operations that have dedicated tools.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": { "type": "string", "description": "The command to execute." },
+            "timeout": { "type": "number", "description": "Optional timeout in milliseconds (max 600000)." },
+            "description": { "type": "string", "description": "A short description of what the command does." }
+          },
+          "required": ["command"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read",
+        "description": "Reads a file from the local filesystem. You can access any file directly by using this tool. By default, it reads up to 2000 lines starting from the beginning of the file. You can optionally specify a line offset and limit for long files. If the file is a directory, it lists the entries one per line.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "filePath": { "type": "string", "description": "The absolute path to the file or directory to read." },
+            "offset": { "type": "number", "description": "The 1-based line number to start reading from." },
+            "limit": { "type": "number", "description": "The maximum number of lines to read." }
+          },
+          "required": ["filePath"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "write",
+        "description": "Writes content to a file at the specified path, overwriting it if it exists. If the file exists, you must have read it first. Missing parent directories are created automatically. Prefer the edit tool for small, targeted changes instead of rewriting a whole file.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "filePath": { "type": "string", "description": "The absolute path to the file to write." },
+            "content": { "type": "string", "description": "The full content to write to the file." }
+          },
+          "required": ["filePath", "content"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "edit",
+        "description": "Performs exact string replacements in a file. The oldString must uniquely identify the text to replace, and must match byte for byte, including indentation and line endings. If the edit fails because oldString was not found, the tool retries while ignoring typographic quote, dash and space variants. Use replaceAll to change every occurrence.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "filePath": { "type": "string", "description": "The absolute path to the file to modify." },
+            "oldString": { "type": "string", "description": "The exact text to find and replace." },
+            "newString": { "type": "string", "description": "The text to replace oldString with." },
+            "replaceAll": { "type": "boolean", "description": "Replace every occurrence instead of requiring a unique match." }
+          },
+          "required": ["filePath", "oldString", "newString"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "glob",
+        "description": "Fast file pattern matching tool that works with any codebase size. Supports glob patterns like **/*.js or src/**/*.ts. Returns matching file paths sorted by modification time. Use this when you need to find files by name patterns.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": { "type": "string", "description": "The glob pattern to match files against." },
+            "path": { "type": "string", "description": "The directory to search in. Defaults to the current working directory." }
+          },
+          "required": ["pattern"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "grep",
+        "description": "Search file contents using ripgrep regular expression syntax or literal text matching. Use it to locate specific code, symbols or text patterns, and narrow searches with path or include. Returns matching file paths, line numbers and line previews.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": { "type": "string", "description": "Regular expression or literal text to match in file contents." },
+            "path": { "type": "string", "description": "File or directory to search. Defaults to the current working directory." },
+            "include": { "type": "string", "description": "Glob pattern to filter files, for example *.js or *.{ts,tsx}." }
+          },
+          "required": ["pattern"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list",
+        "description": "Lists files and directories in a given path. Returns the entries one per line, marking directories with a trailing slash.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string", "description": "The absolute path to the directory to list." }
+          },
+          "required": ["path"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "webfetch",
+        "description": "Fetches content from an HTTP or HTTPS URL and returns it as text, markdown or HTML. Markdown is the default. Use this to read documentation or a web page. Large text results may be replaced with a preview while the complete output is retained in managed storage.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": { "type": "string", "description": "The HTTP or HTTPS URL to fetch." },
+            "format": { "type": "string", "enum": ["text", "markdown", "html"], "description": "The format to return the content in." }
+          },
+          "required": ["url"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "todowrite",
+        "description": "Create and manage a structured task list for the current coding session. Use it to track progress, plan multi-step work, and show the user what you are doing. Always provide the complete list of todos, not just the changed ones.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "todos": { "type": "array", "description": "The full list of todo items." }
+          },
+          "required": ["todos"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "todoread",
+        "description": "Read the current todo list for this session.",
+        "parameters": { "type": "object", "properties": {} }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "task",
+        "description": "Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it. Use a subagent when a task can be parallelized or requires deep exploration.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "description": { "type": "string", "description": "A short (3-5 word) description of the task." },
+            "prompt": { "type": "string", "description": "The task for the agent to perform." },
+            "subagent_type": { "type": "string", "description": "The type of specialized agent to use for this task." }
+          },
+          "required": ["description", "prompt", "subagent_type"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "patch",
+        "description": "Apply a unified diff patch to one or more files. The patch text must be a valid unified diff, including the ---/+++ headers and the @@ hunk headers.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "patchText": { "type": "string", "description": "The full unified diff to apply." }
+          },
+          "required": ["patchText"]
+        }
+      }
+    }
+  ]
+}

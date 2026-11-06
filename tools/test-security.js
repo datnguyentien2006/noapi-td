@@ -1,15 +1,17 @@
 // The bridge must refuse web pages (cross-site requests and WebSockets)
 // while still serving the extension, OpenCode, the MCP proxy and the dashboard.
-import { spawn } from "node:child_process";
 import http from "node:http";
 import net from "node:net";
 import crypto from "node:crypto";
+import { startBridge, stopAll, warnIfDefaultBridge } from "./lib/harness.js";
 
-const PORT = 8798;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const bridge = spawn("node", ["bridge/index.js", `--port=${PORT}`], { stdio: "ignore" });
-const fail = (m) => { console.error("FAIL:", m); bridge.kill(); process.exit(1); };
-await sleep(800);
+await warnIfDefaultBridge();
+const { port: PORT } = await startBridge();
+const fail = (m) => {
+  console.error("FAIL:", m);
+  stopAll();
+  process.exit(1);
+};
 
 const get = (path, headers = {}) =>
   new Promise((resolve, reject) => {
@@ -46,5 +48,5 @@ for (const [name, fn] of checks) {
   if (!(await fn())) fail(name);
   console.log("ok:", name);
 }
-bridge.kill();
+stopAll();
 process.exit(0);

@@ -1,1 +1,527 @@
+<div align="center">
 
+<img src="extension/chrome/icons/128.png" alt="NOAPI? logo" width="96" height="96">
+
+# NOAPI?
+
+**Use ChatGPT, Claude, Gemini, DeepSeek, Z.ai (GLM) and friends inside [OpenCode](https://opencode.ai), with no API keys.**
+
+Your browser is already logged in. NOAPI? just lets OpenCode talk to it.
+
+<br>
+
+<img alt="Node.js 18+" src="https://img.shields.io/badge/node-%3E%3D18-3c873a?logo=node.js&logoColor=white">
+<img alt="Zero dependencies" src="https://img.shields.io/badge/dependencies-0-brightgreen">
+<img alt="Chrome and Firefox" src="https://img.shields.io/badge/browsers-Chrome%20%7C%20Firefox-4285f4?logo=googlechrome&logoColor=white">
+<img alt="Manifest V3" src="https://img.shields.io/badge/extension-Manifest%20V3-orange">
+<img alt="Local only" src="https://img.shields.io/badge/network-127.0.0.1%20only-informational">
+<img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue">
+<a href="https://github.com/cribest7890/NOAPI/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/cribest7890/NOAPI/actions/workflows/ci.yml/badge.svg"></a>
+
+<br>
+
+[Quick start](#-quick-start) &nbsp;•&nbsp;
+[How it works](#-how-it-works) &nbsp;•&nbsp;
+[Any project folder](#-use-it-from-any-project-folder) &nbsp;•&nbsp;
+[Troubleshooting](#-troubleshooting) &nbsp;•&nbsp;
+[Limitations](#-honest-limitations)
+
+</div>
+
+<br>
+
+## 💡 Why this exists
+
+API access costs money, and a lot of us already pay for a chat subscription that we barely squeeze the value out of. NOAPI? connects the two. OpenCode sends a prompt, a small browser extension types it into the real chat page you have open, waits for the answer, and hands it back.
+
+It is not magic and it is not an official integration. It is a careful bit of plumbing that works well enough that you can run a real coding agent on top of it, including file edits and shell commands.
+
+<br>
+
+## ✨ What you get
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+
+**🧰 Real tool use**<br>
+`bash`, `read`, `write`, `edit` and the rest of OpenCode's tools work. The bridge teaches the website model a tiny text protocol and turns its replies into proper tool calls.
+
+  </td>
+    <td width="50%" valign="top">
+
+**🧠 Live "Thinking" status and streaming**<br>
+While the site works, OpenCode shows what is going on: typing, sending, waiting, then the answer streams in as the site writes it. Finished tool calls are handed over right away.
+
+  </td>
+  </tr>
+  <tr>
+    <td valign="top">
+
+**🤖 Fully automatic**<br>
+No copy and paste, no confirm button. Prompts are typed, sent and captured on their own. Only the assistant's reply goes back, not the whole page.
+
+  </td>
+    <td valign="top">
+
+**🔌 Two ways to use it**<br>
+Pick a browser model straight from `/models`, or keep your favourite model and let it ask a website through the MCP tool.
+
+  </td>
+  </tr>
+  <tr>
+    <td valign="top">
+
+**🪶 Zero dependencies**<br>
+The bridge is plain Node.js 18+. No `npm install`, no build step, nothing to audit except the code in this repo.
+
+  </td>
+    <td valign="top">
+
+**🔒 Local only**<br>
+Everything stays on `127.0.0.1`. No telemetry, no proxy, no third party servers. It runs in your own logged in session.
+
+  </td>
+  </tr>
+</table>
+
+<br>
+
+## 🌐 Supported sites
+
+| | Site | Model id in OpenCode | Address |
+|:-:|---|---|---|
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/openai/white"><img src="https://cdn.simpleicons.org/openai" alt="💬" width="24" height="24"></picture> | **ChatGPT** | `noapi/chatgpt` | chatgpt.com |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/claude/white"><img src="https://cdn.simpleicons.org/claude" alt="🟠" width="24" height="24"></picture> | **Claude** | `noapi/claude` | claude.ai |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/googlegemini/white"><img src="https://cdn.simpleicons.org/googlegemini" alt="✨" width="24" height="24"></picture> | **Gemini** | `noapi/gemini` | gemini.google.com |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/deepseek/white"><img src="https://cdn.simpleicons.org/deepseek" alt="🐋" width="24" height="24"></picture> | **DeepSeek** | `noapi/deepseek` | chat.deepseek.com |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/perplexity/white"><img src="https://cdn.simpleicons.org/perplexity" alt="🔎" width="24" height="24"></picture> | **Perplexity** | `noapi/perplexity` | perplexity.ai |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/xai/white"><img src="https://cdn.simpleicons.org/xai" alt="⚡" width="24" height="24"></picture> | **Grok** | `noapi/grok` | grok.com |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/mistralai/white"><img src="https://cdn.simpleicons.org/mistralai" alt="🌬️" width="24" height="24"></picture> | **Mistral** | `noapi/mistral` | chat.mistral.ai |
+| 🤖 | **Z.ai** | `noapi/zai` | chat.z.ai |
+
+You need to be logged in, and the site has to be open in a tab. If you open several, each one can serve its own model.
+
+> 🆕 **Z.ai (`noapi/zai`)** is supported here. The page renders every code block with a CodeMirror editor instead of `<pre>`, so the extension re-emits those blocks as fenced code (that is what keeps tool calls working) and skips the collapsed *Thought Process* panel so reasoning never leaks into the reply. Its square stop control has no `id`/`aria-label`, so it is matched by class rather than `:has()` — which keeps Firefox 115 working too.
+
+<br>
+
+## 🚀 Quick start
+
+**You need:** Node.js 18 or newer, Chrome (or Edge, Brave, Opera, Arc) or Firefox, and OpenCode.
+
+### 1️⃣ Load the extension
+
+<details open>
+<summary><b>Chrome, Edge, Brave, Opera, Arc</b></summary>
+
+1. Open `chrome://extensions`
+2. Turn on **Developer mode** (top right)
+3. Click **Load unpacked**
+4. Pick the `extension/chrome` folder
+
+</details>
+
+<details>
+<summary><b>Firefox</b></summary>
+
+1. Open `about:debugging#/runtime/this-firefox`
+2. Click **Load Temporary Add-on...**
+3. Pick `extension/firefox/manifest.json`
+
+Firefox forgets temporary add-ons when it closes, so you will repeat this after a restart.
+
+</details>
+
+### 2️⃣ Start the bridge
+
+```bash
+npm start
+```
+
+Leave it running. You can peek at the dashboard any time at **http://127.0.0.1:8787/**.
+
+### 3️⃣ Open an AI site
+
+Open one of the [supported sites](#-supported-sites) and log in. You will see a small round **`?`** button in the bottom right corner.
+
+| Dot color | Meaning |
+|:-:|---|
+| 🟢 | Connected to the bridge, ready |
+| 🟡 | Busy, a prompt is being handled |
+| 🔴 | The bridge is not running |
+
+### 4️⃣ Use it in OpenCode
+
+Run `opencode` inside this folder, type `/models`, search for **NOAPI?** and pick something like `noapi/chatgpt`. Then just work as usual.
+
+> 💬 Try: *"make a folder named test and put a hello.txt inside it"*. If everything is wired up, you will see the status lines scroll by and the files show up on disk.
+
+<br>
+
+## 📁 Use it from any project folder
+
+The `opencode.json` in this repo only applies when you launch OpenCode from this exact folder. To use NOAPI? in all your projects, register it once in your global OpenCode config:
+
+```bash
+npm run install-global
+```
+
+That adds the `noapi` provider and the MCP server to `~/.config/opencode/opencode.json`, using the absolute path of this folder. Your other settings are kept, and a backup is saved next to the file as `opencode.json.bak`.
+
+Then, for each project:
+
+```bash
+# terminal 1, inside the NOAPI? folder
+npm start
+
+# terminal 2, inside your project
+opencode
+```
+
+A few things worth knowing:
+
+- Start the bridge **before** OpenCode. If OpenCode has to start it for you and you close that session, other sessions lose the model.
+- If you move the NOAPI? folder, run `npm run install-global` again.
+- To undo it, run `npm run install-global -- --remove`.
+
+<br>
+
+## 🧩 How it works
+
+```mermaid
+flowchart LR
+    A["OpenCode"] -- "OpenAI-style request<br>POST /v1/chat/completions" --> B["Local bridge<br>127.0.0.1:8787"]
+    A -. "MCP over stdio" .-> B
+    B -- "WebSocket" --> C["Browser extension"]
+    C -- "types, sends, reads" --> D["ChatGPT / Claude / Gemini<br>DeepSeek / ..."]
+    D -- "reply" --> C
+    C --> B
+    B -- "answer or tool call" --> A
+```
+
+In plain words:
+
+1. OpenCode thinks it is talking to an OpenAI compatible server. That server is the **bridge**, a tiny Node program on your machine.
+2. The bridge forwards the prompt over a WebSocket to the **extension**.
+3. The extension finds the chat box on the open tab, types the prompt, presses send, and watches the page while the answer grows. The reply is complete once the site's stop button disappears and the text has settled briefly.
+4. The answer streams back as it is written. When tools are enabled and the model finishes a `TOOL_CALL` block, the extension hands it over immediately and stops the site, instead of waiting for any trailing narration.
+
+### 🧰 How tools work on a website that has no tools
+
+Chat websites do not accept tool definitions, so the bridge improvises:
+
+1. On the first prompt of a conversation it adds a short briefing that lists the available tools, the format for calling them, and an example that batches several independent calls into one reply.
+2. When the model wants to act, it writes fenced blocks starting with `TOOL_CALL`, each followed by a small JSON object. Independent calls are requested together, so one round trip can do the work of several.
+3. The bridge cuts those blocks out of the reply and hands OpenCode real `tool_calls`. A finished block is returned as soon as it settles, without waiting for the rest of the reply.
+4. OpenCode runs the tools and sends the results back, which the bridge pastes into the chat as the next message.
+
+Because the website already remembers the conversation, only the **new** message is sent each turn, not the whole history. Very long tool output is trimmed in the middle (16,000 characters by default; set `NOAPI_MAX_TOOL_RESULT` to change it), and the truncation marker tells the model how many characters were cut and how to re-run the tool for the missing part, so prompts stay sane without losing context silently.
+
+### 🛡️ Small details that make it nicer
+
+- 🚦 Requests to the same site are queued, so two prompts never collide in one chat box.
+- ⏹️ Press <kbd>Esc</kbd> in OpenCode and the extension also hits the stop button on the website.
+- 🏷️ OpenCode's session title requests are answered locally, so they do not clutter your real chat.
+- 🔁 If a site swallows a send, or wipes the text you just typed, the extension notices and tries again.
+
+<br>
+
+## ⚙️ Configuration
+
+<details>
+<summary><b>Manual setup in <code>opencode.json</code></b></summary>
+
+If you prefer to edit the config by hand, this is what `npm run install-global` writes (replace the path with your own):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "noapi": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "NOAPI? (browser bridge)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "noapi-local"
+      },
+      "models": {
+        "chatgpt":    { "name": "ChatGPT via browser",    "limit": { "context": 128000,  "output": 8192 } },
+        "claude":     { "name": "Claude via browser",     "limit": { "context": 200000,  "output": 8192 } },
+        "gemini":     { "name": "Gemini via browser",     "limit": { "context": 1000000, "output": 8192 } },
+        "deepseek":   { "name": "DeepSeek via browser",   "limit": { "context": 128000,  "output": 8192 } },
+        "perplexity": { "name": "Perplexity via browser", "limit": { "context": 100000,  "output": 8192 } },
+        "grok":       { "name": "Grok via browser",       "limit": { "context": 128000,  "output": 8192 } },
+        "mistral":    { "name": "Mistral via browser",    "limit": { "context": 128000,  "output": 8192 } },
+        "zai":        { "name": "Z.ai via browser",       "limit": { "context": 128000,  "output": 8192 } }
+      }
+    }
+  },
+  "mcp": {
+    "noapi": {
+      "type": "local",
+      "command": ["node", "/absolute/path/to/NOAPI/bridge/index.js", "--mcp"],
+      "enabled": true,
+      "timeout": 30000
+    }
+  }
+}
+```
+
+The API key is a dummy value. Nothing checks it.
+
+</details>
+
+<details>
+<summary><b>Bridge flags and endpoints</b></summary>
+
+```bash
+node bridge/index.js [--mcp] [--port=8787] [--host=127.0.0.1]
+```
+
+| Flag | What it does |
+|---|---|
+| `--port=8788` | Use another port. Update `baseURL` in your config to match. |
+| `--host=...` | Bind address. Keep it on `127.0.0.1` unless you know why you are changing it. |
+| `--mcp` | Also expose the MCP server on stdio. If the port is already taken by a running bridge, it switches to proxy mode and forwards to it. |
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /` | Status dashboard |
+| `GET /health` | JSON status: clients, pending requests, sites, per-site counters |
+| `GET /v1/models` | One model per site |
+| `POST /v1/chat/completions` | OpenAI compatible chat, streaming and non streaming |
+
+### Fast-path flags (for A/B runs)
+
+Every latency fast path can be turned off to compare a run with it on against a run with it off. Content-script flags live in the extension's storage and are toggled from the **`?` panel → Fast paths (A/B)**; they need no source edit and no reload. Bridge-side flags are environment variables read by `npm start` / `npm run mcp`. Every default equals the shipped behaviour.
+
+| Flag | Where | Default | What it does |
+|---|---|---|---|
+| `observerDriven` | extension storage (panel) | on | Wake the completion loop on DOM events instead of polling every 400ms. Off = the old interval-only loop. |
+| `eagerSend` | extension storage (panel) | on | Click Send the moment the site enables it instead of after a fixed 150ms. Off = the old fixed settle. |
+| `sseObserver` | extension storage (panel) | on | Use the page's own SSE stream as a completion signal. Off = the DOM-only completion path. |
+| `sseText` | extension storage (panel) | off | **Experimental.** Let the SSE observer decode the page's stream for an even earlier tool-call trigger. The reply text still comes from the DOM. Also needs `NOAPI_SSE_TEXT=1` on the bridge (the two are ANDed). |
+| `NOAPI_SSE` | env (bridge) | on | Set to `0` to stop using the page's SSE stream for this bridge. The panel flag and this env var are ANDed. |
+| `NOAPI_EARLY_RETURN` | env (bridge) | on | Set to `0` to disable the early return on a complete `TOOL_CALL` block **and** the stop click; the turn then falls back to normal completion detection. |
+| `NOAPI_EARLY_RETURN_MS` | env (bridge) | `400` | Grace window after the last reply text before an early return is allowed. Clamped to 50–5000. |
+| `NOAPI_TERSE` | env (bridge) | on | Set to `0` to drop the "terse output" rules from the tool preamble (no prose between tool calls, concise final answers). |
+| `NOAPI_NEW_CHAT` | env (bridge) | off | Set to `1` to open a fresh chat for every new OpenCode conversation (see below). |
+| `NOAPI_SSE_TEXT` | env (bridge) | off | Arms the stream-decoding path. ANDed with the panel `sseText` flag. |
+
+Supporting knobs, not fast paths: `NOAPI_MAX_TOOL_RESULT` (`16000`), `NOAPI_DESC_MAX` (`400`), `NOAPI_PARAM_DESC_MAX` (`400`), `NOAPI_DESC_MODE`, `NOAPI_TOOL_DENY`, `NOAPI_DUMP_PREAMBLE` and `NOAPI_STREAM` (on) — see below.
+
+| Env var | Default | What it does |
+|---|---|---|
+| `NOAPI_MAX_TOOL_RESULT` | `16000` | Characters of a tool result sent back to the site (head + tail). Truncation always says how much was cut. A lower value such as `6000`–`8000` shrinks every tool-result turn and can cut latency, at the cost of the model seeing less of a long output (re-run the tool with a narrower range for the rest). |
+| `NOAPI_DESC_MAX` | `400` | Description cap for priority tools (edit, write, bash, read, patch-like, or any tool with an `oldString`/`newString`/`replace` parameter). Other tools stay at 180. |
+| `NOAPI_PARAM_DESC_MAX` | `400` | Parameter-description cap for those same priority tools. Other tools stay at 90. |
+| `NOAPI_DESC_MODE` | `full` | Set to `lean` to give even the priority tools the short caps, shrinking the preamble for the same tool set. Tool semantics are unchanged. |
+| `NOAPI_TOOL_DENY` | empty | Comma-separated tool names to leave out of the preamble. They stay fully callable: the bridge validates a call against the request's tool list, not the rendered preamble. |
+| `NOAPI_DUMP_PREAMBLE` | off | Set to `1` to write the exact prompt (preamble + first turn) sent to the site into `./noapi-preamble.txt` and log its length. |
+| `NOAPI_STREAM` | on | Set to `0` to stop streaming live deltas and emit the reply once at the end (the old behaviour). |
+
+### Timing knobs (for A/B runs)
+
+Every timing constant the content script uses can be overridden per request without editing source, so you can measure a value before changing a default. The bridge reads each variable at request time and forwards it to the tab (a content script cannot read `process.env`). All values are clamped, and an unset, empty or invalid variable keeps the shipped default.
+
+| Env var | Default | What it does | Range |
+|---|---|---|---|
+| `NOAPI_DEBOUNCE_MS` | per site (`350`–`550`) | How long the reply must be unchanged before the DOM path calls it complete. | 30–5000 |
+| `NOAPI_SSE_END_REREAD_MS` | `120` | Re-read the reply node after the page's SSE stream closes, to catch a final paint. | 0–5000 |
+| `NOAPI_EARLY_RETURN_REREAD_MS` | `120` | Re-read after the early-return stop click, so a block mid-write is not cut. | 0–5000 |
+| `NOAPI_EXTRACT_THROTTLE_MS` | `120` | Minimum gap between DOM reads of the growing reply. | 10–5000 |
+| `NOAPI_FALLBACK_TICK_MS` | `400` | Safety-net poll interval (shadow-DOM sites and the timeout/stop checks). | 50–10000 |
+| `NOAPI_PARTIAL_THROTTLE_MS` | `150` | Minimum gap between live partials forwarded to OpenCode. | 20–5000 |
+| `NOAPI_EARLY_RETURN_HARD_CAP_MS` | `1500` | Longest wait for a possible second tool block before stopping early. | 50–30000 |
+
+### `NOAPI_NEW_CHAT=1` — a fresh chat per session
+
+When a request starts a new OpenCode conversation (no assistant message yet), the extension clicks the site's *new chat* control before typing. The trade-off:
+
+- **Faster pages** — a blank chat has a tiny DOM and no old context, so the site responds and paints sooner.
+- **No pollution** — previous OpenCode sessions never bleed into the new one.
+- **It changes your chat history** — the site keeps the old conversations, but your *current* tab moves to a blank chat each session, so the chat you were reading is left behind. That is why it is **off by default**.
+- If no new-chat control is found, the turn continues in the current chat and says so in the status panel.
+
+Only one fresh chat is opened per session (the first request); later turns in the same OpenCode conversation stay in that chat, because the request then has an assistant message.
+
+### Running an A/B comparison
+
+`tools/ab-report.js` is a dependency-free Node script that turns `/health` timings into a per-site before/after table. It never talks to a website; it only reads the bridge's own counters.
+
+1. **Capture the baseline.** With the fast paths at their defaults, drive the sites you care about for a few turns, then label the run:
+   ```bash
+   node tools/ab-report.js capture before
+   ```
+   Capture as often as you like — records are de-duplicated by request id and merged, so repeated captures accumulate. `ab-results/before.json` is gitignored.
+
+2. **Flip one fast path and repeat.** Toggle it in the `?` panel → *Fast paths (A/B)* (no reload needed) or set the bridge env var and restart `npm start`:
+   ```bash
+   node tools/ab-report.js capture after
+   ```
+
+3. **Compare.**
+   ```bash
+   node tools/ab-report.js compare before after
+   ```
+   Prints, per site: request count, median and p90 of `firstText` / `complete` / `total`, and the share of each `completedBy` value (`sse`, `stop-button`, `fallback-2200`, `early-return`). Below 5 requests it says *too few samples to compare* instead of pretending.
+
+Flip only **one** flag per pair so the table reflects that flag. `/health` keeps at least 50 recent requests per site, so a single capture covers a normal A/B pair; for a clean read, capture right after a run so old turns are not mixed in.
+
+### Measuring latency in more detail
+
+`tools/report-latency.js` reads the same `/health` counters and prints, per site, the **median and p90** of every stage, plus the median prompt size and the truncation canary. It needs a running bridge:
+
+```bash
+node tools/report-latency.js            # defaults to http://127.0.0.1:8787
+node tools/report-latency.js http://127.0.0.1:8788 --json
+```
+
+Output covers `composer`, `typed`, `sent`, `firstText`, `lastToken`, `complete`, `postToken` (the client overhead *after* the model's last token — the number every fast path is chasing), `total`, the median `promptChars`, and `lateGrowth`. **`lateGrowth` must stay 0**: any other value means a completion fast path returned a reply that the page kept painting afterwards, i.e. the reply was truncated. The content script re-reads the last reply node ~1s after a turn and reports the growth, and the bridge logs and counts it per site.
+
+`tools/prompt-report.js` measures the prompt the bridge sends, without a browser. It reads a tool-set fixture (a representative OpenCode set ships in `tools/fixtures/opencode-tools.json` — replace it with a captured real request body for exact numbers) and reports the full first-turn prompt length, the marginal preamble cost of each tool, what `NOAPI_DESC_MODE=lean` and `NOAPI_TOOL_DENY` save, and the characters the lossless tool-result cleanup removes:
+
+```bash
+node tools/prompt-report.js
+```
+
+### A manual real-site check
+
+To sanity-check the tuning against the real ChatGPT page:
+
+1. With the defaults, run **20 real turns** in one OpenCode session, then `node tools/report-latency.js` and note `postToken`, `total`, the median `promptChars` and `lateGrowth`.
+2. Re-run with the tuned values, for example:
+   ```bash
+   NOAPI_EARLY_RETURN_MS=200 NOAPI_DEBOUNCE_MS=250 NOAPI_SSE_END_REREAD_MS=60 npm start
+   ```
+   Run another 20 turns and `node tools/report-latency.js` again.
+3. Compare `postToken` and `total` per site. `lateGrowth` must still be 0 in both runs; if it is not, the faster value is cutting replies and should not be adopted.
+
+The MCP server offers three tools: `chat` (ask a site), `status` and `sites`.
+
+</details>
+
+<br>
+
+## 🔧 Troubleshooting
+
+| What you see | What to try |
+|---|---|
+| **"No browser tab on ... is connected"** | Open that site in a tab, make sure you are logged in, and check that the `?` button has a green dot. Refresh the tab if the extension was just reloaded. |
+| **Red dot on the `?` button** | The bridge is not running. Start it with `npm start`. |
+| **Port 8787 already in use** | Run `node bridge/index.js --port=8788` and change `baseURL` in your config to `:8788/v1`. |
+| **NOAPI? is missing from `/models`** | You are probably outside this folder. Run `npm run install-global` once. |
+| **Stuck at "Waiting for ... to answer"** | The site may have changed its layout. Open the `?` panel and read the last status line. The stall message includes a short technical summary you can paste into an issue. |
+| **The prompt gets typed but never sent** | The extension retries a few times on its own. If it keeps failing, the send button selector for that site probably needs an update. |
+| **It worked yesterday, today it does not** | Sites change their pages. See [Limitations](#-honest-limitations) and [Adding or fixing a site](#-adding-or-fixing-a-site). |
+| **Firefox lost the extension** | Temporary add-ons disappear on restart. Load it again from `about:debugging`. |
+
+> 🪪 **Tip:** keep the AI tab visible when you can. Browsers slow down background tabs, which can make long responses laggy.
+
+<br>
+
+## 🧪 Testing without a browser
+
+You can check the whole pipeline with a fake browser tab. No real site needed.
+
+```bash
+npm test
+```
+
+This starts a bridge, connects a fake extension, and runs plain requests, streaming content deltas, early return on tool calls (one and several blocks), MCP in both modes, and a full tool call round trip (model asks for `bash`, gets the result, answers). It also runs the pure logic lifted out of the content script, the `TOOL_CALL` protocol, and the security checks.
+
+```bash
+npm run bench
+```
+
+runs the same fake tab a few times and prints time-to-first-streamed-content and full round-trip numbers, so you can see whether a change actually made things faster.
+
+<br>
+
+## 🗂️ Project layout
+
+```text
+NOAPI/
+├── bridge/                 Local server (pure Node.js)
+│   ├── index.js            Entry point, WebSocket + HTTP + MCP wiring
+│   ├── http.js             OpenAI compatible endpoints and dashboard
+│   ├── state.js            Request queue, routing, progress, cancel
+│   ├── toolproto.js        TOOL_CALL protocol: prompt building and parsing
+│   ├── mcp.js              MCP server over stdio (with proxy mode)
+│   ├── ws.js / wsclient.js Minimal WebSocket server and client
+│   └── sites.js            Supported sites
+├── extension/
+│   ├── chrome/             Manifest V3 extension
+│   └── firefox/            Same code, Firefox manifest
+├── tools/
+│   ├── install-global.js   Register NOAPI? in your global OpenCode config
+│   ├── fake-extension.js   Fake browser tab for tests
+│   ├── bench-latency.js    Round-trip latency benchmark
+│   ├── test-all.js         End to end tests
+│   ├── lib/harness.js      Ephemeral-port test harness
+│   ├── test-content-logic.js  Unit tests for the pure content-script logic
+│   ├── test-toolproto.js   Unit tests for the TOOL_CALL protocol
+│   ├── test-streamfilter.js  Unit tests for the streaming safety filter
+│   ├── test-bridge-state.js  Unit tests for the bridge request queue
+│   ├── test-isolation.js   Checks tests never touch the default port
+│   ├── test-site-wiring.js Checks a new site is registered everywhere
+│   └── test-tools.js       Tool call round trip test
+└── opencode.json           Project level OpenCode config
+```
+
+<br>
+
+## 🤝 Adding or fixing a site
+
+Sites change their HTML from time to time, so selectors rot. The good news is that each site is only a small block of config.
+
+1. In `extension/chrome/content.js`, find the `SITES` object. Each entry lists CSS selectors for the **input**, the **send** button, the **stop** button and the **reply** messages.
+2. Open the site, right click the element, choose Inspect, and update the selector.
+3. Copy the same file to `extension/firefox/content.js` so both browsers match.
+4. For a brand new site, also add it to `bridge/sites.js` (and to the `chat` tool `enum` in `bridge/mcp.js`) and to `opencode.json`.
+5. Add the origin to both manifests: `host_permissions`, the `matches` of **both** content-script entries (the DOM script and the MAIN-world SSE observer) and `web_accessible_resources`. Miss one and the site silently never connects.
+6. Run `npm test` (`tools/test-site-wiring.js` checks every one of those spots), reload the extension, and try it on the real page.
+
+A site that renders code with something other than `<pre>` (z.ai uses a CodeMirror editor) needs a small `extractText` branch so the code is re-emitted as a fenced block; the shared `codeFence` helper builds it and has unit tests.
+
+Pull requests with selector fixes are very welcome. 🙏
+
+<br>
+
+## ⚠️ Honest limitations
+
+I would rather tell you now than have you find out later.
+
+- **It depends on page layouts.** There is no official interface here. When a site redesigns its chat page, that site can break until the selectors are updated.
+- **Speed.** You are driving a real web page, so replies take as long as the website takes, plus a little overhead. The bridge streams the answer as it is written and returns finished tool calls immediately, but the site's own model time cannot be removed.
+- **Tool quality varies by model.** Tool use works through a text format the model has to follow. Strong models do it reliably, weaker ones occasionally slip.
+- **One conversation per site tab.** The website keeps the history, so a very long session may hit that site's own limits.
+- **Free plans have limits too.** The websites still apply their own message caps and rules.
+- **Terms of service.** Automating a website may go against that site's terms. This project is meant for personal use with your own account. You are responsible for how you use it, and it is not affiliated with OpenAI, Anthropic, Google, DeepSeek, Perplexity, xAI, Mistral, Z.ai or OpenCode.
+
+<br>
+
+## 🔐 Privacy and security
+
+- 🏠 The bridge listens on `127.0.0.1` only. Nothing is exposed to your network.
+- 🚫 No analytics, no tracking, no external servers.
+- 🍪 The extension never reads or stores your passwords or cookies. It only types into and reads from the chat page you already opened.
+- 🔒 To tell when an answer is finished, a small observer watches the page's *own* network calls. By default it never reads the response body — it only notes when the site's stream starts and ends. Only if you opt in to the experimental `sseText` flag (and `NOAPI_SSE_TEXT=1`) does it decode the stream inside your browser to notice a tool call slightly earlier. That text never leaves your machine, and the reply that is returned still comes from the page itself.
+- 👀 It is plain JavaScript with no build step, so what you read is what runs.
+
+<br>
+
+## 📄 License
+
+NOAPI? is released under the [MIT License](LICENSE). Use it, change it, share it. Just keep the license notice.
+
+<br>
+
+<div align="center">
+
+Made for people who like their tools local and their bills small. 💚
+
+If NOAPI? saved you some money, a ⭐ on the repo is a nice way to say thanks.
+
+</div>
