@@ -39,6 +39,8 @@
         'div[data-testid="assistant-message"]',
         "div.agent-turn",
         "div[data-message-model-slug]",
+        'section[data-turn="assistant"]',
+        '[data-turn="assistant"]',
       ],
       transcript: '[data-testid="conversation-turns"], main',
     },
@@ -866,6 +868,20 @@
   // — but only when we are already stuck, instead of snapshotting every element
   // on the page once per request the way the old code did.
   const GROW_SAMPLE_MS = 350;
+  const FALLBACK_AFTER_MS_BASELINE = 3000;
+
+  // The transcript container can be replaced by the site (a new chat usually
+  // re-mounts it on the first message), so never keep the node captured before
+  // sending: look it up again each time.
+  function currentScope() {
+    for (const s of SITE.transcript.split(",")) {
+      try {
+        const el = document.querySelector(s.trim());
+        if (el) return el;
+      } catch {}
+    }
+    return document.body;
+  }
 
   function elementLengths(scope) {
     const m = new Map();
@@ -877,20 +893,37 @@
     return m;
   }
 
-  function biggestGrower(before, exclude) {
+  // Walks the CURRENT page, so elements the site created after the baseline was
+  // taken (the reply bubble is a brand-new node!) count as growth from 0. The old
+  // version only looked at elements that already existed in the baseline and
+  // therefore could never find a freshly mounted reply.
+  function biggestGrower(base, exclude) {
     let best = null;
     let bestGrow = 7;
-    for (const [el, prev] of before) {
-      if (!el.isConnected) continue;
+    const scope = currentScope();
+    for (const el of scope.querySelectorAll("*")) {
       if (el === exclude || el.contains?.(exclude) || exclude?.contains?.(el)) continue;
       if (host.contains(el) || el.contains(host)) continue;
-      const g = (el.textContent || "").length - prev;
+      const g = (el.textContent || "").length - (base.get(el) || 0);
       if (g > bestGrow) {
         best = el;
         bestGrow = g;
       }
     }
     return best;
+  }
+
+  // Why no reply was found: counts per selector, so a broken selector is obvious
+  // from the status line alone.
+  function replyDiag() {
+    const per = (SITE.reply || []).map((sel) => {
+      try {
+        return document.querySelectorAll(sel).length;
+      } catch {
+        return "x";
+      }
+    });
+    return `sel=[${per.join(",")}] scope=${currentScope().tagName.toLowerCase()} url=${location.pathname.slice(0, 24)}`;
   }
 
   function stopGeneration() {
@@ -1109,7 +1142,7 @@
   }
   /* @noapi-shared-end toolEarlyReturn */
 
-  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, typedLen, toolsEnabled = false, earlyReturn = true, earlyReturnMs = DEFAULT_EARLY_RETURN_MS, toolNames = [], pipelineT0 = null, timings = null }) {
+  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, baseline = null, typedLen, toolsEnabled = false, earlyReturn = true, earlyReturnMs = DEFAULT_EARLY_RETURN_MS, toolNames = [], pipelineT0 = null, timings = null }) {
     const t0 = Date.now();
     return new Promise((resolve, reject) => {
       let lastText = "";
@@ -1188,9 +1221,12 @@
           const t = dropEcho(extractText(grownNode), prompt);
           if (t) return t;
         }
-        const before = elementLengths(scope || document.body);
-        await sleep(GROW_SAMPLE_MS);
-        grownNode = biggestGrower(before, composer);
+        let base = baseline;
+        if (!base) {
+          base = elementLengths(currentScope());
+          await sleep(GROW_SAMPLE_MS);
+        }
+        grownNode = biggestGrower(base, composer);
         grownAt = Date.now();
         return grownNode ? dropEcho(extractText(grownNode), prompt) : "";
       };
@@ -1209,7 +1245,7 @@
             fromSelector = true;
           }
         }
-        if (!fromSelector && Date.now() - t0 > 8000) {
+        if (!fromSelector && Date.now() - t0 > (baseline ? FALLBACK_AFTER_MS_BASELINE : 8000)) {
           text = await fallbackText();
         }
         return text;
@@ -1278,7 +1314,7 @@
               if (waited >= 20 && waited - lastStallLog >= STALL_LOG_MS / 1000) {
                 lastStallLog = waited;
                 const c = (await findComposer()) || composer;
-                const dbg = `nodes=${replyNodes().length}/${before} box=${composerText(c).length}ch stop=${isStopVisible()}`;
+                const dbg = `nodes=${replyNodes().length}/${before} box=${composerText(c).length}ch stop=${isStopVisible()} ${replyDiag()}`;
                 setLog(`Prompt sent, but no answer detected on ${SITE.name} yet (${waited}s) [${dbg}]. Still waiting...`, true);
               }
             } else if (text !== lastText) {
@@ -1400,6 +1436,9 @@
       const beforeNodes = replyNodes();
       const before = beforeNodes.length;
       const beforeLast = before ? extractText(beforeNodes[before - 1]) : "";
+      // Pre-send baseline for the selector-free fallback. Only needed when no reply was on the page
+      // yet (new chat, small DOM, so cheap); with replies present the selectors evidently work.
+      const baseline = before === 0 ? elementLengths(scope) : null;
 
       let composerNow = (await findComposer()) || composer;
       setLog("Typing prompt into " + SITE.name + "…", true);
@@ -1413,7 +1452,7 @@
       timings.sent = Date.now() - t0;
 
       setLog("Waiting for " + SITE.name + " to answer…", true);
-      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, typedLen, toolsEnabled, earlyReturn, earlyReturnMs, toolNames, pipelineT0: t0, timings });
+      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, baseline, typedLen, toolsEnabled, earlyReturn, earlyReturnMs, toolNames, pipelineT0: t0, timings });
       timings.complete = Date.now() - t0;
 
       setLog(`✓ Response captured (${text.length} chars). Sent to OpenCode.`);
