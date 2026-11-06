@@ -323,6 +323,29 @@ When a request starts a new OpenCode conversation (no assistant message yet), th
 
 Only one fresh chat is opened per session (the first request); later turns in the same OpenCode conversation stay in that chat, because the request then has an assistant message.
 
+### Running an A/B comparison
+
+`tools/ab-report.js` is a dependency-free Node script that turns `/health` timings into a per-site before/after table. It never talks to a website; it only reads the bridge's own counters.
+
+1. **Capture the baseline.** With the fast paths at their defaults, drive the sites you care about for a few turns, then label the run:
+   ```bash
+   node tools/ab-report.js capture before
+   ```
+   Capture as often as you like — records are de-duplicated by request id and merged, so repeated captures accumulate. `ab-results/before.json` is gitignored.
+
+2. **Flip one fast path and repeat.** Toggle it in the `?` panel → *Fast paths (A/B)* (no reload needed) or set the bridge env var and restart `npm start`:
+   ```bash
+   node tools/ab-report.js capture after
+   ```
+
+3. **Compare.**
+   ```bash
+   node tools/ab-report.js compare before after
+   ```
+   Prints, per site: request count, median and p90 of `firstText` / `complete` / `total`, and the share of each `completedBy` value (`sse`, `stop-button`, `fallback-2200`, `early-return`). Below 5 requests it says *too few samples to compare* instead of pretending.
+
+Flip only **one** flag per pair so the table reflects that flag. `/health` keeps at least 50 recent requests per site, so a single capture covers a normal A/B pair; for a clean read, capture right after a run so old turns are not mixed in.
+
 The MCP server offers three tools: `chat` (ask a site), `status` and `sites`.
 
 </details>
