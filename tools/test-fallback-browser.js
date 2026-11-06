@@ -96,8 +96,29 @@ function fakeHtml(cfg) {
     const stop = document.getElementById("stop");
     const transcript = () => document.getElementById("transcript");
     window.__fakeSent = false;
+    // Phase 2 instrumentation: when the send button turns enabled / is clicked.
+    window.__fakeEnabledAt = null;
+    window.__fakeClickedAt = null;
+    window.__fakeClicks = 0;
+    window.__fakeEnableScheduled = false;
+
+    // Optional: start disabled and enable ~N ms after the composer is typed into,
+    // so the send-on-enable path can be measured.
+    if (cfg.sendEnableAfterMs != null) {
+      send.disabled = true;
+      composer.addEventListener("input", () => {
+        if (window.__fakeEnableScheduled) return;
+        window.__fakeEnableScheduled = true;
+        setTimeout(() => {
+          send.disabled = false;
+          window.__fakeEnabledAt = performance.now();
+        }, cfg.sendEnableAfterMs);
+      });
+    }
 
     send.addEventListener("click", async () => {
+      window.__fakeClicks++;
+      if (window.__fakeClickedAt == null) window.__fakeClickedAt = performance.now();
       window.__fakeSent = true;
       composer.innerHTML = "";
       if (cfg.replaceTranscriptOnSend) {
@@ -160,7 +181,14 @@ async function runCase(browser, name, cfg, { maxMs = 20000, expect } = {}) {
     }
     const elapsed = Date.now() - t0;
     const text = reply.text || "";
-    const res = expect(text, elapsed, pageErrors);
+    const state = await page
+      .evaluate(() => ({
+        enabledAt: globalThis.__fakeEnabledAt ?? null,
+        clickedAt: globalThis.__fakeClickedAt ?? null,
+        clicks: globalThis.__fakeClicks ?? 0,
+      }))
+      .catch(() => ({}));
+    const res = expect(text, elapsed, pageErrors, state);
     ok(name, res.pass, res.why || "");
     return { text, elapsed };
   } finally {
@@ -261,6 +289,34 @@ try {
         pass: text.includes("REPLY-D") && elapsed < 5000,
         why: `elapsed=${elapsed}ms text="${text.slice(0, 60)}"`,
       }),
+    }
+  );
+
+  // (e) The send button starts disabled and enables ~300ms after typing. Phase 2
+  //     must click it within ~50ms of enabling and never before.
+  await runCase(
+    browser,
+    "(e) the send button is clicked right when it enables, never before",
+    {
+      sendEnableAfterMs: 300,
+      replyDelayMs: 300,
+      chunks: 3,
+      chunkMs: 40,
+      showStop: true,
+      replyAttrs: { "data-message-author-role": "assistant" },
+      replyText: "REPLY-E: sent the moment the button enabled.",
+    },
+    {
+      maxMs: 8000,
+      expect: (text, elapsed, _pageErrors, state) => {
+        const { enabledAt, clickedAt, clicks } = state || {};
+        const waited = enabledAt != null && clickedAt != null ? Math.round(clickedAt - enabledAt) : null;
+        const neverBefore = enabledAt != null && clickedAt != null && clickedAt >= enabledAt;
+        return {
+          pass: text.includes("REPLY-E") && clicks === 1 && waited != null && waited <= 50 && neverBefore,
+          why: `elapsed=${elapsed}ms clicks=${clicks} enabledAt=${enabledAt} clickedAt=${clickedAt} waited=${waited}ms`,
+        };
+      },
     }
   );
 } finally {

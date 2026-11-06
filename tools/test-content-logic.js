@@ -140,6 +140,66 @@ const flush = async () => {
   ok("the scheduler runs again after a throw", runs === 2, String(runs));
 }
 
+// ---- send gate (Phase 2) ---------------------------------------------------
+// The submit poll: wait for the page's send control to enable, checking every
+// pollMs and giving up at timeoutMs. A fake clock makes the timing exact.
+const makeSendGate = loadShared("sendGate", { fn: "createSendGate" });
+
+{
+  let t = 0;
+  const sleeps = [];
+  const sleep = (ms) => {
+    t += ms;
+    sleeps.push(ms);
+    return Promise.resolve();
+  };
+  const gate = makeSendGate({ probe: () => t >= 90, now: () => t, sleep, timeoutMs: 1200, pollMs: 30 });
+  const ready = await gate();
+  ok("the send gate reports ready once the control enables", ready === true);
+  ok("it wakes on the 30ms grid and clicks right when it enables (never before)", t === 90, String(t));
+  ok("every wait was one poll step", sleeps.every((s) => s === 30), sleeps.join(","));
+}
+
+{
+  let t = 0;
+  let probes = 0;
+  const sleep = (ms) => {
+    t += ms;
+    return Promise.resolve();
+  };
+  const gate = makeSendGate({
+    probe: () => {
+      probes++;
+      return probes >= 3; // enables on the third look, i.e. after 2 sleeps
+    },
+    now: () => t,
+    sleep,
+    timeoutMs: 1200,
+    pollMs: 30,
+  });
+  const ready = await gate();
+  ok("a control that enables after a delay is still caught", ready === true && t === 60, `ready=${ready} t=${t}`);
+}
+
+{
+  let t = 0;
+  const sleep = (ms) => {
+    t += ms;
+    return Promise.resolve();
+  };
+  const gate = makeSendGate({ probe: () => false, now: () => t, sleep, timeoutMs: 100, pollMs: 30 });
+  const ready = await gate();
+  ok("the send gate gives up once the timeout passes", ready === false);
+  ok("it stops at the cap and does not poll forever", t <= 130, String(t));
+}
+
+{
+  let t = 0;
+  const gate = makeSendGate({ probe: () => true, now: () => t, sleep: () => Promise.resolve(), timeoutMs: 1200, pollMs: 30 });
+  const ready = await gate();
+  ok("an already-enabled control returns immediately with no wait", ready === true && t === 0, String(t));
+}
+
 // ---- early return on a complete TOOL_CALL (Phase 4) -----------------------
 const early = loadShared("toolEarlyReturn", { fn: "toolEarlyReturnDecision" });
 const countBlocks = loadShared("toolEarlyReturn", { fn: "toolBlockCount" });

@@ -773,14 +773,35 @@
 
   // Type the prompt and CHECK it stayed there: frameworks like React may
   // re-render the composer right after our programmatic input and reset it to
-  // empty, which leaves the send button disabled and nothing gets sent. The
-  // settle delay only exists to catch that async wipe, so it is short.
+  // empty, which leaves the send button disabled and nothing gets sent.
+  //
+  // Phase 2: instead of sleeping a fixed 150ms to catch that async wipe, wait on
+  // the page's own signal that it accepted the text - the send button turning
+  // enabled - on a 30ms grid. The fixed settle survives only as the DOM fallback
+  // for sites whose send control never enables (or when EAGER_SEND is off).
   const TYPE_SETTLE_MS = 150;
+  const SUBMIT_POLL_MS = 30;
+  const SEND_READY_TIMEOUT_MS = 1200;
+  // Kill switch: set to false to restore the old fixed 150ms settle and the old
+  // 150ms submit poll. The Enter-key fallback is unchanged in either mode.
+  const EAGER_SEND = true;
+
   async function ensureTyped(composer, text) {
     let el = composer;
     for (let attempt = 1; attempt <= 4; attempt++) {
       await typePromptIntoComposer(el, text);
-      await sleep(TYPE_SETTLE_MS);
+      if (EAGER_SEND) {
+        const waitForSend = createSendGate({
+          probe: () => !!findSendButton(el),
+          now: Date.now,
+          sleep,
+          timeoutMs: SEND_READY_TIMEOUT_MS,
+          pollMs: SUBMIT_POLL_MS,
+        });
+        if (!(await waitForSend())) await sleep(TYPE_SETTLE_MS);
+      } else {
+        await sleep(TYPE_SETTLE_MS);
+      }
       el = (await findComposer()) || el;
       if (wantedFilled(el, text)) return el;
       setLog(`Text did not stick in the chat box, typing again (${attempt}/4)...`, true);
@@ -834,17 +855,36 @@
     return null;
   }
 
-  async function submitComposer(composer) {
+  async function submitComposer(composer, prompt) {
+    // Phase 2: poll for the enabled send control on a short grid (bounded) and
+    // click the moment it is ready, instead of the old fixed 150ms x 8 loop.
+    // findSendButton already means "visible and enabled" (and, on icon-send
+    // sites, "the icon-only arrow is live"), so its first non-null answer is the
+    // page accepting the prompt.
+    const pollMs = EAGER_SEND ? SUBMIT_POLL_MS : 150;
+    const tries = EAGER_SEND ? Math.max(1, Math.ceil(SEND_READY_TIMEOUT_MS / pollMs) + 1) : 8;
     let btn = null;
-    for (let i = 0; i < 8 && !btn; i++) {
+    for (let i = 0; i < tries && !btn; i++) {
       btn = findSendButton(composer);
-      if (!btn) await sleep(150);
+      if (!btn && i + 1 < tries) await sleep(pollMs);
     }
     if (btn) {
       btn.click();
+      // Safety check, run once right after the click: a re-render can wipe the
+      // composer between the enable and our click. waitForResponse's recovery
+      // path re-sends (or re-types) so this is a diagnostic, not a hard failure.
+      if (prompt != null && composer && !wantedFilled(composer, prompt)) {
+        setLog(`${SITE.name} chat box emptied as we sent; the recovery loop will re-send if nothing starts.`, true);
+      }
       return true;
     }
+    // No enabled send control appeared within the cap. If the typed text is still
+    // there, the Enter fallback submits it; if it was wiped, say so (the recovery
+    // loop re-types).
     if (composer) {
+      if (prompt != null && !wantedFilled(composer, prompt)) {
+        setLog(`${SITE.name} chat box is empty before send; the recovery loop will type the prompt again.`, true);
+      }
       composer.focus();
       for (const ev of ["keydown", "keypress", "keyup"]) {
         composer.dispatchEvent(
@@ -1151,6 +1191,24 @@
   // the slow fallback interval both go through `schedule()`. `enqueue` is
   // injected (queueMicrotask in the browser) so this stays a pure factory that
   // tools/test-content-logic.js can lift out and exercise without a browser.
+  // Phase 2 submit gate. The page's own "I accept this prompt" signal is the send
+  // control turning enabled; a disabled control means "not yet". `probe()` returns
+  // true once it is enabled. Polls on a short grid and gives up after `timeoutMs`.
+  // The clock and sleep are injected, so tools/test-content-logic.js can lift this
+  // block out and exercise the timing without a browser.
+  /* @noapi-shared-start sendGate */
+  function createSendGate({ probe, now, sleep, timeoutMs, pollMs }) {
+    return async () => {
+      const t0 = now();
+      for (;;) {
+        if (probe()) return true;
+        if (now() - t0 >= timeoutMs) return false;
+        await sleep(pollMs);
+      }
+    };
+  }
+  /* @noapi-shared-end sendGate */
+
   /* @noapi-shared-start tickScheduler */
   function createTickScheduler(run, enqueue) {
     let scheduled = false;
@@ -1339,7 +1397,7 @@
               if (composerText(c).length >= 4) {
                 resubmits++;
                 setLog(`Prompt not accepted yet, sending again (${resubmits}/3)...`, true);
-                await submitComposer(c);
+                await submitComposer(c, prompt);
                 return;
               }
               // Box empty and the page shows no trace of our prompt: it was never sent.
@@ -1347,7 +1405,7 @@
                 resubmits++;
                 setLog(`Chat box is empty and nothing was sent, typing the prompt again (${resubmits}/3)...`, true);
                 const c2 = await ensureTyped(c, prompt);
-                await submitComposer(c2);
+                await submitComposer(c2, prompt);
                 return;
               }
             }
@@ -1509,7 +1567,7 @@
 
       const typedLen = scope.textContent.length;
       setLog("Sending prompt to " + SITE.name + "…", true);
-      if (!(await submitComposer(composerNow))) throw new Error("Could not click Send or trigger Enter on " + SITE.name);
+      if (!(await submitComposer(composerNow, prompt))) throw new Error("Could not click Send or trigger Enter on " + SITE.name);
       timings.sent = Date.now() - t0;
 
       setLog("Waiting for " + SITE.name + " to answer…", true);
