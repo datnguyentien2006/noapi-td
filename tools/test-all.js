@@ -307,8 +307,11 @@ async function run() {
   if (counters.earlyReturn < 1) {
     throw new Error(`early returns were not counted: ${JSON.stringify(counters)}`);
   }
+  if (counters.sseSeen < 1) {
+    throw new Error(`SSE-seen turns were not counted: ${JSON.stringify(counters)}`);
+  }
   console.log(
-    `   ✓ /health counters: requests=${counters.requests} stop=${counters.completedByStop} fallback=${counters.completedByFallback} early=${counters.earlyReturn} resubmits=${counters.resubmits} aborted=${counters.aborted}`
+    `   ✓ /health counters: requests=${counters.requests} sse=${counters.completedBySse} stop=${counters.completedByStop} fallback=${counters.completedByFallback} sseSeen=${counters.sseSeen} early=${counters.earlyReturn} resubmits=${counters.resubmits} aborted=${counters.aborted}`
   );
 
   // Step 4f: NOAPI_STREAM=0 restores the old "emit once at the end" behaviour.

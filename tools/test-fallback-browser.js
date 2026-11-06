@@ -18,6 +18,7 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const CONTENT = fs.readFileSync(path.join(ROOT, "extension", "chrome", "content.js"), "utf8");
+const OBSERVER = fs.readFileSync(path.join(ROOT, "extension", "chrome", "sse-observer.js"), "utf8");
 
 let chromium;
 try {
@@ -60,6 +61,7 @@ const STUB = `(() => {
     },
     onMessage: { addListener(fn) { api.runtimeListeners.push(fn); } },
   };
+  runtime.getURL = (p) => p;
   globalThis.chrome = { runtime };
   // Deliver a prompt exactly the way the background worker would, over the port.
   api.autosend = function (prompt, opts) {
@@ -121,6 +123,32 @@ function fakeHtml(cfg) {
       if (window.__fakeClickedAt == null) window.__fakeClickedAt = performance.now();
       window.__fakeSent = true;
       composer.innerHTML = "";
+      if (cfg.fetchStream) {
+        // Phase 3: the page answers over its own fetch + text/event-stream. The
+        // MAIN-world observer must see it without breaking this read - every
+        // chunk must still arrive here.
+        const bubble = document.createElement("div");
+        bubble.setAttribute("data-message-author-role", "assistant");
+        const p = document.createElement("p");
+        bubble.appendChild(p);
+        transcript().appendChild(bubble);
+        window.__fakeStreamChunks = 0;
+        try {
+          const res = await fetch("/fake-stream");
+          const reader = res.body.getReader();
+          const dec = new TextDecoder();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            window.__fakeStreamChunks++;
+            p.textContent += dec.decode(value, { stream: true });
+          }
+          window.__fakeStreamDone = true;
+        } catch (e) {
+          window.__fakeStreamError = String(e);
+        }
+        return;
+      }
       if (cfg.replaceTranscriptOnSend) {
         const old = document.getElementById("transcript");
         const fresh = document.createElement("main");
@@ -159,10 +187,21 @@ async function runCase(browser, name, cfg, { maxMs = 20000, expect } = {}) {
     const page = await context.newPage();
     const pageErrors = [];
     page.on("pageerror", (e) => pageErrors.push(String(e && e.message ? e.message : e)));
-    await page.route("https://chatgpt.com/**", (route) =>
-      route.fulfill({ contentType: "text/html", body: fakeHtml(cfg) })
-    );
+    await page.route("https://chatgpt.com/**", (route) => {
+      const u = route.request().url();
+      if (u.includes("/fake-stream")) {
+        const body =
+          `data: ${JSON.stringify({ delta: (cfg.replyText || "").slice(0, 24) })}\n\n` +
+          `data: ${JSON.stringify({ delta: (cfg.replyText || "").slice(24) })}\n\n` +
+          "data: [DONE]\n\n";
+        return route.fulfill({ contentType: "text/event-stream", body });
+      }
+      return route.fulfill({ contentType: "text/html", body: fakeHtml(cfg) });
+    });
     await page.goto("https://chatgpt.com/c/regression");
+    // Chrome loads sse-observer.js as a MAIN-world content script; here we inject
+    // it the same way so the fetch wrapper is in place before content.js runs.
+    await page.addScriptTag({ content: OBSERVER });
     await page.addScriptTag({ content: CONTENT });
     await page.waitForFunction(() => globalThis.__noapi && globalThis.__noapi.portListeners.length > 0, null, {
       timeout: 5000,
@@ -186,6 +225,11 @@ async function runCase(browser, name, cfg, { maxMs = 20000, expect } = {}) {
         enabledAt: globalThis.__fakeEnabledAt ?? null,
         clickedAt: globalThis.__fakeClickedAt ?? null,
         clicks: globalThis.__fakeClicks ?? 0,
+        streamChunks: globalThis.__fakeStreamChunks ?? null,
+        streamDone: globalThis.__fakeStreamDone ?? false,
+        streamError: globalThis.__fakeStreamError ?? null,
+        completedBy: (globalThis.__noapi?.reply?.timings?.completedBy) ?? null,
+        sseSeen: (globalThis.__noapi?.reply?.timings?.sseSeen) ?? null,
       }))
       .catch(() => ({}));
     const res = expect(text, elapsed, pageErrors, state);
@@ -315,6 +359,33 @@ try {
         return {
           pass: text.includes("REPLY-E") && clicks === 1 && waited != null && waited <= 50 && neverBefore,
           why: `elapsed=${elapsed}ms clicks=${clicks} enabledAt=${enabledAt} clickedAt=${clickedAt} waited=${waited}ms`,
+        };
+      },
+    }
+  );
+
+  // (f) The page answers over its own fetch + text/event-stream. The MAIN-world
+  //     observer must see the stream (and its end) without stealing any of the
+  //     bytes the page itself reads.
+  await runCase(
+    browser,
+    "(f) the page's own SSE stream is observed and completes the turn",
+    {
+      fetchStream: true,
+      replyText: "REPLY-F: the answer arrived over the page's own SSE stream.",
+    },
+    {
+      maxMs: 10000,
+      expect: (text, elapsed, _pageErrors, state) => {
+        const s = state || {};
+        return {
+          pass:
+            text.includes("REPLY-F") &&
+            s.streamDone === true &&
+            (s.streamChunks || 0) >= 1 &&
+            !s.streamError &&
+            s.completedBy === "sse",
+          why: `elapsed=${elapsed}ms chunks=${s.streamChunks} done=${s.streamDone} err=${s.streamError} completedBy=${s.completedBy} sseSeen=${s.sseSeen} text="${text.slice(0, 60)}"`,
         };
       },
     }

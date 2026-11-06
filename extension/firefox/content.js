@@ -262,6 +262,67 @@
 
   const state = { bridge: false, busy: false, port: null, cancel: false, reqId: null, justStopped: false };
 
+  // ---------------- SSE OBSERVATION (Phase 3) ----------------
+  // A tiny MAIN-world script (sse-observer.js) watches the page's own fetch for
+  // text/event-stream responses and posts "started"/"ended" events here. We only
+  // count those events; the reply text still comes from the DOM. If the observer
+  // is missing, the site never streams over fetch, or NOAPI_SSE=0, the completion
+  // loop behaves exactly as before. SSE_ENABLED is the constant kill switch.
+  const SSE_ENABLED = true;
+  const SSE_TOKEN_ATTR = "data-noapi-sse-token";
+  const SSE = { token: null, started: 0, ended: 0, active: 0, lastAt: 0, wake: null, injected: false };
+
+  function injectSseObserver() {
+    if (!SSE_ENABLED || SSE.injected) return;
+    SSE.injected = true;
+    try {
+      // Chrome loads sse-observer.js as a MAIN-world content script (manifest),
+      // so the token is already on <html> and there is nothing to inject. Firefox
+      // has no MAIN world on our minimum version, so fall back to a <script> tag.
+      if (document.documentElement.getAttribute(SSE_TOKEN_ATTR)) return;
+      const s = document.createElement("script");
+      s.src = ext.runtime.getURL("sse-observer.js");
+      s.async = false;
+      s.onload = () => { try { s.remove(); } catch {} };
+      s.onerror = () => { try { s.remove(); } catch {} };
+      (document.head || document.documentElement).appendChild(s);
+    } catch {}
+  }
+
+  function readSseToken() {
+    try {
+      const t = document.documentElement.getAttribute(SSE_TOKEN_ATTR);
+      if (t) SSE.token = t;
+    } catch {}
+    return SSE.token;
+  }
+
+  if (SSE_ENABLED) {
+    window.addEventListener("message", (e) => {
+      const d = e && e.data;
+      if (!d || d.source !== "noapi-sse") return;
+      if (!SSE.token || d.token !== SSE.token) return;
+      if (d.event === "started") {
+        SSE.started++;
+        SSE.active++;
+      } else if (d.event === "ended") {
+        SSE.ended++;
+        if (SSE.active > 0) SSE.active--;
+      } else {
+        return;
+      }
+      SSE.lastAt = Date.now();
+      // A stream can start and end without any DOM mutation we can observe, so
+      // wake the completion loop right away.
+      try {
+        SSE.wake?.();
+      } catch {}
+    });
+    injectSseObserver();
+    readSseToken();
+    setTimeout(readSseToken, 500);
+  }
+
   // ---------------- UI CREATION ----------------
   const host = document.createElement("div");
   host.id = "noapi-host";
@@ -573,6 +634,7 @@
         earlyReturn: msg.earlyReturn,
         earlyReturnMs: msg.earlyReturnMs,
         toolNames: msg.toolNames,
+        sse: msg.sse,
       }).catch(() => {});
     } else if (msg.type === "noapi_cancel") {
       if (state.busy && (!msg.id || msg.id === state.reqId)) cancelCurrent();
@@ -1033,6 +1095,19 @@
   const UNSEEN_MUTATION_MS = 1000;
   const STALL_LOG_MS = 20_000;
 
+  /* @noapi-shared-start sseDecision */
+  // Phase 3: read the observed SSE counters. `turn` is the snapshot taken when
+  // this request's wait began, `live` the current counters. "ended" wins over
+  // "started" so a stream that opened and closed between two ticks is still seen,
+  // but only once no other stream is still open.
+  function sseDecision(turn, live) {
+    if (!turn || !live) return "none";
+    if (live.ended > turn.ended && (live.active || 0) <= 0) return "ended";
+    if (live.active > 0 || live.started > turn.started) return "started";
+    return "none";
+  }
+  /* @noapi-shared-end sseDecision */
+
   // Pure decision function, delimited so tools/test-content-logic.js can lift it
   // out of this file and unit-test it without a browser. Keep it self-contained
   // (no outer variables) — that is what makes the extraction possible.
@@ -1247,7 +1322,7 @@
   }
   /* @noapi-shared-end tickScheduler */
 
-  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, baseline = null, typedLen, toolsEnabled = false, earlyReturn = true, earlyReturnMs = DEFAULT_EARLY_RETURN_MS, toolNames = [], pipelineT0 = null, timings = null }) {
+  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, baseline = null, typedLen, toolsEnabled = false, earlyReturn = true, earlyReturnMs = DEFAULT_EARLY_RETURN_MS, toolNames = [], pipelineT0 = null, timings = null, sseEnabled = true }) {
     const t0 = Date.now();
     return new Promise((resolve, reject) => {
       let lastText = "";
@@ -1264,12 +1339,18 @@
       let timer = null;
       let scheduler = null;
       let completionTimer = null;
+      // Phase 3: snapshot the observed SSE counters for THIS request; only events
+      // that arrive after we start waiting can complete it.
+      const sseOn = Boolean(sseEnabled) && SSE_ENABLED;
+      if (sseOn) readSseToken();
+      const sseTurn = { started: SSE.started, ended: SSE.ended };
 
       const cleanup = () => {
         if (timer) clearInterval(timer);
         timer = null;
         if (completionTimer) clearTimeout(completionTimer);
         completionTimer = null;
+        SSE.wake = null;
         scheduler?.stop();
         try {
           observer?.disconnect();
@@ -1282,10 +1363,11 @@
         cleanup();
         if (timings) {
           timings.resubmits = resubmits;
-          // How this turn ended: the stop button disappearing ("stop"), the
-          // stable-text fallback ("fallback"), or the early tool return
-          // ("early"). /health keeps a per-site counter for each.
-          timings.completedBy = completedBy || (stopSeen ? "stop" : "fallback");
+          // How this turn ended: the site's SSE stream closing ("sse"), the stop
+          // button disappearing ("stop-button"), the stable-text fallback
+          // ("fallback-2200"), or the early tool return ("early-return").
+          // /health keeps a per-site counter for each.
+          timings.completedBy = completedBy || (stopSeen ? "stop-button" : "fallback-2200");
         }
         resolve(text);
       };
@@ -1382,6 +1464,16 @@
             sawActivity = true;
             stopSeen = true;
             if (timings) timings.stopSeen = true;
+          }
+
+          // Phase 3: the page's own fetch SSE stream started/ended. A live or
+          // newly-started stream proves the send was accepted, so the "swallowed
+          // send" recovery below must not fire.
+          const sseState = sseOn ? sseDecision(sseTurn, SSE) : "none";
+          if (sseState !== "none") {
+            sawActivity = true;
+            if (timings && !timings.sseSeen) timings.sseSeen = true;
+            if (sseState === "started") setLog(`${SITE.name} opened its answer stream...`, "tick");
           }
 
           // If the site swallowed the send (nothing started), recover. Two cases:
@@ -1483,8 +1575,21 @@
               if (after && toolBlockCount(after, toolNames) > toolBlockCount(lastText, toolNames)) finalText = after;
             }
             setLog(`✓ ${SITE.name} returned a complete tool call — stopping generation.`);
-            finish(finalText, "early");
+            finish(finalText, "early-return");
             return;
+          }
+
+          // Phase 3: the page's own SSE stream ended, so the answer is complete.
+          // Read the reply once more and return it without waiting out the
+          // per-site debounce. Falls through if no usable text is there yet.
+          if (sseState === "ended") {
+            const nodes = replyNodes();
+            const text = (nodes.length ? extractText(nodes[nodes.length - 1]) : "") || lastText;
+            if (text && text.length >= 5) {
+              setLog(`✓ ${SITE.name} stream ended (${text.length} chars).`);
+              finish(text, "sse");
+              return;
+            }
           }
 
           // Completion. Needs a non-trivial reply and no stop button right now.
@@ -1501,6 +1606,7 @@
       // The observer drives the loop; this slow interval only covers mutations it
       // cannot see (shadow DOM) and keeps the timeout / stop-button checks alive.
       scheduler = createTickScheduler(tick, (fn) => queueMicrotask(fn));
+      SSE.wake = () => scheduler?.schedule();
       timer = setInterval(() => scheduler?.schedule(), FALLBACK_TICK_MS);
       scheduler.schedule();
     });
@@ -1515,6 +1621,9 @@
         ? Number(opts.earlyReturnMs)
         : DEFAULT_EARLY_RETURN_MS;
     const toolNames = Array.isArray(opts.toolNames) ? opts.toolNames.filter((n) => typeof n === "string") : [];
+    // Phase 3: NOAPI_SSE=0 in the bridge environment is forwarded as sse:false and
+    // disables the SSE completion signal for this request (the DOM paths remain).
+    const sseEnabled = opts.sse !== false;
     if (state.busy) {
       if (reqId) {
         ext.runtime.sendMessage({ type: "noapi_error", id: reqId, error: "This tab is already handling a prompt." }).catch(() => {});
@@ -1571,7 +1680,7 @@
       timings.sent = Date.now() - t0;
 
       setLog("Waiting for " + SITE.name + " to answer…", true);
-      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, baseline, typedLen, toolsEnabled, earlyReturn, earlyReturnMs, toolNames, pipelineT0: t0, timings });
+      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, baseline, typedLen, toolsEnabled, earlyReturn, earlyReturnMs, toolNames, pipelineT0: t0, timings, sseEnabled });
       timings.complete = Date.now() - t0;
 
       setLog(`✓ Response captured (${text.length} chars). Sent to OpenCode.`);

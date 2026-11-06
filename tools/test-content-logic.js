@@ -200,6 +200,38 @@ const makeSendGate = loadShared("sendGate", { fn: "createSendGate" });
   ok("an already-enabled control returns immediately with no wait", ready === true && t === 0, String(t));
 }
 
+// ---- SSE completion signal (Phase 3) --------------------------------------
+// sseDecision(turn, live): "ended" once a stream that started after the turn
+// snapshot closes, "started" while one is live, "none" otherwise.
+const sseDecision = loadShared("sseDecision");
+
+ok(
+  "no SSE decision before any stream is seen",
+  sseDecision({ started: 0, ended: 0 }, { started: 0, ended: 0, active: 0 }) === "none"
+);
+ok(
+  "a live stream counts as activity",
+  sseDecision({ started: 0, ended: 0 }, { started: 1, ended: 0, active: 1 }) === "started"
+);
+ok(
+  "an already-ended stream from before the turn is ignored",
+  sseDecision({ started: 2, ended: 2 }, { started: 2, ended: 2, active: 0 }) === "none"
+);
+ok(
+  "a stream that ends after the turn completes",
+  sseDecision({ started: 1, ended: 0 }, { started: 1, ended: 1, active: 1 }) === "started" &&
+    sseDecision({ started: 1, ended: 0 }, { started: 1, ended: 1, active: 0 }) === "ended"
+);
+ok(
+  "a stream that starts and ends between two ticks is still seen as ended",
+  sseDecision({ started: 0, ended: 0 }, { started: 1, ended: 1, active: 0 }) === "ended"
+);
+ok(
+  "while another stream is still open, it stays started",
+  sseDecision({ started: 0, ended: 0 }, { started: 2, ended: 1, active: 1 }) === "started"
+);
+ok("a missing snapshot is safe", sseDecision(null, { started: 1, ended: 1, active: 0 }) === "none");
+
 // ---- early return on a complete TOOL_CALL (Phase 4) -----------------------
 const early = loadShared("toolEarlyReturn", { fn: "toolEarlyReturnDecision" });
 const countBlocks = loadShared("toolEarlyReturn", { fn: "toolBlockCount" });

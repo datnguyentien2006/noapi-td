@@ -212,6 +212,8 @@
         earlyReturn: m.early_return !== false,
         earlyReturnMs: Number(m.early_return_ms) || 400,
         toolNames: Array.isArray(m.tool_names) ? m.tool_names : [],
+        // Phase 3: NOAPI_SSE=0 disables the page-SSE completion signal.
+        sse: m.sse !== false,
       };
 
       try {

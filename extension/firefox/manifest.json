@@ -59,5 +59,26 @@
       "js": ["content.js"],
       "run_at": "document_idle"
     }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["sse-observer.js"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://*.chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://claude.ai/*",
+        "https://*.claude.ai/*",
+        "https://gemini.google.com/*",
+        "https://www.perplexity.ai/*",
+        "https://perplexity.ai/*",
+        "https://grok.com/*",
+        "https://*.grok.com/*",
+        "https://chat.mistral.ai/*",
+        "https://*.mistral.ai/*",
+        "https://chat.deepseek.com/*",
+        "https://*.deepseek.com/*"
+      ]
+    }
   ]
 }

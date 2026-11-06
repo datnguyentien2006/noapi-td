@@ -41,7 +41,9 @@ export class Bridge {
         requests: 0,
         completedByStop: 0,
         completedByFallback: 0,
+        completedBySse: 0,
         earlyReturn: 0,
+        sseSeen: 0,
         resubmits: 0,
         aborted: 0,
         timeouts: 0,
@@ -161,6 +163,7 @@ export class Bridge {
     earlyReturn = true,
     earlyReturnMs = 400,
     toolNames = [],
+    sse = true,
   }) {
     const key = site || "*";
     const prev = this.locks.get(key) || Promise.resolve();
@@ -185,6 +188,7 @@ export class Bridge {
         earlyReturn,
         earlyReturnMs,
         toolNames,
+        sse,
       });
     } finally {
       release();
@@ -208,6 +212,7 @@ export class Bridge {
     earlyReturn = true,
     earlyReturnMs = 400,
     toolNames = [],
+    sse = true,
   }) {
     return new Promise((resolve, reject) => {
       const id = this._nextId();
@@ -266,6 +271,8 @@ export class Bridge {
         early_return: Boolean(earlyReturn),
         early_return_ms: Number(earlyReturnMs) || 400,
         tool_names: Array.isArray(toolNames) ? toolNames : [],
+        // Phase 3: NOAPI_SSE=0 disables the page-SSE completion signal.
+        sse: Boolean(sse),
       });
       let delivered = 0;
       for (const [conn] of targets) {
@@ -353,6 +360,7 @@ export class Bridge {
       }
       if (timings.stopSeen) entry.stopSeen = true;
       if (timings.earlyReturn) entry.earlyReturn = true;
+      if (timings.sseSeen) entry.sseSeen = true;
       if (Number.isFinite(Number(timings.idleMs))) entry.idleMs = Number(timings.idleMs);
       // When the model produced its last token, so the benchmark can separate
       // model time from the overhead the client adds after it.
@@ -363,14 +371,16 @@ export class Bridge {
     this.timings.push(entry);
     if (this.timings.length > MAX_TIMING_RECORDS) this.timings.shift();
     const stats = this.statsFor(record.site);
-    if (entry.completedBy === "stop") stats.completedByStop += 1;
-    else if (entry.completedBy === "fallback") stats.completedByFallback += 1;
+    if (entry.completedBy === "stop-button") stats.completedByStop += 1;
+    else if (entry.completedBy === "fallback-2200") stats.completedByFallback += 1;
+    else if (entry.completedBy === "sse") stats.completedBySse += 1;
+    if (entry.sseSeen) stats.sseSeen += 1;
     if (entry.earlyReturn) stats.earlyReturn += 1;
     if (Number.isFinite(Number(entry.resubmits))) stats.resubmits += Number(entry.resubmits);
     const parts = TIMING_STAGES.filter((k) => entry[k] != null).map((k) => `${k}=${entry[k]}ms`);
     this.log(
       `timing ${record.site || "any"}: total=${entry.total}ms${parts.length ? " " + parts.join(" ") : ""}` +
-        `${entry.stopSeen ? " stop=yes" : ""}${entry.earlyReturn ? " early-return=yes" : ""}`
+        `${entry.stopSeen ? " stop=yes" : ""}${entry.sseSeen ? " sse=yes" : ""}${entry.earlyReturn ? " early-return=yes" : ""}`
     );
   }
 

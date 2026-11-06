@@ -125,6 +125,8 @@ const outcome = (p) => p.then((text) => ({ text }), (err) => ({ err: err.message
   b.register(off, { site: "tools-off" });
   const kill = makeConn("kill");
   b.register(kill, { site: "tools-kill" });
+  const sseKill = makeConn("sse-kill");
+  b.register(sseKill, { site: "sse-kill" });
   const p1 = outcome(
     b.requestPrompt({
       prompt: "hi",
@@ -140,20 +142,25 @@ const outcome = (p) => p.then((text) => ({ text }), (err) => ({ err: err.message
   const p3 = outcome(
     b.requestPrompt({ prompt: "hi", site: "tools-kill", toolsEnabled: true, earlyReturn: false, timeoutMs: 5000 })
   );
+  const p4 = outcome(b.requestPrompt({ prompt: "hi", site: "sse-kill", sse: false, timeoutMs: 5000 }));
   await sleep(30);
   const reqOn = on.sent.find((m) => m.t === "request");
   const reqOff = off.sent.find((m) => m.t === "request");
   const reqKill = kill.sent.find((m) => m.t === "request");
+  const reqSse = sseKill.sent.find((m) => m.t === "request");
   ok("tools_enabled=true is forwarded", reqOn?.tools_enabled === true, JSON.stringify(reqOn));
   ok("early_return defaults to true", reqOn?.early_return === true, JSON.stringify(reqOn));
   ok("early_return_ms is forwarded", reqOn?.early_return_ms === 650, JSON.stringify(reqOn));
   ok("tool_names are forwarded", JSON.stringify(reqOn?.tool_names) === JSON.stringify(["bash", "read"]), JSON.stringify(reqOn));
   ok("tools_enabled defaults to false", reqOff?.tools_enabled === false, JSON.stringify(reqOff));
   ok("the kill switch is forwarded as early_return=false", reqKill?.early_return === false, JSON.stringify(reqKill));
+  ok("sse defaults to true", reqOn?.sse === true, JSON.stringify(reqOn));
+  ok("the SSE kill switch is forwarded as sse=false", reqSse?.sse === false, JSON.stringify(reqSse));
   b.respond(on, reqOn.id, "ok");
   b.respond(off, reqOff.id, "ok");
   b.respond(kill, reqKill.id, "ok");
-  await Promise.all([p1, p2, p3]);
+  b.respond(sseKill, reqSse.id, "ok");
+  await Promise.all([p1, p2, p3, p4]);
 }
 
 // ---- per-site debug counters (/health) -----------------------------------
@@ -165,13 +172,13 @@ const outcome = (p) => p.then((text) => ({ text }), (err) => ({ err: err.message
   const done = outcome(b.requestPrompt({ prompt: "hi", site: "stats-site", timeoutMs: 5000 }));
   await sleep(10);
   const id = b.listPending()[0].id;
-  b.respond(conn, id, "answer", { completedBy: "stop", earlyReturn: true, resubmits: 2 });
+  b.respond(conn, id, "answer", { completedBy: "stop-button", earlyReturn: true, resubmits: 2 });
   await done;
 
   const fallbackDone = outcome(b.requestPrompt({ prompt: "hi", site: "stats-site", timeoutMs: 5000 }));
   await sleep(10);
   const id2 = b.listPending()[0].id;
-  b.respond(conn, id2, "answer", { completedBy: "fallback", resubmits: 1 });
+  b.respond(conn, id2, "answer", { completedBy: "fallback-2200", resubmits: 1 });
   await fallbackDone;
 
   const ac = new AbortController();
@@ -183,10 +190,18 @@ const outcome = (p) => p.then((text) => ({ text }), (err) => ({ err: err.message
   const timedOut = outcome(b.requestPrompt({ prompt: "hi", site: "stats-site", timeoutMs: 40 }));
   await timedOut;
 
+  const sseDone = outcome(b.requestPrompt({ prompt: "hi", site: "stats-site", timeoutMs: 5000 }));
+  await sleep(10);
+  const id3 = b.listPending()[0].id;
+  b.respond(conn, id3, "answer", { completedBy: "sse", sseSeen: true });
+  await sseDone;
+
   const s = b.status().stats["stats-site"];
-  ok("stats: dispatch count", s.requests === 4, JSON.stringify(s));
+  ok("stats: dispatch count", s.requests === 5, JSON.stringify(s));
   ok("stats: stop-button completions counted", s.completedByStop === 1, JSON.stringify(s));
   ok("stats: fallback completions counted", s.completedByFallback === 1, JSON.stringify(s));
+  ok("stats: sse completions counted", s.completedBySse === 1, JSON.stringify(s));
+  ok("stats: sseSeen turns counted", s.sseSeen === 1, JSON.stringify(s));
   ok("stats: early returns counted", s.earlyReturn === 1, JSON.stringify(s));
   ok("stats: resubmits summed", s.resubmits === 3, JSON.stringify(s));
   ok("stats: client aborts counted", s.aborted === 1, JSON.stringify(s));

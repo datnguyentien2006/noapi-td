@@ -236,7 +236,9 @@ function handleRequest(msg) {
       total: completeAt,
       stopSeen: earlyReturn ? true : MODE !== "old",
       earlyReturn,
-      completedBy: earlyReturn ? "early" : MODE === "old" ? "fallback" : "stop",
+      completedBy: earlyReturn ? "early-return" : MODE === "old" ? "fallback-2200" : "stop-button",
+      // Simulate the page-SSE signal being observed in the "new" mode.
+      sseSeen: MODE !== "old",
       resubmits: 0,
     };
     send({ t: "response", id: msg.id, text: finalText, timings });
