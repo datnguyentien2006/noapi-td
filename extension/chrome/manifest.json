@@ -15,7 +15,8 @@
     "https://*.perplexity.ai/*",
     "https://*.grok.com/*",
     "https://*.mistral.ai/*",
-    "https://*.deepseek.com/*"
+    "https://*.deepseek.com/*",
+    "https://chat.z.ai/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -49,7 +50,8 @@
         "https://chat.mistral.ai/*",
         "https://*.mistral.ai/*",
         "https://chat.deepseek.com/*",
-        "https://*.deepseek.com/*"
+        "https://*.deepseek.com/*",
+        "https://chat.z.ai/*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle"
@@ -69,7 +71,8 @@
         "https://chat.mistral.ai/*",
         "https://*.mistral.ai/*",
         "https://chat.deepseek.com/*",
-        "https://*.deepseek.com/*"
+        "https://*.deepseek.com/*",
+        "https://chat.z.ai/*"
       ],
       "js": ["sse-observer.js"],
       "run_at": "document_start",
@@ -93,7 +96,8 @@
         "https://chat.mistral.ai/*",
         "https://*.mistral.ai/*",
         "https://chat.deepseek.com/*",
-        "https://*.deepseek.com/*"
+        "https://*.deepseek.com/*",
+        "https://chat.z.ai/*"
       ]
     }
   ]

@@ -332,6 +332,17 @@ ok("tuning: undefined overrides keeps every default", JSON.stringify(resolveTuni
   ok("tuning: invalid values keep the default", bad.debounce === null && bad.fallbackTick === 400 && bad.extractThrottle === 120, JSON.stringify(bad));
 }
 
+// ---- code fence helper (z.ai CodeMirror blocks) ----------------------------
+// Code blocks that have no <pre> (CodeMirror on z.ai) are emitted through this
+// helper, so its exact output is what the tool-call parser later sees.
+const fence = loadShared("codeFence");
+ok("fence: language + code", fence("js", "let x = 1") === "```js\nlet x = 1\n```");
+ok("fence: empty language uses a bare opening fence", fence("", "x") === "```\nx\n```");
+ok("fence: a missing language is safe", fence(undefined, "x") === "```\nx\n```");
+ok("fence: trailing newlines are trimmed", fence("", "a\nb\n\n") === "```\na\nb\n```");
+ok("fence: empty code keeps its own blank line", fence("", "") === "```\n\n```");
+ok("fence: a TOOL_CALL block round-trips", fence("", 'TOOL_CALL\n{"name":"bash"}') === '```\nTOOL_CALL\n{"name":"bash"}\n```');
+
 if (failed) {
   console.error(`\n${failed} test(s) failed`);
   process.exit(1);

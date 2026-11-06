@@ -36,6 +36,10 @@
         "mistral": {
           "name": "Mistral via browser (no API)",
           "limit": { "context": 128000, "output": 8192 }
+        },
+        "zai": {
+          "name": "Z.ai via browser (no API)",
+          "limit": { "context": 128000, "output": 8192 }
         }
       }
     }

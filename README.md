@@ -4,7 +4,7 @@
 
 # NOAPI?
 
-**Use ChatGPT, Claude, Gemini, DeepSeek and friends inside [OpenCode](https://opencode.ai), with no API keys.**
+**Use ChatGPT, Claude, Gemini, DeepSeek, Z.ai (GLM) and friends inside [OpenCode](https://opencode.ai), with no API keys.**
 
 Your browser is already logged in. NOAPI? just lets OpenCode talk to it.
 
@@ -98,8 +98,11 @@ Everything stays on `127.0.0.1`. No telemetry, no proxy, no third party servers.
 | <picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/perplexity/white"><img src="https://cdn.simpleicons.org/perplexity" alt="🔎" width="24" height="24"></picture> | **Perplexity** | `noapi/perplexity` | perplexity.ai |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/xai/white"><img src="https://cdn.simpleicons.org/xai" alt="⚡" width="24" height="24"></picture> | **Grok** | `noapi/grok` | grok.com |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/mistralai/white"><img src="https://cdn.simpleicons.org/mistralai" alt="🌬️" width="24" height="24"></picture> | **Mistral** | `noapi/mistral` | chat.mistral.ai |
+| 🤖 | **Z.ai** | `noapi/zai` | chat.z.ai |
 
 You need to be logged in, and the site has to be open in a tab. If you open several, each one can serve its own model.
+
+> 🆕 **Z.ai (`noapi/zai`)** is supported here. The page renders every code block with a CodeMirror editor instead of `<pre>`, so the extension re-emits those blocks as fenced code (that is what keeps tool calls working) and skips the collapsed *Thought Process* panel so reasoning never leaks into the reply. Its square stop control has no `id`/`aria-label`, so it is matched by class rather than `:has()` — which keeps Firefox 115 working too.
 
 <br>
 
@@ -249,7 +252,8 @@ If you prefer to edit the config by hand, this is what `npm run install-global` 
         "deepseek":   { "name": "DeepSeek via browser",   "limit": { "context": 128000,  "output": 8192 } },
         "perplexity": { "name": "Perplexity via browser", "limit": { "context": 100000,  "output": 8192 } },
         "grok":       { "name": "Grok via browser",       "limit": { "context": 128000,  "output": 8192 } },
-        "mistral":    { "name": "Mistral via browser",    "limit": { "context": 128000,  "output": 8192 } }
+        "mistral":    { "name": "Mistral via browser",    "limit": { "context": 128000,  "output": 8192 } },
+        "zai":        { "name": "Z.ai via browser",       "limit": { "context": 128000,  "output": 8192 } }
       }
     }
   },
@@ -461,6 +465,7 @@ NOAPI/
 │   ├── test-streamfilter.js  Unit tests for the streaming safety filter
 │   ├── test-bridge-state.js  Unit tests for the bridge request queue
 │   ├── test-isolation.js   Checks tests never touch the default port
+│   ├── test-site-wiring.js Checks a new site is registered everywhere
 │   └── test-tools.js       Tool call round trip test
 └── opencode.json           Project level OpenCode config
 ```
@@ -474,8 +479,11 @@ Sites change their HTML from time to time, so selectors rot. The good news is th
 1. In `extension/chrome/content.js`, find the `SITES` object. Each entry lists CSS selectors for the **input**, the **send** button, the **stop** button and the **reply** messages.
 2. Open the site, right click the element, choose Inspect, and update the selector.
 3. Copy the same file to `extension/firefox/content.js` so both browsers match.
-4. For a brand new site, also add it to `bridge/sites.js`, to `opencode.json`, and to the `matches` and `host_permissions` in both manifests.
-5. Run `npm test`, reload the extension, and try it on the real page.
+4. For a brand new site, also add it to `bridge/sites.js` (and to the `chat` tool `enum` in `bridge/mcp.js`) and to `opencode.json`.
+5. Add the origin to both manifests: `host_permissions`, the `matches` of **both** content-script entries (the DOM script and the MAIN-world SSE observer) and `web_accessible_resources`. Miss one and the site silently never connects.
+6. Run `npm test` (`tools/test-site-wiring.js` checks every one of those spots), reload the extension, and try it on the real page.
+
+A site that renders code with something other than `<pre>` (z.ai uses a CodeMirror editor) needs a small `extractText` branch so the code is re-emitted as a fenced block; the shared `codeFence` helper builds it and has unit tests.
 
 Pull requests with selector fixes are very welcome. 🙏
 
@@ -490,7 +498,7 @@ I would rather tell you now than have you find out later.
 - **Tool quality varies by model.** Tool use works through a text format the model has to follow. Strong models do it reliably, weaker ones occasionally slip.
 - **One conversation per site tab.** The website keeps the history, so a very long session may hit that site's own limits.
 - **Free plans have limits too.** The websites still apply their own message caps and rules.
-- **Terms of service.** Automating a website may go against that site's terms. This project is meant for personal use with your own account. You are responsible for how you use it, and it is not affiliated with OpenAI, Anthropic, Google, DeepSeek, Perplexity, xAI, Mistral or OpenCode.
+- **Terms of service.** Automating a website may go against that site's terms. This project is meant for personal use with your own account. You are responsible for how you use it, and it is not affiliated with OpenAI, Anthropic, Google, DeepSeek, Perplexity, xAI, Mistral, Z.ai or OpenCode.
 
 <br>
 

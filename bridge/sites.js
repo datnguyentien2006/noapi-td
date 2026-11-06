@@ -41,6 +41,12 @@ export const SITES = [
     url: "https://chat.mistral.ai",
     hosts: ["chat.mistral.ai"],
   },
+  {
+    key: "zai",
+    name: "Z.ai",
+    url: "https://chat.z.ai/",
+    hosts: ["chat.z.ai"],
+  },
 ];
 
 export const SITE_KEYS = SITES.map((s) => s.key);

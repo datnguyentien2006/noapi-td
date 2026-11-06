@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- **Z.ai** (`chat.z.ai`, model id `noapi/zai`) as a supported site. The reply is read from `.chat-assistant` / `#response-content-container` using `textarea#chat-input` and the `#send-message-button`. Because the page renders every code block with a CodeMirror editor instead of `<pre>`, `extractText` re-emits those blocks as fenced code (via the shared `codeFence` helper) so tool calls survive, and the collapsed reasoning panel (`thinking-chain-container`) is skipped. The stop control is an id-less square button (`span.bg-text-inverted`) that replaces the send button while generating; it is matched without `:has()` so Firefox 115 works
+- `tools/test-site-wiring.js` guards every place a site must be registered (bridge registry, MCP tool enum, `opencode.json`, both content scripts, both manifests) and is part of `npm test`
 - Per-request latency instrumentation: stage timings (composer, typed, sent, first reply text, completion) travel with each reply, appear in `/health`, on the dashboard, and as a one-line summary in the bridge log
 - Live streaming to OpenCode: while a site is writing, the reply is forwarded as content deltas (throttled to 150 ms). Tool calls are never streamed as visible text
 - `npm run bench` latency benchmark using the fake browser tab, running the same simulated model with the old and new client behaviour and reporting four separate numbers (first streamed content, overhead after the last token, typing + send overhead, full round trip)

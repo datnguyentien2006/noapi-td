@@ -10,7 +10,7 @@ const INTERNAL_TOOLS = [
   {
     name: "chat",
     description:
-      "Send a prompt to an AI chat website (ChatGPT, Claude, Gemini, DeepSeek, Perplexity, Grok, Mistral) that is open and logged-in in the user's browser, and return the model's reply. No API key involved: the prompt is routed through the NOAPI? local bridge into the website's chat UI. The user must have the NOAPI? browser extension active on a supported site.",
+      "Send a prompt to an AI chat website (ChatGPT, Claude, Gemini, DeepSeek, Perplexity, Grok, Mistral, Z.ai) that is open and logged-in in the user's browser, and return the model's reply. No API key involved: the prompt is routed through the NOAPI? local bridge into the website's chat UI. The user must have the NOAPI? browser extension active on a supported site.",
     inputSchema: {
       type: "object",
       properties: {
@@ -20,7 +20,7 @@ const INTERNAL_TOOLS = [
         },
         site: {
           type: "string",
-          enum: ["chatgpt", "claude", "gemini", "deepseek", "perplexity", "grok", "mistral"],
+          enum: ["chatgpt", "claude", "gemini", "deepseek", "perplexity", "grok", "mistral", "zai"],
           description: "Which site to use (defaults to the first connected site).",
         },
         timeout_seconds: {

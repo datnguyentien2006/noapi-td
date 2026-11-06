@@ -254,6 +254,35 @@
        ],
        transcript: "main",
      },
+     zai: {
+       name: "Z.ai",
+       debounce: 450,
+       hosts: ["chat.z.ai"],
+       newChat: ['button#sidebar-new-chat-button'],
+       input: [
+         "textarea#chat-input",
+         'textarea[placeholder*="Message" i]',
+         'div[contenteditable="true"][role="textbox"]',
+         "textarea",
+       ],
+       send: [
+         "button#send-message-button",
+         "button.sendMessageButton",
+         'button[type="submit"]',
+       ],
+       // While z.ai generates it REMOVES the send button and shows a small square
+       // "stop" button (button > span.bg-text-inverted) in the same place, with
+       // no id and no aria-label. Matching the span (not the button) avoids
+       // :has(), which Firefox 115 lacks; a click on the span bubbles to the
+       // button's own handler.
+       stop: [
+         "form span.bg-text-inverted",
+         "form button.bg-interactive-bg-primary-default:not(#send-message-button)",
+         'button[aria-label*="Stop" i]',
+       ],
+       reply: [".chat-assistant", "#response-content-container"],
+       transcript: "main",
+     },
    };
 
   function detectSite() {
@@ -343,6 +372,15 @@
   }
   const normalize = (s) => String(s || "").replace(/\n{3,}/g, "\n\n").trim();
 
+  /* @noapi-shared-start codeFence */
+  // Build a fenced code block from a language and its code, trimming any
+  // trailing newlines so the closing fence always sits on its own line. Used for
+  // <pre> blocks and for editors that have no <pre> (CodeMirror on z.ai).
+  function codeFence(lang, code) {
+    return "```" + (lang || "") + "\n" + String(code || "").replace(/\n+$/, "") + "\n```";
+  }
+  /* @noapi-shared-end codeFence */
+
   // ---------------- TEXT EXTRACTION ----------------
   // Turn a rendered chat message into clean markdown-ish text, skipping UI
   // chrome (copy buttons, "ChatGPT said:" headings) that innerText would include.
@@ -357,6 +395,21 @@
     const nl = () => {
       if (out && !out.endsWith("\n")) out += "\n";
     };
+    // CodeMirror code blocks (z.ai renders every fenced block with one) have no
+    // <pre>: their text lives in .cm-editor and the language label sits in a
+    // sibling div that would otherwise be emitted as plain text. Map the block
+    // wrapper (the element that also holds the label) to its fenced text once, so
+    // the walk can emit the fence and skip both the label and the raw editor.
+    const cmBlocks = new Map();
+    try {
+      for (const cm of root.querySelectorAll(".cm-editor")) {
+        const holder = cm.closest('[class*="language-"]');
+        const wrapper = holder ? holder.parentElement : cm.parentElement;
+        if (!wrapper || !root.contains(wrapper)) continue;
+        const cls = Array.from((holder && holder.classList) || []).find((x) => x.startsWith("language-")) || "";
+        cmBlocks.set(wrapper, codeFence(cls.slice("language-".length), cm.innerText || cm.textContent));
+      }
+    } catch {}
     const walk = (n) => {
       if (n.nodeType === 3) {
         out += n.nodeValue;
@@ -366,11 +419,20 @@
       const tag = n.tagName.toUpperCase();
       if (SKIP_TAGS.has(tag)) return;
       if (n.classList && (n.classList.contains("sr-only") || n.classList.contains("visually-hidden"))) return;
+      // A model reasoning panel must never leak into the reply. z.ai shows one as
+      // .thinking-chain-container (collapsed it holds only a label inside a
+      // <button>, which is skipped anyway, but an expanded panel would not be).
+      if (n.classList && n.classList.contains("thinking-chain-container")) return;
+      if (cmBlocks.has(n)) {
+        nl();
+        out += cmBlocks.get(n) + "\n";
+        return;
+      }
       if (tag === "PRE") {
         const code = n.querySelector("code") || n;
         const lang = (code.className || "").match(/language-([\w+-]+)/)?.[1] || "";
         nl();
-        out += "```" + lang + "\n" + String(code.textContent || "").replace(/\n+$/, "") + "\n```\n";
+        out += codeFence(lang, code.textContent) + "\n";
         return;
       }
       if (tag === "BR") {
