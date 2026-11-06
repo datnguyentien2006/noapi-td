@@ -231,6 +231,11 @@ ok(
   sseDecision({ started: 0, ended: 0 }, { started: 2, ended: 1, active: 1 }) === "started"
 );
 ok("a missing snapshot is safe", sseDecision(null, { started: 1, ended: 1, active: 0 }) === "none");
+ok(
+  "an errored stream is activity but never a completion",
+  sseDecision({ started: 0, ended: 0, errored: 0 }, { started: 1, ended: 0, errored: 1, active: 0 }) === "started" &&
+    sseDecision({ started: 0, ended: 0, errored: 0 }, { started: 1, ended: 0, errored: 1, active: 0 }) !== "ended"
+);
 
 // ---- early return on a complete TOOL_CALL (Phase 4) -----------------------
 const early = loadShared("toolEarlyReturn", { fn: "toolEarlyReturnDecision" });

@@ -283,7 +283,7 @@
   // loop behaves exactly as before. SSE_ENABLED is the constant kill switch.
   const SSE_ENABLED = true;
   const SSE_TOKEN_ATTR = "data-noapi-sse-token";
-  const SSE = { token: null, started: 0, ended: 0, active: 0, lastAt: 0, wake: null, injected: false };
+  const SSE = { token: null, started: 0, ended: 0, errored: 0, active: 0, lastAt: 0, wake: null, injected: false };
 
   function injectSseObserver() {
     if (!SSE_ENABLED || SSE.injected) return;
@@ -320,6 +320,11 @@
         SSE.active++;
       } else if (d.event === "ended") {
         SSE.ended++;
+        if (SSE.active > 0) SSE.active--;
+      } else if (d.event === "error") {
+        // The stream failed, was aborted, or its end was unobservable. It still
+        // counts as activity, but it must NEVER be treated as a finished answer.
+        SSE.errored++;
         if (SSE.active > 0) SSE.active--;
       } else {
         return;
@@ -1380,7 +1385,7 @@
       // that arrive after we start waiting can complete it.
       const sseOn = Boolean(sseEnabled) && SSE_ENABLED;
       if (sseOn) readSseToken();
-      const sseTurn = { started: SSE.started, ended: SSE.ended };
+      const sseTurn = { started: SSE.started, ended: SSE.ended, errored: SSE.errored };
 
       const cleanup = () => {
         if (timer) clearInterval(timer);
@@ -1619,7 +1624,13 @@
           // Phase 3: the page's own SSE stream ended, so the answer is complete.
           // Read the reply once more and return it without waiting out the
           // per-site debounce. Falls through if no usable text is there yet.
-          if (sseState === "ended") {
+          //
+          // `!generating` guards two cases: (1) the site has not yet torn down
+          // its stop button right after the stream closed, and (2) a page script
+          // that observed the token and replayed "ended" cannot cut a reply
+          // short while the site is visibly still generating. An "error" event
+          // never reaches here (sseDecision only returns "ended" for a clean end).
+          if (sseState === "ended" && !generating) {
             const nodes = replyNodes();
             const text = (nodes.length ? extractText(nodes[nodes.length - 1]) : "") || lastText;
             if (text && text.length >= 5) {

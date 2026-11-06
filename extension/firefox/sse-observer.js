@@ -8,6 +8,13 @@
 // request or a response, never calls a site API, and never hardcodes a URL - it
 // only watches the traffic the page already makes by itself.
 //
+// Events posted to the content script:
+//   "started" - an SSE response just began.
+//   "ended"   - that stream finished cleanly (its body reached the end).
+//   "error"   - the stream errored, was aborted, or its end cannot be observed.
+//               This is deliberately NOT "ended": an errored/aborted stream must
+//               not be reported as a complete answer (it could truncate a reply).
+//
 // Chrome loads this as a "world": "MAIN" content script (see manifest.json).
 // Firefox does not support MAIN-world content scripts on our minimum version, so
 // extension/*/content.js injects this same file with a <script> tag instead. The
@@ -56,10 +63,12 @@
       // page's own: res.clone() must happen before the page reads the body.
       Promise.resolve(p).then(
         (res) => {
+          let started = false;
           try {
             const ct = res && res.headers && typeof res.headers.get === "function" ? res.headers.get("content-type") : null;
             if (!ct || !String(ct).toLowerCase().startsWith("text/event-stream")) return;
             post("started");
+            started = true;
             // Drain a clone in the background so we can tell when the stream
             // ends. The page keeps its own body untouched, byte for byte.
             const clone = res.clone ? res.clone() : null;
@@ -68,15 +77,25 @@
               const pump = () =>
                 reader.read().then(
                   ({ done }) => (done ? post("ended") : pump()),
-                  () => post("ended")
+                  // A rejected read means the stream errored or the user
+                  // aborted it. The answer is NOT complete: report an error so
+                  // the content script falls back to the DOM path instead of
+                  // returning a truncated reply as "complete".
+                  () => post("error")
                 );
               pump();
             } else if (clone && typeof clone.text === "function") {
-              clone.text().then(() => post("ended"), () => post("ended"));
+              clone.text().then(() => post("ended"), () => post("error"));
             } else {
-              post("ended");
+              // We cannot observe when this stream ends, so never claim it did.
+              post("error");
             }
-          } catch {}
+          } catch {
+            // Cloning or reading failed after we announced the start: close it
+            // out as an error so the live-stream count does not leak (a leaked
+            // count would suppress every later "ended" for the rest of the turn).
+            if (started) post("error");
+          }
         },
         () => {}
       );
