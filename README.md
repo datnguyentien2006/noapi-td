@@ -288,17 +288,29 @@ node bridge/index.js [--mcp] [--port=8787] [--host=127.0.0.1]
 | `GET /v1/models` | One model per site |
 | `POST /v1/chat/completions` | OpenAI compatible chat, streaming and non streaming |
 
+### Fast-path flags (for A/B runs)
+
+Every latency fast path can be turned off to compare a run with it on against a run with it off. Content-script flags live in the extension's storage and are toggled from the **`?` panel → Fast paths (A/B)**; they need no source edit and no reload. Bridge-side flags are environment variables read by `npm start` / `npm run mcp`. Every default equals the shipped behaviour.
+
+| Flag | Where | Default | What it does |
+|---|---|---|---|
+| `observerDriven` | extension storage (panel) | on | Wake the completion loop on DOM events instead of polling every 400ms. Off = the old interval-only loop. |
+| `eagerSend` | extension storage (panel) | on | Click Send the moment the site enables it instead of after a fixed 150ms. Off = the old fixed settle. |
+| `sseObserver` | extension storage (panel) | on | Use the page's own SSE stream as a completion signal. Off = the DOM-only completion path. |
+| `NOAPI_SSE` | env (bridge) | on | Set to `0` to stop using the page's SSE stream for this bridge. The panel flag and this env var are ANDed. |
+| `NOAPI_EARLY_RETURN` | env (bridge) | on | Set to `0` to disable the early return on a complete `TOOL_CALL` block **and** the stop click; the turn then falls back to normal completion detection. |
+| `NOAPI_EARLY_RETURN_MS` | env (bridge) | `400` | Grace window after the last reply text before an early return is allowed. Clamped to 50–5000. |
+| `NOAPI_TERSE` | env (bridge) | on | Set to `0` to drop the "terse output" rules from the tool preamble (no prose between tool calls, concise final answers). |
+| `NOAPI_NEW_CHAT` | env (bridge) | off | Set to `1` to open a fresh chat for every new OpenCode conversation (see below). |
+
+Supporting knobs, not fast paths: `NOAPI_MAX_TOOL_RESULT` (`16000`), `NOAPI_DESC_MAX` (`400`), `NOAPI_PARAM_DESC_MAX` (`400`) and `NOAPI_STREAM` (on) — see below.
+
 | Env var | Default | What it does |
 |---|---|---|
-| `NOAPI_EARLY_RETURN` | on | Set to `0` to disable the early return on a complete `TOOL_CALL` block **and** the stop click; the turn then falls back to normal completion detection. |
-| `NOAPI_EARLY_RETURN_MS` | `400` | Grace window after the last reply text before an early return is allowed. Clamped to 50–5000. |
 | `NOAPI_MAX_TOOL_RESULT` | `16000` | Characters of a tool result sent back to the site (head + tail). Truncation always says how much was cut. |
 | `NOAPI_DESC_MAX` | `400` | Description cap for priority tools (edit, write, bash, read, patch-like, or any tool with an `oldString`/`newString`/`replace` parameter). Other tools stay at 180. |
 | `NOAPI_PARAM_DESC_MAX` | `400` | Parameter-description cap for those same priority tools. Other tools stay at 90. |
 | `NOAPI_STREAM` | on | Set to `0` to stop streaming live deltas and emit the reply once at the end (the old behaviour). |
-| `NOAPI_TERSE` | on | Set to `0` to drop the "terse output" rules from the tool preamble (no prose between tool calls, concise final answers). |
-| `NOAPI_SSE` | on | Set to `0` to stop using the page's own SSE stream as a completion signal. Requires a page reload after changing it: the observer is loaded by the extension, not per request. |
-| `NOAPI_NEW_CHAT` | off | Set to `1` to open a fresh chat for every new OpenCode conversation (see below). |
 
 ### `NOAPI_NEW_CHAT=1` — a fresh chat per session
 

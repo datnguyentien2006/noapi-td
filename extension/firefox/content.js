@@ -10,6 +10,67 @@
   const ext = globalThis.browser || globalThis.chrome;
   if (!ext || !ext.runtime) return;
 
+  // ---------------- FEATURE FLAGS (A/B) ----------------
+  // The fast paths that live in this file can be flipped WITHOUT editing source:
+  // the values are read from extension storage (the manifest has "storage") and
+  // toggled from the "?" panel. Every default equals the shipped behaviour, so
+  // an install with no stored flags behaves exactly as before. If storage is
+  // unavailable (unit tests, a stripped harness) the defaults stand.
+  //
+  // Bridge-side fast paths are deliberately NOT here: NOAPI_SSE, NOAPI_TERSE,
+  // NOAPI_NEW_CHAT and the early-return flags are read from the bridge process
+  // environment and forwarded per request. See the README flag table.
+  const FLAG_DEFAULTS = { observerDriven: true, eagerSend: true, sseObserver: true };
+  const FLAGS = { ...FLAG_DEFAULTS };
+  const applyFlags = (v) => {
+    if (!v || typeof v !== "object") return;
+    for (const k of Object.keys(FLAG_DEFAULTS)) if (typeof v[k] === "boolean") FLAGS[k] = v[k];
+  };
+  const flagReady = []; // callbacks to run once the stored flags have been read
+  function whenFlags(fn) {
+    flagReady.push(fn);
+  }
+  function loadFlags() {
+    const keys = Object.keys(FLAG_DEFAULTS);
+    const fire = () => {
+      for (const fn of flagReady.splice(0)) {
+        try {
+          fn();
+        } catch {}
+      }
+    };
+    try {
+      const st = ext.storage && ext.storage.local;
+      if (!st || typeof st.get !== "function") return fire();
+      // Firefox's browser.storage is promise-only; Chrome's chrome.storage takes
+      // a callback (and newer Chrome also returns a promise). Support both.
+      const ret = st.get(keys);
+      if (ret && typeof ret.then === "function") {
+        ret.then(
+          (v) => {
+            applyFlags(v);
+            fire();
+          },
+          fire
+        );
+        return;
+      }
+      st.get(keys, (v) => {
+        applyFlags(v);
+        fire();
+      });
+    } catch {
+      fire();
+    }
+  }
+  function saveFlags(patch) {
+    applyFlags(patch);
+    try {
+      const st = ext.storage && ext.storage.local;
+      if (st && typeof st.set === "function") st.set(patch);
+    } catch {}
+  }
+
   const SITES = {
     chatgpt: {
       name: "ChatGPT",
@@ -277,16 +338,15 @@
 
   // ---------------- SSE OBSERVATION (Phase 3) ----------------
   // A tiny MAIN-world script (sse-observer.js) watches the page's own fetch for
-  // text/event-stream responses and posts "started"/"ended" events here. We only
-  // count those events; the reply text still comes from the DOM. If the observer
-  // is missing, the site never streams over fetch, or NOAPI_SSE=0, the completion
-  // loop behaves exactly as before. SSE_ENABLED is the constant kill switch.
-  const SSE_ENABLED = true;
+  // text/event-stream responses and posts "started"/"ended"/"error" events here.
+  // We only count those events; the reply text still comes from the DOM. If the
+  // observer is missing, the site never streams over fetch, or the "sseObserver"
+  // flag (or NOAPI_SSE=0) is off, the completion loop behaves exactly as before.
   const SSE_TOKEN_ATTR = "data-noapi-sse-token";
   const SSE = { token: null, started: 0, ended: 0, errored: 0, active: 0, lastAt: 0, wake: null, injected: false };
 
   function injectSseObserver() {
-    if (!SSE_ENABLED || SSE.injected) return;
+    if (!FLAGS.sseObserver || SSE.injected) return;
     SSE.injected = true;
     try {
       // Chrome loads sse-observer.js as a MAIN-world content script (manifest),
@@ -310,36 +370,42 @@
     return SSE.token;
   }
 
-  if (SSE_ENABLED) {
-    window.addEventListener("message", (e) => {
-      const d = e && e.data;
-      if (!d || d.source !== "noapi-sse") return;
-      if (!SSE.token || d.token !== SSE.token) return;
-      if (d.event === "started") {
-        SSE.started++;
-        SSE.active++;
-      } else if (d.event === "ended") {
-        SSE.ended++;
-        if (SSE.active > 0) SSE.active--;
-      } else if (d.event === "error") {
-        // The stream failed, was aborted, or its end was unobservable. It still
-        // counts as activity, but it must NEVER be treated as a finished answer.
-        SSE.errored++;
-        if (SSE.active > 0) SSE.active--;
-      } else {
-        return;
-      }
-      SSE.lastAt = Date.now();
-      // A stream can start and end without any DOM mutation we can observe, so
-      // wake the completion loop right away.
-      try {
-        SSE.wake?.();
-      } catch {}
-    });
-    injectSseObserver();
+  // Always listen: whether the events are USED is decided per request from
+  // FLAGS.sseObserver (so flipping the flag off needs no reload to take effect).
+  window.addEventListener("message", (e) => {
+    const d = e && e.data;
+    if (!d || d.source !== "noapi-sse") return;
+    if (!SSE.token || d.token !== SSE.token) return;
+    if (d.event === "started") {
+      SSE.started++;
+      SSE.active++;
+    } else if (d.event === "ended") {
+      SSE.ended++;
+      if (SSE.active > 0) SSE.active--;
+    } else if (d.event === "error") {
+      // The stream failed, was aborted, or its end was unobservable. It still
+      // counts as activity, but it must NEVER be treated as a finished answer.
+      SSE.errored++;
+      if (SSE.active > 0) SSE.active--;
+    } else {
+      return;
+    }
+    SSE.lastAt = Date.now();
+    // A stream can start and end without any DOM mutation we can observe, so
+    // wake the completion loop right away.
+    try {
+      SSE.wake?.();
+    } catch {}
+  });
+
+  // Inject/read the token only once the stored flags are known, so the
+  // "sseObserver" flag can suppress the Firefox <script> injection on load.
+  whenFlags(() => {
+    if (FLAGS.sseObserver) injectSseObserver();
     readSseToken();
     setTimeout(readSseToken, 500);
-  }
+  });
+  loadFlags();
 
   // ---------------- UI CREATION ----------------
   const host = document.createElement("div");
@@ -487,6 +553,17 @@
     font-size: 12px;
     color: #94a3b8;
   }
+  .flags-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 10px;
+    font-size: 12px;
+    color: #cbd5e1;
+  }
+  .flags-row label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  .flags-row input { margin: 0; }
+  .flags-state { color: #64748b; }
   .mode-toggle {
     display: flex;
     align-items: center;
@@ -560,6 +637,12 @@
     <button class="stop-btn" style="padding:2px 8px;font-size:11px" title="Abort the current request" hidden>Stop</button>
   </div>
   <div class="mode-row"><span>Automatic: OpenCode prompts are typed, sent and answered by this tab.</span></div>
+  <div class="mode-row"><span>Fast paths (A/B):</span></div>
+  <div class="flags-row">
+    <label title="Wake the completion loop on DOM events instead of polling every 400ms"><input type="checkbox" data-flag="observerDriven"> event loop</label>
+    <label title="Click Send the moment the site enables it instead of after a fixed 150ms"><input type="checkbox" data-flag="eagerSend"> send on enable</label>
+    <label title="Use the page's own SSE stream as a completion signal (bridge NOAPI_SSE=0 also disables it)"><input type="checkbox" data-flag="sseObserver"> SSE signal</label>
+  </div>
   <div class="log-box">Ready. Waiting for OpenCode…</div>
 </div>
 <div class="fab" title="NOAPI? — Bridge AI chat to OpenCode">
@@ -576,6 +659,22 @@
   const stopBtn = shadow.querySelector(".stop-btn");
   const reconnectBtn = shadow.querySelector(".reconnect-btn");
   const logBox = shadow.querySelector(".log-box");
+
+  // Feature-flag checkboxes. Opening the panel re-syncs them from the live FLAGS
+  // (storage may have answered after the DOM was built), and toggling writes the
+  // flag straight to storage so an A/B run needs no edit and no reload.
+  const flagBoxes = Array.from(shadow.querySelectorAll("input[data-flag]"));
+  const flagsState = shadow.querySelector(".flags-state");
+  function syncFlagBoxes() {
+    for (const b of flagBoxes) b.checked = FLAGS[b.dataset.flag] !== false;
+    if (flagsState) flagsState.textContent = "defaults";
+  }
+  for (const b of flagBoxes) {
+    b.addEventListener("change", () => {
+      saveFlags({ [b.dataset.flag]: b.checked });
+      if (flagsState) flagsState.textContent = "saved";
+    });
+  }
 
   function attachHost() {
     if (document.body && !document.getElementById("noapi-host")) document.body.appendChild(host);
@@ -659,6 +758,7 @@
       if (state.busy && (!msg.id || msg.id === state.reqId)) cancelCurrent();
     } else if (msg.type === "noapi_toggle_panel") {
       panel.hidden = !panel.hidden;
+      if (!panel.hidden) syncFlagBoxes();
     }
   }
 
@@ -671,6 +771,7 @@
   fab.addEventListener("click", () => {
     panel.hidden = !panel.hidden;
     if (!panel.hidden) {
+      syncFlagBoxes();
       ext.runtime
         .sendMessage({ type: "noapi_status_req" })
         .then((r) => {
@@ -878,19 +979,19 @@
   // Phase 2: instead of sleeping a fixed 150ms to catch that async wipe, wait on
   // the page's own signal that it accepted the text - the send button turning
   // enabled - on a 30ms grid. The fixed settle survives only as the DOM fallback
-  // for sites whose send control never enables (or when EAGER_SEND is off).
+  // for sites whose send control never enables (or when the eagerSend flag is off).
   const TYPE_SETTLE_MS = 150;
   const SUBMIT_POLL_MS = 30;
   const SEND_READY_TIMEOUT_MS = 1200;
-  // Kill switch: set to false to restore the old fixed 150ms settle and the old
-  // 150ms submit poll. The Enter-key fallback is unchanged in either mode.
-  const EAGER_SEND = true;
+  // Kill switch / A/B flag: FLAGS.eagerSend=false restores the old fixed 150ms
+  // settle and the old 150ms submit poll. The Enter-key fallback is unchanged
+  // in either mode.
 
   async function ensureTyped(composer, text) {
     let el = composer;
     for (let attempt = 1; attempt <= 4; attempt++) {
       await typePromptIntoComposer(el, text);
-      if (EAGER_SEND) {
+      if (FLAGS.eagerSend) {
         const waitForSend = createSendGate({
           probe: () => !!findSendButton(el),
           now: Date.now,
@@ -961,8 +1062,9 @@
     // findSendButton already means "visible and enabled" (and, on icon-send
     // sites, "the icon-only arrow is live"), so its first non-null answer is the
     // page accepting the prompt.
-    const pollMs = EAGER_SEND ? SUBMIT_POLL_MS : 150;
-    const tries = EAGER_SEND ? Math.max(1, Math.ceil(SEND_READY_TIMEOUT_MS / pollMs) + 1) : 8;
+    const eager = FLAGS.eagerSend;
+    const pollMs = eager ? SUBMIT_POLL_MS : 150;
+    const tries = eager ? Math.max(1, Math.ceil(SEND_READY_TIMEOUT_MS / pollMs) + 1) : 8;
     let btn = null;
     for (let i = 0; i < tries && !btn; i++) {
       btn = findSendButton(composer);
@@ -1129,10 +1231,9 @@
   // timeout / stop-button checks still need a periodic wake-up.
   const FALLBACK_STABLE_MS = 2200;
   const FALLBACK_TICK_MS = 400;
-  // Kill switch for the event-driven loop: set to false to go back to the old
+  // Kill switch / A/B flag: FLAGS.observerDriven=false goes back to the old
   // interval-only behaviour (the observer then only marks the DOM dirty and the
   // 400ms fallback interval drives every tick).
-  const OBSERVER_DRIVEN = true;
   const EXTRACT_THROTTLE_MS = 120;
   const UNSEEN_MUTATION_MS = 1000;
   const STALL_LOG_MS = 20_000;
@@ -1383,7 +1484,7 @@
       let completionTimer = null;
       // Phase 3: snapshot the observed SSE counters for THIS request; only events
       // that arrive after we start waiting can complete it.
-      const sseOn = Boolean(sseEnabled) && SSE_ENABLED;
+      const sseOn = Boolean(sseEnabled) && FLAGS.sseObserver;
       if (sseOn) readSseToken();
       const sseTurn = { started: SSE.started, ended: SSE.ended, errored: SSE.errored };
 
@@ -1440,7 +1541,7 @@
       try {
         observer = new MutationObserver(() => {
           dirty = true;
-          if (OBSERVER_DRIVEN) scheduler?.schedule();
+          if (FLAGS.observerDriven) scheduler?.schedule();
         });
         observer.observe(scope || document.body, { subtree: true, childList: true, characterData: true });
       } catch {}
