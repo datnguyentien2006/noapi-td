@@ -9,7 +9,7 @@ import fs from "node:fs";
 import { SITES, SITE_KEYS } from "./sites.js";
 import { requestAllowed } from "./security.js";
 import { buildPrompt, parseToolCalls, toolList, toolsHash, isTitleRequest, localTitle } from "./toolproto.js";
-import { autoreadBlock } from "./consult.js";
+import { autoreadReport } from "./consult.js";
 import { StreamFilter, streamEnabled } from "./streamfilter.js";
 import { tuningFromEnv, sseTextFromEnv } from "./tuning.js";
 
@@ -218,7 +218,7 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         const newChat = process.env.NOAPI_NEW_CHAT === "1" && fresh;
         if (newChat) bridge.toolHashes.delete(model);
         const includePreamble = tools.length > 0 && (fresh || bridge.toolHashes.get(model) !== hash);
-        let { prompt } = buildPrompt(messages, tools, { includePreamble });
+        let { prompt, parts: promptParts } = buildPrompt(messages, tools, { includePreamble });
         // Task 2: dump the exact prompt (preamble + first turn) sent to the site
         // so its size and per-tool cost can be measured without a live change.
         if (process.env.NOAPI_DUMP_PREAMBLE === "1") {
@@ -230,13 +230,23 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
           }
         }
         const titleOnly = isTitleRequest(messages, tools);
-        // NOAPI_AUTOREAD=1 (off by default): append the contents of any absolute
-        // file path the *user* mentioned so a model that cannot call read tools
-        // still sees the file. Same root/secret/size rules as consult mode.
-        if (process.env.NOAPI_AUTOREAD === "1" && !titleOnly) {
+        let filesChars = 0;
+        // NOAPI_AUTOREAD=1 (off by default, fully inert when off): attach the
+        // files named in the latest real user message only — never system or
+        // earlier turns, and never again on a TOOL_RESULT continuation, since
+        // the site already holds those turns. One summary line per request, plus
+        // a line per real candidate that was skipped, with the reason.
+        if (!titleOnly && process.env.NOAPI_AUTOREAD === "1") {
           try {
-            const extra = autoreadBlock(messages);
-            if (extra) prompt = `${prompt}\n\n${extra}`;
+            const { block, notes, attached, chars } = autoreadReport(messages);
+            if (block) {
+              prompt = `${prompt}\n\n${block}`;
+              filesChars = block.length;
+            }
+            for (const n of notes) {
+              if (n.action === "skip") log(`autoread skip ${n.path}: ${n.reason}`);
+            }
+            log(`autoread: attached ${attached} file(s), ${chars} chars, prompt total ${prompt.length} chars`);
           } catch (err) {
             log(`autoread skipped: ${err.message}`);
           }
@@ -244,6 +254,24 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         if (!prompt && !titleOnly) {
           errorJson(res, 400, "No user message found in request.");
           return;
+        }
+
+        // Diagnostic only, never sent anywhere: one line per request describing
+        // what the prompt is made of. The pieces are the text actually sent to
+        // the web AI; `other` is the remainder (separators, the AVAILABLE TOOLS
+        // header's surrounding lines and the "Continue the task" hint), so the
+        // parts always add up to `total`. Never logs the text itself.
+        if (!titleOnly) {
+          try {
+            const p = promptParts;
+            const total = prompt.length;
+            const other = total - (p.preamble + p.tools + p.system + p.user + p.toolresults + filesChars);
+            log(
+              `prompt breakdown: preamble=${p.preamble} tools=${p.tools} system=${p.system} user=${p.user} files=${filesChars} toolresults=${p.toolresults} other=${other} total=${total}`
+            );
+          } catch (err) {
+            log(`prompt breakdown skipped: ${err.message}`);
+          }
         }
 
         // Cancel the browser request if OpenCode aborts (Esc / closed).

@@ -460,8 +460,8 @@ with no markdown fences (chat pages tend to rewrite them).
 |---|---|---|
 | `NOAPI_CONSULT_MAX_FILE` | `60000` | Max characters of a single file's included content. |
 | `NOAPI_CONSULT_MAX_TOTAL` | `80000` | Max characters across all files. If exceeded, the error names each file's size so you can retry with a line range. |
-| `NOAPI_CONSULT_ROOTS` | *(empty)* | Extra allowed directories, separated by the OS path separator (`;` on Windows, `:` elsewhere). The workspace (`cwd`) is always allowed. |
-| `NOAPI_AUTOREAD` | off | Set to `1` to append the contents of any absolute file path a **user** mentions to a `noapi/*` request, so a model that cannot call `read` still sees the file. Same secret/size rules. |
+| `NOAPI_CONSULT_ROOTS` | *(empty)* | Extra allowed directories. Separated by `;` (or `:`); a Windows drive path such as `C:\dir` is never split on its colon, so it works even when the bridge runs on Linux/macOS. The workspace (`cwd`) is always allowed. |
+| `NOAPI_AUTOREAD` | off | **Optional, off by default.** Set to `1` to append the contents of the files named in the *latest* user message to a `noapi/*` request, so a model that cannot call `read` still sees the file. It attaches **once per task** — only when the newest message is that user turn, never on a `TOOL_RESULT` continuation, never from system/earlier turns, and never twice for the same file (paths in either slash style, and mixed drive-letter case, compare equal). Instruction files (`AGENTS.md`, `CLAUDE.md`, `opencode.json`) are not attached unless the latest message names them. Same secret/size rules as `consult`, and a leading UTF-8 BOM is stripped. Paths are matched by their own flavour (`C:\dir\f.py`, `C:/dir/f.py`, mixed case all agree). Each real candidate not attached gets its own `autoread skip <path>: <reason>` line; each request ends with a summary line `[noapi] autoread: attached N file(s), M chars, prompt total P chars`. |
 
 ### Pointing your primary agent at a non-NOAPI model
 

@@ -39,23 +39,58 @@ export function maxTotalChars(env = process.env) {
 
 // ---------------------------------------------------------------- path rules
 
-function pathKey(p) {
-  const abs = path.resolve(p);
-  return process.platform === "win32" ? abs.toLowerCase() : abs;
+// A path's *flavour* (Windows vs POSIX) is decided by the string itself, not by
+// the machine running the bridge. "C:\testNOAPI\helloword.py" is a Windows path
+// even when the bridge runs on Linux or macOS, so the same user message resolves
+// the same way everywhere. Without this, the host `path.resolve` on a POSIX box
+// treats the drive letter as part of a file name and containment wrongly fails,
+// so a mentioned file is never attached.
+const WIN_DRIVE = /^[A-Za-z]:([\\/]|$)/;
+const WIN_UNC = /^(?:\\\\|\/\/)[^\\/]/;
+
+export function isWindowsPath(p) {
+  const s = String(p ?? "");
+  return WIN_DRIVE.test(s) || WIN_UNC.test(s);
+}
+
+// The `path` module (or its win32 twin) that owns this string.
+export function pathFlavor(p) {
+  return isWindowsPath(p) ? path.win32 : path;
+}
+
+// One flavour able to compare both inputs: Windows if either side is Windows.
+function sharedFlavor(a, b) {
+  return pathFlavor(a) === path.win32 || pathFlavor(b) === path.win32 ? path.win32 : path;
+}
+
+// Windows paths compare case-insensitively; the POSIX host (the other branch of
+// `pathFlavor`) is case-sensitive, matching the filesystem it will actually read.
+function keyOf(api, p) {
+  const abs = api.resolve(p);
+  return api === path.win32 ? abs.toLowerCase() : abs;
+}
+
+// Resolve `p` against `cwd` using the path's own flavour, so an absolute Windows
+// path stays absolute even on a POSIX host instead of becoming a relative name.
+function absoluteFrom(cwd, p) {
+  const api = pathFlavor(p);
+  return api.isAbsolute(p) ? api.resolve(p) : api.resolve(cwd, p);
 }
 
 export function samePath(a, b) {
-  return pathKey(a) === pathKey(b);
+  const api = sharedFlavor(a, b);
+  return keyOf(api, a) === keyOf(api, b);
 }
 
-// Is `target` inside `root` (or equal to it)? Case-insensitive on win32 so
-// "C:\Dir" and "c:\dir" match, and a different drive never counts as inside.
+// Is `target` inside `root` (or equal to it)? Case-insensitive for Windows paths
+// so "C:\Dir" and "c:\dir" match, and a different drive never counts as inside.
 export function insideRoot(root, target) {
-  const r = pathKey(root);
-  const t = pathKey(target);
+  const api = sharedFlavor(root, target);
+  const r = keyOf(api, root);
+  const t = keyOf(api, target);
   if (t === r) return true;
-  const rel = path.relative(r, t);
-  return Boolean(rel) && !rel.startsWith("..") && !path.isAbsolute(rel);
+  const rel = api.relative(r, t);
+  return Boolean(rel) && !rel.startsWith("..") && !api.isAbsolute(rel);
 }
 
 function realpathOr(p) {
@@ -67,25 +102,48 @@ function realpathOr(p) {
 }
 
 // Resolve symlinks as far as the path exists, without requiring the leaf to
-// exist (so a missing file still gets a deterministic containment check).
+// exist (so a missing file still gets a deterministic containment check). Only
+// the host filesystem can resolve symlinks, so a path whose flavour is not the
+// host's is returned lexically instead of being mangled by the wrong rules.
 function resolveReal(p) {
-  const abs = path.resolve(p);
+  const api = pathFlavor(p);
+  const abs = api.resolve(p);
+  if ((api === path.win32) !== (process.platform === "win32")) return abs;
   const direct = realpathOr(abs);
   if (direct) return direct;
-  const dir = path.dirname(abs);
+  const dir = api.dirname(abs);
   const realDir = realpathOr(dir);
-  return realDir ? path.join(realDir, path.basename(abs)) : abs;
+  return realDir ? api.join(realDir, api.basename(abs)) : abs;
 }
 
-// cwd is always allowed; NOAPI_CONSULT_ROOTS adds more, separated by
-// path.delimiter (";" on Windows, ":" elsewhere).
+// NOAPI_CONSULT_ROOTS separator. Accepts ";" everywhere and ":" too, but never
+// splits the colon of a Windows drive ("C:\dir" is one root, not "C" + "\dir").
+function splitRoots(value) {
+  const s = String(value || "");
+  const out = [];
+  let cur = "";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    const driveColon = ch === ":" && /^[A-Za-z]$/.test(cur) && /[\\/]/.test(s[i + 1] || "");
+    if ((ch === ";" || ch === "\n" || (ch === ":" && !driveColon))) {
+      out.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+// cwd is always allowed; NOAPI_CONSULT_ROOTS adds more.
 export function allowedRoots({ cwd = process.cwd(), env = process.env } = {}) {
-  const raw = [path.resolve(cwd), ...String(env.NOAPI_CONSULT_ROOTS || "").split(path.delimiter)];
+  const raw = [path.resolve(cwd), ...splitRoots(env.NOAPI_CONSULT_ROOTS)];
   const out = [];
   for (const entry of raw) {
     const t = String(entry).trim();
     if (!t) continue;
-    const real = resolveReal(path.resolve(cwd, t));
+    const real = resolveReal(absoluteFrom(cwd, t));
     if (!out.some((r) => samePath(r, real))) out.push(real);
   }
   return out;
@@ -161,6 +219,7 @@ function readRangeBounded(real, { start, end, maxChars, rel }) {
     let chars = 0;
     let eof = false;
     const keep = (line) => {
+      if (lineNo === 0) line = line.replace(/^\uFEFF/, "");
       lineNo += 1;
       if (lineNo < start || lineNo > end) return;
       chars += line.length + (selected.length ? 1 : 0);
@@ -206,14 +265,15 @@ function readRangeBounded(real, { start, end, maxChars, rel }) {
 export function resolveFile({ arg, roots, cwd = process.cwd(), env = process.env }) {
   const { path: raw, start, end } = parseFileArg(arg);
   if (!String(raw).trim()) throw new ConsultError("Empty file path.");
-  const real = resolveReal(path.resolve(cwd, raw));
+  const real = resolveReal(absoluteFrom(cwd, raw));
   const root = roots.find((r) => insideRoot(r, real));
   if (!root) {
     throw new ConsultError(
       `Path "${raw}" is outside the allowed roots. Allowed roots: ${roots.join(", ")}`
     );
   }
-  const rel = (path.relative(root, real) || path.basename(real)).split(path.sep).join("/");
+  const api = sharedFlavor(root, real);
+  const rel = (api.relative(root, real) || api.basename(real)).split(api.sep).join("/");
   const reason = secretRule(rel);
   if (reason) throw new ConsultError(`Refusing to read "${rel}": ${reason}.`);
   if (start != null && end != null && end < start) {
@@ -246,6 +306,9 @@ export function resolveFile({ arg, roots, cwd = process.cwd(), env = process.env
     } catch (err) {
       throw new ConsultError(`Cannot read "${rel}": ${err.message}`);
     }
+    // A UTF-8 BOM is a file artifact, not content: drop it before it reaches
+    // the prompt (and before line numbering).
+    content = content.replace(/^\uFEFF/, "");
     const lines = splitLines(content);
     const total = lines.length;
     const { s, e } = clampRange(start, end, total, rel);
@@ -427,20 +490,23 @@ function countOccurrences(haystack, needle) {
 // Resolve a path named by the website against cwd and every allowed root,
 // preferring the first root where it actually exists.
 function resolveValidationTarget(raw, { roots, cwd }) {
-  const relOf = (root, real) => (path.relative(root, real) || path.basename(real)).split(path.sep).join("/");
-  if (path.isAbsolute(raw)) {
+  const relOf = (root, real) => {
+    const api = sharedFlavor(root, real);
+    return (api.relative(root, real) || api.basename(real)).split(api.sep).join("/");
+  };
+  if (pathFlavor(raw).isAbsolute(raw)) {
     const real = resolveReal(raw);
     const root = roots.find((r) => insideRoot(r, real));
     if (!root) throw new ConsultError(`Path "${raw}" is outside the allowed roots. Allowed roots: ${roots.join(", ")}`);
     return { abs: real, rel: relOf(root, real) };
   }
   for (const root of roots) {
-    const real = resolveReal(path.resolve(root, raw));
+    const real = resolveReal(absoluteFrom(root, raw));
     if (insideRoot(root, real) && realpathOr(real)) {
       return { abs: real, rel: relOf(root, real) };
     }
   }
-  const real = resolveReal(path.resolve(cwd, raw));
+  const real = resolveReal(absoluteFrom(cwd, raw));
   const root = roots.find((r) => insideRoot(r, real));
   if (!root) throw new ConsultError(`Path "${raw}" is outside the allowed roots. Allowed roots: ${roots.join(", ")}`);
   return { abs: real, rel: relOf(root, real) };
@@ -513,17 +579,54 @@ export function validationReport(results) {
 
 // --------------------------------------------------------------- autoread flag
 
-// Absolute paths mentioned in free text. Windows drive paths and POSIX paths;
-// trailing punctuation is trimmed so "see C:\x\y.js," yields the file.
-export function findAbsolutePaths(text) {
-  const out = new Set();
-  const re = /(?:[A-Za-z]:[\\/][^\s"'`<>|]*)|\/(?:[^\s"'`<>|/]+\/)*[^\s"'`<>|/]+/g;
-  let m;
-  while ((m = re.exec(String(text || "")))) {
-    let p = m[0].replace(/[.,;:!?)\]}]+$/, "");
-    if (p.length > 1) out.add(p);
+// A path-shaped token, anchored so a match never starts inside a word, after a
+// ":" (URL scheme) or after "/" (the second slash of "//"). This is what keeps
+// "https://x.com/a/b.js", "a/b", "and/or" and "1/2" from being read as paths.
+const PATH_TOKEN = /(?<![A-Za-z0-9_:\\/])(?:[A-Za-z]:[\\/][^\s"'`<>|]*|\\\\[^\s"'`<>|]*|\/[^\s"'`<>|]*)/g;
+
+// Trailing punctuation that clings to a path in prose ("see C:\x\y.js, and").
+const TRAILING = /[.,;:!?)\]}>"'`]+$/;
+
+function isDrivePath(t) {
+  return /^[A-Za-z]:[\\/]/.test(t);
+}
+function isUncPath(t) {
+  return /^\\\\/.test(t);
+}
+
+// A bare "/word" (log lines, "/zai", "/**", "/system-update") is far more often
+// prose than a file, so a POSIX path is accepted only when it has at least two
+// segments or a file extension, and its first segment really exists on disk.
+function acceptPosix(t, exists) {
+  const segs = t.split("/").filter(Boolean);
+  if (!segs.length) return false;
+  const hasExt = /\.[^./\\]+$/.test(t);
+  if (segs.length < 2 && !hasExt) return false;
+  try {
+    return Boolean(exists("/" + segs[0]));
+  } catch {
+    return false;
   }
-  return [...out];
+}
+
+// Absolute paths mentioned in free text: Windows drive paths, UNC paths, and
+// strict POSIX paths. Everything else is prose and yields nothing. `exists` is
+// injectable so the POSIX rule stays unit-testable on any OS.
+export function findAbsolutePaths(text, { exists = (p) => fs.existsSync(p) } = {}) {
+  const out = [];
+  const seen = new Set();
+  let m;
+  PATH_TOKEN.lastIndex = 0;
+  const src = String(text || "");
+  while ((m = PATH_TOKEN.exec(src))) {
+    const token = m[0].replace(TRAILING, "");
+    if (!token) continue;
+    const ok = isDrivePath(token) || isUncPath(token) || (token[0] === "/" && acceptPosix(token, exists));
+    if (!ok || seen.has(token)) continue;
+    seen.add(token);
+    out.push(token);
+  }
+  return out;
 }
 
 function messageText(m) {
@@ -533,31 +636,100 @@ function messageText(m) {
   return "";
 }
 
-// NOAPI_AUTOREAD=1 (off by default): the bridge appends the contents of any
-// absolute file path the *user* mentioned (tool results excluded) so a model
-// that cannot call read tools still sees the file. Best-effort and silent.
-export function autoreadBlock(messages, { cwd = process.cwd(), env = process.env, roots = allowedRoots({ cwd, env }) } = {}) {
-  const text = (messages || [])
-    .filter((m) => m.role === "user")
-    .map(messageText)
-    .join("\n");
-  if (!text) return "";
+// The text of the most recent *real* user message, and only when that message is
+// the last one in the conversation. Continuation turns end in a TOOL_RESULT, so
+// they get "" and nothing is attached again. The website keeps the earlier turns
+// itself: `buildPrompt` only sends the delta since the last assistant message.
+function latestUserText(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const last = list[list.length - 1];
+  if (!last || last.role !== "user") return "";
+  return messageText(last);
+}
+
+// Instruction files the agent harness mentions on its own. Never auto-attached
+// unless the latest user message itself names that exact path.
+const INSTRUCTION_FILES = new Set(["agents.md", "claude.md", "opencode.json"]);
+function isInstructionFile(rel) {
+  const base = String(rel).split("/").pop().toLowerCase();
+  return INSTRUCTION_FILES.has(base);
+}
+
+// Absolute paths named by the user, from the latest real user message only.
+export function mentionedPaths(messages, opts = {}) {
+  return findAbsolutePaths(latestUserText(messages), opts);
+}
+
+// Collapse a resolve/read failure into the short reason the bridge logs.
+function skipReason(err) {
+  const m = String(err?.message || "");
+  if (/outside the allowed roots/i.test(m)) return "outside roots";
+  if (/Refusing to read/i.test(m)) return "secret rule";
+  if (/not a regular file/i.test(m)) return "not a file";
+  if (/per-file limit|per-file read limit|over the limit/i.test(m)) return "too large";
+  if (/Cannot read/i.test(m)) return /ENOENT|no such file|cannot find/i.test(m) ? "not found" : "unreadable";
+  return m || "unreadable";
+}
+
+// Normalised identity of a candidate, so the same file in two slash styles (or
+// two spellings/cases) is only ever read and attached once per request.
+function candidateKey(cwd, p) {
+  const real = resolveReal(absoluteFrom(cwd, p));
+  return pathFlavor(p) === path.win32 ? real.toLowerCase() : real;
+}
+
+// NOAPI_AUTOREAD=1 (off by default): append the contents of any absolute file
+// path the user mentioned in the latest message so a model that cannot call read
+// tools still sees the file. Best-effort, never throws; `notes` records one
+// decision per real candidate and `attached`/`chars` feed the bridge's one-line
+// summary log.
+export function autoreadReport(messages, { cwd = process.cwd(), env = process.env, roots = allowedRoots({ cwd, env }), exists } = {}) {
+  const notes = [];
+  const text = latestUserText(messages);
+  if (!text) return { block: "", notes, attached: 0, chars: 0 };
+  const candidates = findAbsolutePaths(text, exists ? { exists } : {});
+  if (!candidates.length) return { block: "", notes, attached: 0, chars: 0 };
   const maxFile = maxFileChars(env);
   const maxTotal = maxTotalChars(env);
   const blocks = [];
+  const seen = new Set();
   let total = 0;
-  for (const candidate of findAbsolutePaths(text)) {
+  let attached = 0;
+  for (const candidate of candidates) {
     try {
+      const key = candidateKey(cwd, candidate);
+      if (seen.has(key)) {
+        notes.push({ path: candidate, action: "skip", reason: "duplicate" });
+        continue;
+      }
+      seen.add(key);
       const f = resolveFile({ arg: candidate, roots, cwd, env });
+      if (isInstructionFile(f.rel) && !text.includes(candidate)) {
+        notes.push({ path: candidate, action: "skip", reason: "instruction file" });
+        continue;
+      }
       // Same size rules as `consult`: skip an over-budget file rather than
       // quietly building a huge prompt.
-      if (f.chars > maxFile) continue;
-      if (total + f.chars > maxTotal) break;
+      if (f.chars > maxFile) {
+        notes.push({ path: candidate, action: "skip", reason: "too large" });
+        continue;
+      }
+      if (total + f.chars > maxTotal) {
+        notes.push({ path: candidate, action: "skip", reason: "too large (total)" });
+        break;
+      }
       total += f.chars;
+      attached += 1;
       blocks.push(fileBlock(f, "explain"));
-    } catch {
-      // not inside a root, a secret, or unreadable: simply skip it
+      notes.push({ path: candidate, action: "attach", reason: `${f.chars} chars` });
+    } catch (err) {
+      // not inside a root, a secret, or unreadable: skip it, but say why
+      notes.push({ path: candidate, action: "skip", reason: skipReason(err) });
     }
   }
-  return blocks.join("\n\n");
+  return { block: blocks.join("\n\n"), notes, attached, chars: total };
+}
+
+export function autoreadBlock(messages, opts = {}) {
+  return autoreadReport(messages, opts).block;
 }

@@ -17,8 +17,13 @@ import {
   buildConsultPrompt,
   buildPromptText,
   autoreadBlock,
+  autoreadReport,
+  findAbsolutePaths,
+  mentionedPaths,
+  insideRoot,
+  isWindowsPath,
 } from "../bridge/consult.js";
-import { startBridge, startFake, spawnProxy, stopAll, waitForHealth, sleep, warnIfDefaultBridge } from "./lib/harness.js";
+import { startBridge, startFake, spawnProxy, stopAll, waitForHealth, sleep, fetchJson, warnIfDefaultBridge } from "./lib/harness.js";
 import { ProxyGateway } from "../bridge/mcp.js";
 
 let failed = 0;
@@ -351,6 +356,17 @@ ok("autoread ignores relative paths", autoreadBlock([{ role: "user", content: "l
   );
 }
 
+// Every mentioned path gets a one-line note with the reason it was attached or
+// skipped, so the bridge can log it instead of failing silently.
+{
+  const note = (content, env = ENV) => autoreadReport([{ role: "user", content }], { cwd, env }).notes[0];
+  ok("autoread note: attached", note(`read ${path.join(TMP, "sample.txt")}`)?.action === "attach");
+  ok("autoread note: secret rule", note(`read ${path.join(TMP, ".env")}`)?.reason === "secret rule");
+  ok("autoread note: not found", note(`read ${path.join(TMP, "nope.txt")}`)?.reason === "not found");
+  ok("autoread note: too large", note(`read ${path.join(TMP, "auto-mid.txt")}`, { NOAPI_CONSULT_MAX_FILE: "100" })?.reason === "too large");
+  ok("autoread note: outside roots", note("read C:\\definitely\\outside.txt")?.reason === "outside roots");
+}
+
 // The proxy gateway must forward the tool switch (bug: it was dropped).
 {
   const g = new ProxyGateway("ws://127.0.0.1:1/ws");
@@ -373,6 +389,116 @@ if (process.platform === "win32") {
   ok("a Windows path with backslashes resolves", resolve(winAbs).prompt.includes("consult-tmp/sample.txt"));
   ok("mixed slashes resolve", resolve(mixed).prompt.includes("consult-tmp/sample.txt"));
   ok("drive-letter case is ignored", resolve(upper).files[0].rel.toLowerCase() === "consult-tmp/sample.txt");
+}
+
+// ----------------------------------------- autoread of Windows paths, any host
+// The same user message must resolve the same way whichever OS the bridge runs
+// on, so the path flavour comes from the string itself, not process.platform.
+// Built with path.win32 so this runs (and fails) on Windows, Linux and macOS.
+{
+  const WROOT = "C:\\testNOAPI";
+  const WFILE = path.win32.join(WROOT, "helloword.py");
+  const msg = "doc file " + WFILE + " va viet toan bo noi dung cua file duoi dang text";
+
+  const found = findAbsolutePaths(msg);
+  ok("detects C:\\testNOAPI\\helloword.py in the exact message", found.includes(WFILE), JSON.stringify(found));
+  ok("detects the path with trailing punctuation", findAbsolutePaths("see " + WFILE + ", please").includes(WFILE));
+  ok("detects the path in double quotes", findAbsolutePaths('open "' + WFILE + '" now').includes(WFILE));
+  ok("detects the path in single quotes", findAbsolutePaths("open '" + WFILE + "' now").includes(WFILE));
+  const fwd = "C:/testNOAPI/helloword.py";
+  ok("detects the forward-slash form", findAbsolutePaths("read " + fwd + " here").includes(fwd));
+  const lower = "c:\\testNOAPI\\helloword.py";
+  ok("detects a mixed-case drive letter", findAbsolutePaths("read " + lower + " here").includes(lower));
+  ok("mentionedPaths sees the user's path", mentionedPaths([{ role: "user", content: msg }]).includes(WFILE));
+
+  ok(
+    "a Windows path is recognised as Windows regardless of host",
+    isWindowsPath(WFILE) && isWindowsPath(fwd) && isWindowsPath(lower) && !isWindowsPath("src/a.js")
+  );
+  ok(
+    "containment accepts the Windows path under its Windows root",
+    insideRoot(WROOT, WFILE) && insideRoot(WROOT, fwd) && insideRoot(WROOT, lower)
+  );
+  ok("containment is case-insensitive for Windows paths", insideRoot("C:\\TESTnoapi", WFILE));
+  ok("containment rejects a sibling sharing the root prefix", !insideRoot(WROOT, "C:\\testNOAPI2\\helloword.py"));
+  ok("containment rejects .. out of the Windows root", !insideRoot(WROOT, "C:\\testNOAPI\\..\\evil.py"));
+
+  const env = { NOAPI_CONSULT_ROOTS: "C:\\testNOAPI" };
+  const wroots = allowedRoots({ cwd, env });
+  ok("allowedRoots keeps the whole drive path (never splits on ':')", wroots.some((r) => path.win32.resolve(String(r)).toLowerCase() === "c:\\testnoapi"), JSON.stringify(wroots));
+  ok("allowedRoots' Windows root contains the Windows file", wroots.some((r) => insideRoot(r, WFILE)));
+
+  // The whole point: a mentioned Windows path must never be dropped as "outside
+  // the allowed roots" just because the bridge runs on a POSIX host.
+  const report = autoreadReport([{ role: "user", content: msg }], { cwd, env });
+  const note = report.notes.find((n) => n.path === WFILE);
+  ok(
+    "autoread resolves the Windows path instead of rejecting it as outside roots",
+    note && note.reason !== "outside roots",
+    JSON.stringify(report.notes)
+  );
+}
+
+// ---------------------------------------- autoread: strict paths, once, no BOM
+{
+  const ENVW = { NOAPI_CONSULT_ROOTS: "C:\\testNOAPI" };
+  const WFILE = "C:\\testNOAPI\\helloword.py";
+
+  // (3) prose that merely contains slashes is not a path and must yield nothing.
+  const prose = ["look at /** please", "what is /what here", "/current and /zai and /containment", "/system-update happened", "and/or and 1/2 and a/b inside a word"];
+  for (const text of prose) {
+    const got = findAbsolutePaths(text, { exists: () => true });
+    ok(`not a path: ${JSON.stringify(text)}`, got.length === 0, JSON.stringify(got));
+  }
+  ok("a token inside a URL is not a path", findAbsolutePaths("see https://x.com/a/b.js now", { exists: () => true }).length === 0);
+
+  // (3b) POSIX paths need >=2 segments or an extension, and a real first segment.
+  const exists = (p) => p === "/real";
+  ok("POSIX /real/a/b accepted (2 segments, first exists)", findAbsolutePaths("see /real/a/b", { exists }).includes("/real/a/b"));
+  ok("POSIX /real/a.txt accepted (extension, first exists)", findAbsolutePaths("see /real/a.txt", { exists }).includes("/real/a.txt"));
+  ok("POSIX /missing/a/b rejected (first segment absent)", findAbsolutePaths("see /missing/a/b", { exists }).length === 0);
+  ok("POSIX /onlyone rejected (one segment, no extension)", findAbsolutePaths("see /onlyone", { exists: () => true }).length === 0);
+
+  // (3a) drive and UNC paths are still accepted.
+  ok("drive path accepted", findAbsolutePaths("a C:\\x\\y.py b").includes("C:\\x\\y.py"));
+  ok("UNC path accepted", findAbsolutePaths("a \\\\server\\share\\y.py b").includes("\\\\server\\share\\y.py"));
+
+  // (1)+(2) only the latest real user message, and only when it is the last one.
+  const cont = [
+    { role: "user", content: "read " + WFILE },
+    { role: "assistant", content: "", tool_calls: [{ id: "t1", type: "function", function: { name: "read" } }] },
+    { role: "tool", tool_call_id: "t1", content: "some result" },
+  ];
+  const contReport = autoreadReport(cont, { cwd, env: ENVW });
+  ok("a TOOL_RESULT continuation attaches nothing", contReport.block === "" && contReport.attached === 0, JSON.stringify(contReport.notes));
+  ok("a system-only tail attaches nothing", autoreadReport([{ role: "user", content: "read " + WFILE }, { role: "system", content: "x" }], { cwd, env: ENVW }).block === "");
+
+  // (5) an instruction file mentioned by an earlier turn is never attached.
+  const agentsAbs = path.join(cwd, "AGENTS.md");
+  const hist = [
+    { role: "user", content: "start by reading " + agentsAbs },
+    { role: "assistant", content: "ok" },
+    { role: "user", content: "now read " + WFILE },
+  ];
+  const histReport = autoreadReport(hist, { cwd, env: ENVW });
+  ok("an earlier AGENTS.md mention is not attached", !histReport.block.includes("AGENTS.md") && !histReport.notes.some((n) => /AGENTS\.md/i.test(n.path)), JSON.stringify(histReport.notes));
+  // ...but naming it in the latest message is an explicit request (allowed).
+  const named = autoreadReport([{ role: "user", content: "read " + agentsAbs }], { cwd, env: ENV });
+  ok("an instruction file named by the latest message is allowed", named.attached === 1, JSON.stringify(named.notes));
+  ok("a CLAUDE.md path alone is not attached from history", !autoreadReport([{ role: "user", content: "see " + path.join(cwd, "CLAUDE.md") }, { role: "assistant", content: "ok" }, { role: "user", content: "hi" }], { cwd, env: ENV }).block);
+
+  // (4) the same file in both slash styles is read and attached once.
+  const sampleAbs = path.join(TMP, "sample.txt");
+  const dup = [{ role: "user", content: "read " + sampleAbs + " and " + sampleAbs.replace(/\\/g, "/") }];
+  const dupReport = autoreadReport(dup, { cwd, env: ENV });
+  ok("both slash styles attach the file once", dupReport.attached === 1 && (dupReport.block.match(/===== FILE:/g) || []).length === 1, JSON.stringify(dupReport.notes));
+  ok("the duplicate is reported as skipped", dupReport.notes.some((n) => n.reason === "duplicate"));
+
+  // (6) a leading UTF-8 BOM never reaches the prompt.
+  const bomFile = path.join(TMP, "bom.txt");
+  fs.writeFileSync(bomFile, "\uFEFFprint('hi')\n");
+  const bomReport = autoreadReport([{ role: "user", content: "read " + bomFile }], { cwd, env: ENV });
+  ok("a UTF-8 BOM is stripped from the content", bomReport.block.includes("1: print('hi')") && !bomReport.block.includes("\uFEFF"));
 }
 
 // ------------------------------------------------------- MCP integration
@@ -488,6 +614,42 @@ await warnIfDefaultBridge();
 
   const patched = out.find((m) => m.id === 4)?.result?.content?.[0]?.text || "";
   ok("proxy patch mode appends the validation report", patched.includes("block 1 (consult-tmp/edit.txt): ok"), patched.slice(-200));
+}
+
+// --- autoread end-to-end: one attach on the user turn, none on a TOOL_RESULT --
+{
+  console.log("9. autoread end-to-end (attach once, never on a continuation)...");
+  const stderr = [];
+  const { port, proc } = await startBridge({
+    env: { NOAPI_AUTOREAD: "1", NOAPI_CONSULT_ROOTS: TMP },
+    onStderr: (s) => stderr.push(s),
+  });
+  const fake = startFake({ port, site: "chatgpt", env: { NOAPI_FAKE_FIRST_MS: "120", NOAPI_FAKE_REPLY: "ok" } });
+  await waitForHealth(port, { clients: true });
+
+  const file = path.join(TMP, "sample.txt");
+  const post = (messages) =>
+    fetchJson(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "noapi/chatgpt", messages, stream: false }),
+    });
+
+  await post([{ role: "user", content: `please read ${file}` }]);
+  await sleep(400);
+  await post([
+    { role: "user", content: `please read ${file}` },
+    { role: "assistant", content: "", tool_calls: [{ id: "t1", type: "function", function: { name: "read", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "t1", content: "done" },
+  ]);
+  await sleep(400);
+  fake.kill();
+  proc.kill();
+
+  const lines = stderr.join("").split(/\r?\n/).filter((l) => l.includes("autoread: attached"));
+  ok("autoread logs the required summary line", lines.length >= 1 && /autoread: attached 1 file\(s\), \d+ chars, prompt total \d+ chars/.test(lines[0]), lines.join(" | "));
+  ok("the user turn attaches exactly one file", lines[0]?.includes("attached 1 file(s)"), lines.join(" | "));
+  ok("the TOOL_RESULT continuation attaches nothing", lines[1]?.includes("attached 0 file(s)"), lines.join(" | "));
 }
 
 // ---------------------------------------------------------------- teardown

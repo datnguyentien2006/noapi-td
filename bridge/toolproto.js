@@ -218,7 +218,7 @@ export function terseEnabled() {
   return process.env.NOAPI_TERSE !== "0";
 }
 
-export function renderPreamble(tools, messages, { terse = terseEnabled(), deny = toolDenyList() } = {}) {
+export function renderPreambleParts(tools, messages, { terse = terseEnabled(), deny = toolDenyList() } = {}) {
   const denied = new Set(deny || []);
   const fns = toolList(tools).filter((f) => !denied.has(f.name));
   const hints = envHints(messages);
@@ -237,7 +237,7 @@ export function renderPreamble(tools, messages, { terse = terseEnabled(), deny =
       "8. Keep the final answer terse: state the result and stop. No preamble, no restating the request, no offers of further help."
     );
   }
-  return [
+  const beforeTools = [
     "You are being used as the brain of OpenCode, a coding agent that runs on the user's computer.",
     "You cannot run anything yourself in this chat, BUT the agent can run tools for you: when you need to act (create files or folders, run commands, read or edit files, search...), request a tool call using the exact format below. Never say that you are unable to access the computer or the file system - request the tool instead.",
     "",
@@ -255,11 +255,19 @@ export function renderPreamble(tools, messages, { terse = terseEnabled(), deny =
     ...rules,
     ...(hints.length ? ["", ...hints] : []),
     "",
-    "AVAILABLE TOOLS:",
-    ...fns.map(renderTool),
-    "",
-    "---",
-  ].join("\n");
+  ];
+  const toolLines = ["AVAILABLE TOOLS:", ...fns.map(renderTool)];
+  const afterTools = ["", "---"];
+  return {
+    preamble: [...beforeTools, ...toolLines, ...afterTools].join("\n"),
+    // The AVAILABLE TOOLS section is a contiguous slice of the preamble, so the
+    // fixed instruction text is exactly the remainder.
+    tools: toolLines.join("\n"),
+  };
+}
+
+export function renderPreamble(tools, messages, opts = {}) {
+  return renderPreambleParts(tools, messages, opts).preamble;
 }
 
 // Everything the website has not seen yet: messages after the last assistant
@@ -280,19 +288,22 @@ export function buildDelta(messages) {
   const parts = [];
   let sawUser = false;
   let sawTool = false;
+  let userChars = 0;
+  let toolChars = 0;
   for (const m of fresh) {
     if (m.role === "user") {
       const t = msgText(m).trim();
       if (t) {
         parts.push(t);
+        userChars += t.length;
         sawUser = true;
       }
     } else if (m.role === "tool") {
       sawTool = true;
       const name = callNames.get(m.tool_call_id) || m.name || "tool";
-      parts.push(
-        `TOOL_RESULT ${name} (id ${m.tool_call_id})\n${clipMiddle(tidyToolResult(msgText(m).trim() || "(empty output)"), maxToolResult())}\nEND_TOOL_RESULT`
-      );
+      const block = `TOOL_RESULT ${name} (id ${m.tool_call_id})\n${clipMiddle(tidyToolResult(msgText(m).trim() || "(empty output)"), maxToolResult())}\nEND_TOOL_RESULT`;
+      parts.push(block);
+      toolChars += block.length;
     }
   }
   return {
@@ -300,6 +311,8 @@ export function buildDelta(messages) {
     isNew: lastAssistant === -1,
     sawTool,
     sawUser,
+    userChars,
+    toolChars,
   };
 }
 
@@ -311,10 +324,47 @@ export function buildPrompt(messages, tools, { includePreamble }) {
     text +=
       "\n\nContinue the task. If you need more tools, output TOOL_CALL block(s) and stop; if the task is finished, give the final answer in plain text.";
   }
+  let preambleChars = 0;
+  let toolListChars = 0;
   if (hasTools && includePreamble) {
-    text = `${renderPreamble(tools, messages)}\n\n${text}`;
+    const pre = renderPreambleParts(tools, messages);
+    preambleChars = pre.preamble.length - pre.tools.length;
+    toolListChars = pre.tools.length;
+    text = `${pre.preamble}\n\n${text}`;
   }
-  return { prompt: text, isNew: d.isNew };
+  return {
+    prompt: text,
+    isNew: d.isNew,
+    parts: {
+      // Character counts of the pieces that make up the prompt. `system` is 0
+      // because system/developer text is never forwarded verbatim; only the
+      // Working directory/Platform hints derived from it appear, inside the
+      // preamble. The caller adds `files` (autoread) and derives `other`.
+      preamble: preambleChars,
+      tools: toolListChars,
+      system: 0,
+      user: d.userChars,
+      toolresults: d.toolChars,
+    },
+  };
+}
+
+// Character breakdown of a prompt plus the autoread block appended after it.
+// Pure, used by the diagnostics log and by the unit tests; never logs text.
+export function promptBreakdown(messages, tools, { includePreamble = false, filesChars = 0 } = {}) {
+  const { prompt, parts } = buildPrompt(messages, tools, { includePreamble });
+  const total = prompt.length + (filesChars > 0 ? 2 + filesChars : 0);
+  const sum = parts.preamble + parts.tools + parts.system + parts.user + parts.toolresults + filesChars;
+  return {
+    preamble: parts.preamble,
+    tools: parts.tools,
+    system: parts.system,
+    user: parts.user,
+    files: filesChars,
+    toolresults: parts.toolresults,
+    other: total - sum,
+    total,
+  };
 }
 
 // ---------------------------------------------------------------- parsing

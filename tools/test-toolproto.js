@@ -7,6 +7,8 @@ import {
   toolsHash,
   maxToolResult,
   buildDelta,
+  buildPrompt,
+  promptBreakdown,
   renderPreamble,
   parseToolCalls,
   isPriorityTool,
@@ -260,6 +262,52 @@ ok("block text is stripped from content", parsed.text === "On it.", JSON.stringi
 
 const plain = parseToolCalls("just a normal answer", [tool()]);
 ok("plain text parses as no calls", plain.calls.length === 0 && plain.text === "just a normal answer");
+
+// ---- prompt breakdown: the parts add up to the total ---------------------
+{
+  const toolDef = tool();
+  const systemMsg = { role: "system", content: "S".repeat(100) };
+  const userMsg = { role: "user", content: "U".repeat(50) };
+  const toolResultMsg = (content) => ({ role: "tool", tool_call_id: "c1", content });
+  const withCall = (content) => [
+    userMsg,
+    { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "bash", arguments: "{}" } }] },
+    toolResultMsg(content),
+  ];
+
+  // First turn: a system message, a user message and a tool result in the same
+  // delta (no assistant turn between them), plus one autoread file block.
+  const first = [systemMsg, userMsg, toolResultMsg("R".repeat(20))];
+  const b = promptBreakdown(first, [toolDef], { includePreamble: true, filesChars: 40 });
+  ok("breakdown: user counts only the user text", b.user === 50, JSON.stringify(b));
+  ok("breakdown: system text is not forwarded verbatim", b.system === 0, JSON.stringify(b));
+  ok("breakdown: tool result is counted", b.toolresults > 20, JSON.stringify(b));
+  ok("breakdown: files is the autoread block length", b.files === 40, JSON.stringify(b));
+  ok("breakdown: preamble and tools are non-zero", b.preamble > 0 && b.tools > 0, JSON.stringify(b));
+  ok(
+    "breakdown: total matches the real prompt length",
+    b.total === buildPrompt(first, [toolDef], { includePreamble: true }).prompt.length + 2 + 40,
+    JSON.stringify(b)
+  );
+  ok(
+    "breakdown: parts sum to total",
+    b.preamble + b.tools + b.system + b.user + b.files + b.toolresults + b.other === b.total,
+    JSON.stringify(b)
+  );
+
+  // Continuation turn: only a tool result, no preamble and no files.
+  const c = promptBreakdown(withCall("R".repeat(20)), [toolDef], { includePreamble: false });
+  ok("continuation: preamble and tools are 0", c.preamble === 0 && c.tools === 0, JSON.stringify(c));
+  ok("continuation: user text is 0", c.user === 0, JSON.stringify(c));
+  ok("continuation: tool result is counted", c.toolresults > 20, JSON.stringify(c));
+  ok("continuation: files is 0", c.files === 0, JSON.stringify(c));
+  ok(
+    "continuation: parts sum to total",
+    c.preamble + c.tools + c.system + c.user + c.files + c.toolresults + c.other === c.total,
+    JSON.stringify(c)
+  );
+  ok("continuation: other covers the continue hint", c.other >= "Continue the task".length, JSON.stringify(c));
+}
 
 if (failed) {
   console.error(`\n${failed} test(s) failed`);
