@@ -398,9 +398,113 @@ To sanity-check the tuning against the real ChatGPT page:
    Run another 20 turns and `node tools/report-latency.js` again.
 3. Compare `postToken` and `total` per site. `lateGrowth` must still be 0 in both runs; if it is not, the faster value is cutting replies and should not be adopted.
 
-The MCP server offers three tools: `chat` (ask a site), `status` and `sites`.
+The MCP server offers four tools: `chat` (ask a site), `consult` (send local files plus a question to a site — see [Consult mode](#-consult-mode-use-a-normal-model--a-web-ai-as-advisor)), `status` and `sites`.
 
 </details>
+
+<br>
+
+## 🤝 Consult mode (use a normal model + a web AI as advisor)
+
+Usually you let `noapi/*` **be** the model. Consult mode flips that around: keep
+your normal model in charge (it has the good editor and the diffs) and use a
+strong web model as an advisor for the hard parts — a nasty bug, a security
+review, a large refactor. The `consult` MCP tool sends the files you name, plus
+your question, to a site that is open and logged in in your browser, and brings
+the answer back.
+
+> 🔐 **Your file contents leave your machine.** Consult mode pastes the files you
+> name straight into the website's chat box. It refuses `.env*`, `*.pem`,
+> `*.key`, `id_rsa*`, anything under `.git/` or `node_modules/`, and anything
+> over the size limit — but everything else you name **is sent**. Never point it
+> at secrets.
+
+### The `consult` tool
+
+| Argument | Required | What it is |
+|---|---|---|
+| `question` | yes | What to ask about the files. |
+| `files` | yes | 1..N paths relative to the workspace (an absolute path inside an allowed root also works), each optionally with a 1-based line range: `src/app.js:10-40`. |
+| `site` | no | Which site (`chatgpt`, `claude`, `gemini`, `deepseek`, `perplexity`, `grok`, `mistral`, `zai`). Defaults to the first connected site. |
+| `mode` | no | `patch` (default), `explain` or `review`. |
+| `timeout_seconds` | no | How long to wait for the answer (default 180). |
+
+- `explain` / `review` prefix every line with its line number and ask for plain
+  analysis that references those numbers.
+- `patch` asks for edit blocks in one fixed format:
+
+  ```text
+  ===== EDIT: <path> =====
+  <<<<<<< SEARCH
+  <exact existing lines, copied from the file>
+  =======
+  <replacement lines>
+  >>>>>>> REPLACE
+  ===== END EDIT =====
+  ```
+
+  When the reply comes back, the bridge checks each block's `SEARCH` text
+  against the file on disk and appends a `--- consult validation ---` report
+  with one line per block: `ok`, `SEARCH not found`, `SEARCH found N times`,
+  `file not found or unreadable`, `SEARCH block is empty`, or `refused` (the
+  path is outside the allowed roots or a secret). **It never writes to disk** —
+  the model that called `consult` applies the blocks it trusts with its own
+  `edit` tool, re-reading the file when a block does not match.
+
+File contents are sent as plain text between `===== FILE: ... =====` markers,
+with no markdown fences (chat pages tend to rewrite them).
+
+### Consult configuration
+
+| Env var | Default | What it does |
+|---|---|---|
+| `NOAPI_CONSULT_MAX_FILE` | `60000` | Max characters of a single file's included content. |
+| `NOAPI_CONSULT_MAX_TOTAL` | `80000` | Max characters across all files. If exceeded, the error names each file's size so you can retry with a line range. |
+| `NOAPI_CONSULT_ROOTS` | *(empty)* | Extra allowed directories, separated by the OS path separator (`;` on Windows, `:` elsewhere). The workspace (`cwd`) is always allowed. |
+| `NOAPI_AUTOREAD` | off | Set to `1` to append the contents of any absolute file path a **user** mentions to a `noapi/*` request, so a model that cannot call `read` still sees the file. Same secret/size rules. |
+
+### Pointing your primary agent at a non-NOAPI model
+
+Keep the `noapi` MCP server enabled and set the default model to one that is
+**not** from `noapi`. `model` is the verified config field (the `noapi` provider
+and MCP blocks below are the same ones `npm run install-global` writes):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "anthropic/claude-sonnet-5-5",
+  "provider": {
+    "noapi": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8787/v1", "apiKey": "noapi-local" },
+      "models": {
+        "chatgpt": { "name": "ChatGPT via browser (no API)" }
+      }
+    }
+  },
+  "mcp": {
+    "noapi": {
+      "type": "local",
+      "command": ["node", "/absolute/path/to/NOAPI/bridge/index.js", "--mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+The root `AGENTS.md` in this repo gives the model its instructions: for hard
+analysis or large refactors, call the noapi `consult` tool with the relevant
+files, then apply the returned edit blocks itself.
+
+### One manual recipe
+
+1. Start the bridge (`npm start`) and open, say, Claude or ChatGPT in a tab with
+   the extension active.
+2. In OpenCode, pick a **non-NOAPI** model and ask:
+   *"Use the noapi consult tool on `bridge/consult.js` and `bridge/mcp.js` with
+   mode `review`, tell me the riskiest bug, then fix it yourself."*
+3. The model calls `consult`; the website answers with analysis or edit blocks;
+   the model applies the edit with its own `edit` tool.
 
 <br>
 
@@ -449,6 +553,7 @@ NOAPI/
 │   ├── state.js            Request queue, routing, progress, cancel
 │   ├── toolproto.js        TOOL_CALL protocol: prompt building and parsing
 │   ├── mcp.js              MCP server over stdio (with proxy mode)
+│   ├── consult.js          Consult mode: path rules, prompt + EDIT block logic
 │   ├── ws.js / wsclient.js Minimal WebSocket server and client
 │   └── sites.js            Supported sites
 ├── extension/
@@ -466,8 +571,10 @@ NOAPI/
 │   ├── test-bridge-state.js  Unit tests for the bridge request queue
 │   ├── test-isolation.js   Checks tests never touch the default port
 │   ├── test-site-wiring.js Checks a new site is registered everywhere
+│   ├── test-consult.js     Consult mode unit + MCP integration tests
 │   └── test-tools.js       Tool call round trip test
-└── opencode.json           Project level OpenCode config
+├── opencode.json           Project level OpenCode config
+└── AGENTS.md               Instructions for a non-NOAPI primary model
 ```
 
 <br>

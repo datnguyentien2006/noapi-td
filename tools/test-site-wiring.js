@@ -6,6 +6,7 @@
 // web-accessible resources). Forgetting one is easy and only shows up as "the
 // site never connects", so this test reads the files and asserts each spot.
 import fs from "node:fs";
+import { SITE_KEYS } from "../bridge/sites.js";
 
 const read = (f) => fs.readFileSync(f, "utf8");
 let failed = 0;
@@ -29,6 +30,23 @@ ok("bridge/sites.js registers the host", sites.includes(`"${HOST}"`));
 // The MCP tool enum offered to OpenCode.
 const mcp = read("bridge/mcp.js");
 ok("bridge/mcp.js offers zai in the chat tool enum", new RegExp(`"${KEY}"`).test(mcp));
+
+// The MCP tool enum must list exactly the registered sites, so `chat`/`consult`
+// cannot drift from bridge/sites.js.
+{
+  const m = mcp.match(/const SITE_ENUM = \[([^\]]*)\]/);
+  const enumKeys = m
+    ? m[1]
+        .split(",")
+        .map((s) => s.trim().replace(/^"|"$/g, ""))
+        .filter(Boolean)
+    : [];
+  ok(
+    "bridge/mcp.js SITE_ENUM matches the registered sites",
+    enumKeys.length === SITE_KEYS.length && SITE_KEYS.every((k) => enumKeys.includes(k)),
+    `enum=${JSON.stringify(enumKeys)} sites=${JSON.stringify(SITE_KEYS)}`
+  );
+}
 
 // The project OpenCode config.
 const oc = JSON.parse(read("opencode.json"));

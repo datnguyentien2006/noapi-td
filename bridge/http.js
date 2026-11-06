@@ -9,6 +9,7 @@ import fs from "node:fs";
 import { SITES, SITE_KEYS } from "./sites.js";
 import { requestAllowed } from "./security.js";
 import { buildPrompt, parseToolCalls, toolList, toolsHash, isTitleRequest, localTitle } from "./toolproto.js";
+import { autoreadBlock } from "./consult.js";
 import { StreamFilter, streamEnabled } from "./streamfilter.js";
 import { tuningFromEnv, sseTextFromEnv } from "./tuning.js";
 
@@ -217,7 +218,7 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         const newChat = process.env.NOAPI_NEW_CHAT === "1" && fresh;
         if (newChat) bridge.toolHashes.delete(model);
         const includePreamble = tools.length > 0 && (fresh || bridge.toolHashes.get(model) !== hash);
-        const { prompt } = buildPrompt(messages, tools, { includePreamble });
+        let { prompt } = buildPrompt(messages, tools, { includePreamble });
         // Task 2: dump the exact prompt (preamble + first turn) sent to the site
         // so its size and per-tool cost can be measured without a live change.
         if (process.env.NOAPI_DUMP_PREAMBLE === "1") {
@@ -229,6 +230,17 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
           }
         }
         const titleOnly = isTitleRequest(messages, tools);
+        // NOAPI_AUTOREAD=1 (off by default): append the contents of any absolute
+        // file path the *user* mentioned so a model that cannot call read tools
+        // still sees the file. Same root/secret/size rules as consult mode.
+        if (process.env.NOAPI_AUTOREAD === "1" && !titleOnly) {
+          try {
+            const extra = autoreadBlock(messages);
+            if (extra) prompt = `${prompt}\n\n${extra}`;
+          } catch (err) {
+            log(`autoread skipped: ${err.message}`);
+          }
+        }
         if (!prompt && !titleOnly) {
           errorJson(res, 400, "No user message found in request.");
           return;

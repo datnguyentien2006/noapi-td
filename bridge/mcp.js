@@ -3,8 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { WsClient } from "./wsclient.js";
+import { buildConsultPrompt, parseEditBlocks, validateEditBlocks, validationReport } from "./consult.js";
 
 const SERVER_INFO = { name: "noapi-bridge", version: "0.1.0" };
+
+// One place for every site the MCP tools offer, so `chat` and `consult` cannot
+// drift apart. Kept as literals (not imported) so the wiring guard can grep it.
+const SITE_ENUM = ["chatgpt", "claude", "gemini", "deepseek", "perplexity", "grok", "mistral", "zai"];
 
 const INTERNAL_TOOLS = [
   {
@@ -20,7 +25,7 @@ const INTERNAL_TOOLS = [
         },
         site: {
           type: "string",
-          enum: ["chatgpt", "claude", "gemini", "deepseek", "perplexity", "grok", "mistral", "zai"],
+          enum: SITE_ENUM,
           description: "Which site to use (defaults to the first connected site).",
         },
         timeout_seconds: {
@@ -29,6 +34,42 @@ const INTERNAL_TOOLS = [
         },
       },
       required: ["prompt"],
+    },
+  },
+  {
+    name: "consult",
+    description:
+      "Consult a logged-in AI chat website about local files. Sends the contents of one or more project files plus a question to the site (ChatGPT, Claude, Gemini, DeepSeek, Perplexity, Grok, Mistral, Z.ai) open in the user's browser and returns the answer. Use it for hard analysis or large refactors: ask for a patch and it returns edit blocks you apply yourself with the edit tool. File contents are sent to the website, so never pass secrets. Paths must be inside the workspace (or NOAPI_CONSULT_ROOTS); .env/.pem/.key/id_rsa/.git/node_modules are refused.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        question: {
+          type: "string",
+          description: "What to ask about the files (e.g. 'fix the off-by-one in the loop').",
+        },
+        files: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Files to send. Each is a path relative to the workspace, optionally with a 1-based line range: \"src/app.js:10-40\".",
+        },
+        site: {
+          type: "string",
+          enum: SITE_ENUM,
+          description: "Which site to consult (defaults to the first connected site).",
+        },
+        mode: {
+          type: "string",
+          enum: ["explain", "review", "patch"],
+          description:
+            "explain/review return analysis with line numbers; patch (default) returns EDIT blocks that are validated against the files on disk.",
+        },
+        timeout_seconds: {
+          type: "number",
+          description: "Max seconds to wait for the answer (default 180).",
+        },
+      },
+      required: ["question", "files"],
     },
   },
   {
@@ -305,6 +346,34 @@ function callTool(gateway, name, args, log) {
           timeoutMs,
         });
       }
+      case "consult": {
+        const question = String(args.question ?? "").trim();
+        if (!question) throw new Error("The 'question' argument is required.");
+        const fileArgs = Array.isArray(args.files)
+          ? args.files.filter((f) => typeof f === "string" && f.trim())
+          : [];
+        if (!fileArgs.length) throw new Error("The 'files' argument must list at least one file.");
+        const mode = ["explain", "review", "patch"].includes(String(args.mode)) ? String(args.mode) : "patch";
+        const timeoutMs = Math.min(Math.max(Number(args.timeout_seconds) || 180, 10), 600) * 1000;
+        log(`mcp consult tool called (mode: ${mode}, files: ${fileArgs.length}, site: ${args.site || "any"})`);
+
+        // Resolve/read the files here (the MCP process has the workspace); the
+        // website only ever receives the assembled prompt, with tools disabled.
+        const built = buildConsultPrompt({ question, files: fileArgs, mode });
+        return (async () => {
+          const reply = await gateway.requestPrompt({
+            prompt: built.prompt,
+            site: args.site ? String(args.site) : undefined,
+            timeoutMs,
+            toolsEnabled: false,
+          });
+          if (built.mode !== "patch") return reply;
+          // Validate the EDIT blocks against the files on disk and tell the
+          // caller which ones are safe to apply. We never write to disk.
+          const report = validationReport(validateEditBlocks(parseEditBlocks(reply)));
+          return report ? `${reply}\n\n${report}` : reply;
+        })();
+      }
       case "status":
         return gateway.status();
       case "sites":
@@ -457,9 +526,17 @@ export class ProxyGateway {
     });
   }
 
-  requestPrompt({ prompt, system, site, timeoutMs = 180_000 }) {
+  requestPrompt({ prompt, system, site, timeoutMs = 180_000, toolsEnabled = false }) {
     return this._call(
-      { t: "proxy-request", prompt, system: system || null, site: site || null, timeout_ms: timeoutMs },
+      {
+        t: "proxy-request",
+        prompt,
+        system: system || null,
+        site: site || null,
+        timeout_ms: timeoutMs,
+        // Forward the tool switch so `consult` really runs with tools off.
+        tools_enabled: Boolean(toolsEnabled),
+      },
       timeoutMs + 15_000
     );
   }
