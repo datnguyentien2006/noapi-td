@@ -152,6 +152,10 @@ The benchmark is a **simulation**: the fake tab stands in for a real website and
 
 The fake tab cannot know how a real website behaves, so changes to the extension still need a quick manual try. If you fix a bug in the bridge, a test that would have caught it is the best kind of pull request.
 
+`tools/test-fallback-browser.js` drives `content.js` in a real browser to prove the reply fallback still finds an answer after a site changes its markup. It uses Playwright only if it is already installed; otherwise it prints `skipped: playwright not installed` and passes, so CI (which has no browser) is unaffected.
+
+> 🖐️ **Manual check: a stall with no answer.** Selector changes cannot be tested here, so after touching `SITES.*.reply` please try this once: open ChatGPT and send one prompt from OpenCode. If you see *"Prompt sent, but no answer detected on ChatGPT yet ... [sel=[...]]"*, copy the `sel=[...]` part (for example `sel=[0,0,0,0,0,0] scope=main url=/c/abc`) into your bug report — it shows how many elements each reply selector matches right now, which is exactly what a selector fix needs.
+
 <br>
 
 ## 🔐 Security
