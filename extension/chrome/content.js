@@ -33,7 +33,7 @@
         'button[aria-label*="send" i]',
         "#composer-submit-button",
       ],
-      stop: ['button[data-testid="stop-button"]', 'button[aria-label*="Stop" i]'],
+      stop: ['button[data-testid="stop-button"]', 'button[aria-label*="Stop" i]', 'button[data-testid*="stop" i]'],
       reply: [
         '[data-message-author-role="assistant"]',
         'div[data-testid="assistant-message"]',
@@ -41,6 +41,8 @@
         "div[data-message-model-slug]",
         'section[data-turn="assistant"]',
         '[data-turn="assistant"]',
+        'article[data-testid*="assistant"]',
+        "div.markdown",
       ],
       transcript: '[data-testid="conversation-turns"], main',
     },
