@@ -16,13 +16,14 @@ Your browser is already logged in. NOAPI? just lets OpenCode talk to it.
 <img alt="Manifest V3" src="https://img.shields.io/badge/extension-Manifest%20V3-orange">
 <img alt="Local only" src="https://img.shields.io/badge/network-127.0.0.1%20only-informational">
 <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue">
-<a href="https://github.com/cribest7890/NOAPI/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/cribest7890/NOAPI/actions/workflows/ci.yml/badge.svg"></a>
+<a href="https://github.com/datnguyentien2006/noapi-td/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/datnguyentien2006/noapi-td/actions/workflows/ci.yml/badge.svg"></a>
 
 <br>
 
 [Quick start](#-quick-start) &nbsp;•&nbsp;
 [How it works](#-how-it-works) &nbsp;•&nbsp;
 [Any project folder](#-use-it-from-any-project-folder) &nbsp;•&nbsp;
+[Consult mode](#-consult-mode-use-a-normal-model--a-web-ai-as-advisor) &nbsp;•&nbsp;
 [Troubleshooting](#-troubleshooting) &nbsp;•&nbsp;
 [Limitations](#-honest-limitations)
 
@@ -72,14 +73,14 @@ Pick a browser model straight from `/models`, or keep your favourite model and l
   <tr>
     <td valign="top">
 
-**🪶 Zero dependencies**<br>
-The bridge is plain Node.js 18+. No `npm install`, no build step, nothing to audit except the code in this repo.
+**🛡️ Built to survive real sites**<br>
+Pages that refuse, chats that grow too long, replies that get cut off and tabs that fall asleep are all handled instead of ending the turn.
 
   </td>
     <td valign="top">
 
-**🔒 Local only**<br>
-Everything stays on `127.0.0.1`. No telemetry, no proxy, no third party servers. It runs in your own logged in session.
+**🔒 Local only, zero dependencies**<br>
+Plain Node.js 18+, no `npm install`, no build step. Everything stays on `127.0.0.1` in your own logged-in session.
 
   </td>
   </tr>
@@ -132,6 +133,8 @@ You need to be logged in, and the site has to be open in a tab. If you open seve
 Firefox forgets temporary add-ons when it closes, so you will repeat this after a restart.
 
 </details>
+
+The Chrome extension asks for the `storage`, `power` and `alarms` permissions (Firefox needs only `storage`). `power` and `alarms` are only used to stop the browser from discarding your AI tabs and to keep the service worker awake while a reply is in flight; if you deny them, everything still works, just without that protection (see [keeping the tabs alive](#keeping-the-tabs-alive)).
 
 ### 2️⃣ Start the bridge
 
@@ -218,12 +221,58 @@ Chat websites do not accept tool definitions, so the bridge improvises:
 
 Because the website already remembers the conversation, only the **new** message is sent each turn, not the whole history. Very long tool output is trimmed in the middle (16,000 characters by default; set `NOAPI_MAX_TOOL_RESULT` to change it), and the truncation marker tells the model how many characters were cut and how to re-run the tool for the missing part, so prompts stay sane without losing context silently.
 
+#### RAW BLOCKS — large text without JSON escaping
+
+File contents, edit text and long commands are what break hand-written JSON. Instead of escaping megabytes of text inside a JSON string, the model can put any multi-line argument in a **raw block** right after the JSON:
+
+```text
+TOOL_CALL
+{"name":"write","arguments":{"filePath":"app.py"}}
+<<<content
+print("hello")
+# exactly as it must appear — no JSON quotes, no \n escaping
+content>>>
+```
+
+The bridge folds each `<<<argname ... argname>>>` block into the named string argument. The preamble teaches this whenever the tool set has a suitable string argument, and the repair prompts point back to it whenever JSON fails. A single call is kept to a sane size; for a big file the model is told to write the first part and then extend it with `edit` calls.
+
+#### Refusal guard
+
+Some pages have their own system prompt that says the model lives in a sandbox and cannot see your computer — so the model answers *"I cannot read `C:\NOAPI`; please upload the files"* instead of calling a tool. That reply has no `TOOL_CALL`, so without help it reached OpenCode as a final answer.
+
+The guard (`bridge/guard.js`) fixes this in four layers, each switchable:
+
+1. **Preamble override + worked example** — the briefing names the exact wrong answers and shows a full correct turn, because the page's own system prompt outranks a normal user turn. (`NOAPI_GUARD=0` removes it.)
+2. **A one-line reminder** is appended to every real user turn, even when the preamble is not re-sent. (`NOAPI_REMIND=0`.)
+3. **Detection + correction** — a reply with no tool call that matches a refusal (English, Vietnamese or Chinese, including the diacritic-folded wording) triggers up to two corrective follow-ups in the same chat. If the model still refuses, the turn **fails with a clear error** instead of silently returning prose. (`NOAPI_GUARD=0`.)
+4. **Working-directory seed** (opt-in, `NOAPI_SEED_TREE=1`) — lists the real files in the first prompt so the model can see the bridge can reach the machine. Off by default because it sends local file names to the website.
+
+The first `GUARD_HOLD` characters of a first-turn reply are also held back from the live stream while the text still reads like a refusal, so a refusal never flashes into OpenCode before the bridge has had a chance to correct it.
+
+#### Repeat-call guard
+
+Right after a chat rotation (or any context loss) the model can re-issue the exact call whose result it was just handed, and the agent loops. Two identical calls in a row are almost never intended, so the bridge asks once for the *next* step instead (`NOAPI_REPEAT_GUARD=0` disables it).
+
+#### Chat rotation with a recap
+
+A website chat gets slower and less reliable as it grows, and a big project does not fit in one. The bridge counts the characters exchanged with each chat; once the limit is passed in the middle of real work it opens a **new chat** and sends the tool protocol plus a compact **recap** built from OpenCode's own message list (no model call, so nothing can go wrong): the original task, later user messages, the files changed, the last thing the model said, and a shortened list of steps done so far. The newest tool results are sent right after it. If `PLAN.md` or `PROGRESS.md` exist in the working directory, the recap tells the model to read them and continue from them.
+
+A rotation window never double-fires: rotation is skipped if the chat is too young (minimum turns), and the limit is raised automatically when the rotation prompt itself is a large slice of it (otherwise the new chat starts almost full and rotates again immediately).
+
+#### When a reply is cut off
+
+A long reply can stop mid-block. If the block is *truncated* (the reply does not end on its closing fence), the bridge asks the site to continue and **stitches** the pieces back together — up to three continuations, and only while the reply is still short enough to be worth continuing. If it truly cannot be recovered, the turn ends with an explicit error (and the raw reply is saved under `./noapi-debug/`) rather than handing a broken block to OpenCode as final text. `NOAPI_REPAIR_FAIL=text` restores the old "return it as plain text" behaviour.
+
 ### 🛡️ Small details that make it nicer
 
 - 🚦 Requests to the same site are queued, so two prompts never collide in one chat box.
 - ⏹️ Press <kbd>Esc</kbd> in OpenCode and the extension also hits the stop button on the website.
+- 🔻 A turn that times out stops the site first, so the next send is not stuck waiting for a send button that never comes back.
+- 🧯 A runaway reply (more than 40,000 characters with tools on) is cut short — a usable tool call never needs to be that long.
+- 🔁 The extension reconnects on its own with exponential backoff, proves the link is alive with a ping/pong, and abandons a socket that stalls mid-handshake.
 - 🏷️ OpenCode's session title requests are answered locally, so they do not clutter your real chat.
-- 🔁 If a site swallows a send, or wipes the text you just typed, the extension notices and tries again.
+- 🖥️ The **Reconnect** button in the `?` panel reports the real outcome instead of guessing.
+- 🌙 While an AI tab is open, the extension asks the browser not to discard the tab and (optionally) keeps the computer awake; timers run in a background Worker so a hidden tab still types and polls at full speed.
 
 <br>
 
@@ -288,11 +337,16 @@ node bridge/index.js [--mcp] [--port=8787] [--host=127.0.0.1]
 | Endpoint | Purpose |
 |---|---|
 | `GET /` | Status dashboard |
-| `GET /health` | JSON status: clients, pending requests, sites, per-site counters |
+| `GET /health` | JSON status: clients, pending requests, sites, per-site counters, guard stats |
 | `GET /v1/models` | One model per site |
 | `POST /v1/chat/completions` | OpenAI compatible chat, streaming and non streaming |
 
-### Fast-path flags (for A/B runs)
+The bridge treats `Ctrl+C` as "close the sockets and exit"; a second press more than a second later forces the exit. Without that the extension kept its socket open and stayed "connected" to a bridge that had already gone.
+
+</details>
+
+<details>
+<summary><b>Fast-path flags (for A/B runs)</b></summary>
 
 Every latency fast path can be turned off to compare a run with it on against a run with it off. Content-script flags live in the extension's storage and are toggled from the **`?` panel → Fast paths (A/B)**; they need no source edit and no reload. Bridge-side flags are environment variables read by `npm start` / `npm run mcp`. Every default equals the shipped behaviour.
 
@@ -309,7 +363,41 @@ Every latency fast path can be turned off to compare a run with it on against a 
 | `NOAPI_NEW_CHAT` | env (bridge) | off | Set to `1` to open a fresh chat for every new OpenCode conversation (see below). |
 | `NOAPI_SSE_TEXT` | env (bridge) | off | Arms the stream-decoding path. ANDed with the panel `sseText` flag. |
 
-Supporting knobs, not fast paths: `NOAPI_MAX_TOOL_RESULT` (`16000`), `NOAPI_DESC_MAX` (`400`), `NOAPI_PARAM_DESC_MAX` (`400`), `NOAPI_DESC_MODE`, `NOAPI_TOOL_DENY`, `NOAPI_DUMP_PREAMBLE` and `NOAPI_STREAM` (on) — see below.
+</details>
+
+<details>
+<summary><b>Robustness flags (guard, repair, rotation, connections)</b></summary>
+
+All are read by the bridge process at request time. Defaults are the shipped behaviour.
+
+| Env var | Default | What it does |
+|---|---|---|
+| `NOAPI_GUARD` | on | Set to `0` to drop the refusal-guard preamble override, the worked example and the corrective follow-ups. |
+| `NOAPI_REMIND` | on | Set to `0` to stop appending the one-line protocol reminder to a real user turn. |
+| `NOAPI_SEED_TREE` | off | Set to `1` to list the working directory (names only, no secrets) in the first prompt. |
+| `NOAPI_REPEAT_GUARD` | on | Set to `0` to accept two identical calls in a row instead of asking for the next step. |
+| `NOAPI_TOOL_REPAIR` | on | Set to `0` to return a malformed `TOOL_CALL` block to OpenCode as plain text instead of asking the site to resend it. When on, a reply that carries a `TOOL_CALL` marker but no usable block triggers at most two short follow-ups; each attempt logs `tool repair: attempt N/2 reason=... tool=...`. A follow-up tells the tab which reply it is replacing, so a stale DOM read that hands the previous answer back verbatim is ignored (`tool repair: stale reply ignored (unchanged, N chars)`). |
+| `NOAPI_REPAIR_FAIL` | error | What to do when a `TOOL_CALL` cannot be recovered even after repair. Default: end the turn with an error (so the agent does not mistake a broken block for a final answer). `text` restores the old behaviour of returning the raw reply. |
+| `NOAPI_CONTINUE` | on | Set to `0` to stop continuing a reply that was cut off mid-block. Up to three continuations, only while the reply is still under 30,000 characters. |
+| `NOAPI_CLIENT_WAIT_MS` | `15000` | When a request arrives before the extension has reconnected (MV3 backoff, alarms), hold it this long for a tab to appear instead of failing at once. `0` = fail immediately. Clamped to 0–120000. |
+| `NOAPI_MAX_WS` | `256` | Cap on simultaneous WebSocket connections, so a client stuck in a reconnect loop cannot exhaust the bridge. |
+| `NOAPI_MAX_PENDING_HELLO` | `32` | Cap on sockets that opened but have not introduced themselves yet. |
+| `NOAPI_CANCEL_ACK_MS` | `5000` | How long a cancelled request waits for the tab to confirm it really stopped. |
+| `NOAPI_HUB` | on | Set to `0` to stop the MCP server spawning your other configured MCP servers (see [MCP hub](#-mcp-hub)). |
+
+**Chat rotation** (`bridge/rotation.js`, `bridge/recap.js`):
+
+| Env var | Default | What it does |
+|---|---|---|
+| `NOAPI_ROTATE_CHARS` | `150000` | Characters sent + received in a chat before it is rotated. `0` turns rotation off. |
+| `NOAPI_ROTATE_CHARS_<SITE>` | per site | Per-site override (e.g. `NOAPI_ROTATE_CHARS_ZAI=300000`). Z.ai ships with `300000`. A plain `NOAPI_ROTATE_CHARS` wins over the built-in per-site table. |
+| `NOAPI_ROTATE_MIN_TURNS` | `3` | Never rotate twice within this many turns of the same chat. |
+| `NOAPI_ROTATE_RESULT_BUDGET` | `24000` | Total characters of pending tool results allowed in a rotation prompt (the recap already carries the history). `0` = no compaction. |
+
+</details>
+
+<details>
+<summary><b>Prompt-size knobs</b></summary>
 
 | Env var | Default | What it does |
 |---|---|---|
@@ -320,9 +408,13 @@ Supporting knobs, not fast paths: `NOAPI_MAX_TOOL_RESULT` (`16000`), `NOAPI_DESC
 | `NOAPI_TOOL_DENY` | empty | Comma-separated tool names to leave out of the preamble. They stay fully callable: the bridge validates a call against the request's tool list, not the rendered preamble. |
 | `NOAPI_DUMP_PREAMBLE` | off | Set to `1` to write the exact prompt (preamble + first turn) sent to the site into `./noapi-preamble.txt` and log its length. |
 | `NOAPI_STREAM` | on | Set to `0` to stop streaming live deltas and emit the reply once at the end (the old behaviour). |
-| `NOAPI_TOOL_REPAIR` | on | Set to `0` to return a malformed `TOOL_CALL` block to OpenCode as plain text instead of asking the site to resend it. When on, a reply that carries a `TOOL_CALL` marker but no usable block triggers at most two short follow-ups (the problem, one correct one-line example for that tool, and "please resend only the corrected block"); each attempt logs `tool repair: attempt N/2 reason=… tool=…`. Flattened calls are accepted only when every key is a parameter of the named tool, and invalid JSON is never repaired by guessing. |
 
-### Timing knobs (for A/B runs)
+Failed tool-call replies are also written to `./noapi-debug/` (one file per failure) so the real text can be inspected after the fact.
+
+</details>
+
+<details>
+<summary><b>Timing knobs (for A/B runs)</b></summary>
 
 Every timing constant the content script uses can be overridden per request without editing source, so you can measure a value before changing a default. The bridge reads each variable at request time and forwards it to the tab (a content script cannot read `process.env`). All values are clamped, and an unset, empty or invalid variable keeps the shipped default.
 
@@ -336,6 +428,8 @@ Every timing constant the content script uses can be overridden per request with
 | `NOAPI_PARTIAL_THROTTLE_MS` | `150` | Minimum gap between live partials forwarded to OpenCode. | 20–5000 |
 | `NOAPI_EARLY_RETURN_HARD_CAP_MS` | `1500` | Longest wait for a possible second tool block before stopping early. | 50–30000 |
 
+</details>
+
 ### `NOAPI_NEW_CHAT=1` — a fresh chat per session
 
 When a request starts a new OpenCode conversation (no assistant message yet), the extension clicks the site's *new chat* control before typing. The trade-off:
@@ -345,7 +439,17 @@ When a request starts a new OpenCode conversation (no assistant message yet), th
 - **It changes your chat history** — the site keeps the old conversations, but your *current* tab moves to a blank chat each session, so the chat you were reading is left behind. That is why it is **off by default**.
 - If no new-chat control is found, the turn continues in the current chat and says so in the status panel.
 
-Only one fresh chat is opened per session (the first request); later turns in the same OpenCode conversation stay in that chat, because the request then has an assistant message.
+Only one fresh chat is opened per session (the first request); later turns in the same OpenCode conversation stay in that chat, because the request then has an assistant message. Automatic [chat rotation](#chat-rotation-with-a-recap) uses the same mechanism, but is driven by chat size instead.
+
+### Keeping the tabs alive
+
+`extension/chrome/keepalive.js` (loaded by the background script) does three small things, each guarded so a missing permission just disables that one:
+
+1. Marks every AI tab `autoDiscardable: false`, so the browser's memory saver does not put your chat to sleep mid-task.
+2. Keeps the computer awake while an AI tab is open (`power.requestKeepAwake`) — set `KEEP_AWAKE = false` at the top of the file to skip.
+3. Wakes the background worker every 30 s with an alarm, so it and the bridge connection stay alive.
+
+The content script also moves its timers into a dedicated Worker, because a hidden tab's `setTimeout` is throttled to roughly once a second and then to once a minute. The `?` panel's status and each reply's timing report `[NOAPI] timers run in a background Worker: true` when this is active; if a page's CSP blocks the Worker, everything falls back to the ordinary timers.
 
 ### Running an A/B comparison
 
@@ -398,10 +502,6 @@ To sanity-check the tuning against the real ChatGPT page:
    ```
    Run another 20 turns and `node tools/report-latency.js` again.
 3. Compare `postToken` and `total` per site. `lateGrowth` must still be 0 in both runs; if it is not, the faster value is cutting replies and should not be adopted.
-
-The MCP server offers four tools: `chat` (ask a site), `consult` (send local files plus a question to a site — see [Consult mode](#-consult-mode-use-a-normal-model--a-web-ai-as-advisor)), `status` and `sites`.
-
-</details>
 
 <br>
 
@@ -509,20 +609,31 @@ files, then apply the returned edit blocks itself.
 
 <br>
 
+## 🧩 MCP hub
+
+The `noapi` MCP server is a small **hub**: on start it reads your OpenCode config, spawns the *other* MCP servers you have enabled, and re-publishes their tools alongside its own `chat` / `consult` / `status` / `sites`. That way a session running on a `noapi/*` model still has your normal MCP tools available.
+
+The hub refuses to start inside itself (`NOAPI_HUB_CHILD` is set for every child, so a server that lists itself can never fork-bomb), skips any entry whose command is this bridge (matched by its real path on disk, including Windows paths and array-style commands), honours `enabled: false`, and merges both `env` and `environment` for a child. Set `NOAPI_HUB=0` to turn the whole feature off.
+
+<br>
+
 ## 🔧 Troubleshooting
 
 | What you see | What to try |
 |---|---|
-| **"No browser tab on ... is connected"** | Open that site in a tab, make sure you are logged in, and check that the `?` button has a green dot. Refresh the tab if the extension was just reloaded. |
-| **Red dot on the `?` button** | The bridge is not running. Start it with `npm start`. |
+| **"No browser tab on ... is connected"** | Open that site in a tab, make sure you are logged in, and check that the `?` button has a green dot. Refresh the tab if the extension was just reloaded. The bridge waits ~15 s for a reconnect before giving up (`NOAPI_CLIENT_WAIT_MS`). |
+| **Red dot on the `?` button** | The bridge is not running. Start it with `npm start`, or click **Reconnect** in the `?` panel. |
 | **Port 8787 already in use** | Run `node bridge/index.js --port=8788` and change `baseURL` in your config to `:8788/v1`. |
 | **NOAPI? is missing from `/models`** | You are probably outside this folder. Run `npm run install-global` once. |
+| **"The model refused to use tools ... even after 2 corrections"** | The site's own system prompt is winning. Open a NEW chat on that site, switch off its built-in tools (code execution / uploads), then send *"continue"*. Or try `NOAPI_SEED_TREE=1` so the model sees real paths. |
+| **"TOOL_CALL ... could not be parsed ... even after auto-repair"** | The model produced unrecoverable JSON three times. Send *"continue"*; if it repeats, switch to a stronger model. Raw replies are in `./noapi-debug/`. |
 | **Stuck at "Waiting for ... to answer"** | The site may have changed its layout. Open the `?` panel and read the last status line. The stall message includes a short technical summary you can paste into an issue. |
+| **"Waiting for the browser extension to connect"** | The bridge started before the extension reconnected. It waits ~15 s; reload the tab if it persists. |
 | **The prompt gets typed but never sent** | The extension retries a few times on its own. If it keeps failing, the send button selector for that site probably needs an update. |
 | **It worked yesterday, today it does not** | Sites change their pages. See [Limitations](#-honest-limitations) and [Adding or fixing a site](#-adding-or-fixing-a-site). |
 | **Firefox lost the extension** | Temporary add-ons disappear on restart. Load it again from `about:debugging`. |
 
-> 🪪 **Tip:** keep the AI tab visible when you can. Browsers slow down background tabs, which can make long responses laggy.
+> 🪪 **Tip:** keep the AI tab visible when you can. Browsers slow down background tabs; the extension works around this with a background Worker, but a visible tab is still the smoothest.
 
 <br>
 
@@ -534,13 +645,24 @@ You can check the whole pipeline with a fake browser tab. No real site needed.
 npm test
 ```
 
-This starts a bridge, connects a fake extension, and runs plain requests, streaming content deltas, early return on tool calls (one and several blocks), MCP in both modes, and a full tool call round trip (model asks for `bash`, gets the result, answers). It also runs the pure logic lifted out of the content script, the `TOOL_CALL` protocol, and the security checks.
+This starts a bridge, connects a fake extension, and runs plain requests, streaming content deltas, early return on tool calls (one and several blocks), MCP in both modes, and a full tool call round trip (model asks for `bash`, gets the result, answers). It also runs the pure logic lifted out of the content script, the `TOOL_CALL` protocol, the streaming safety filter, the bridge request queue, the security checks, site wiring, and a Playwright fallback test when a browser is installed.
+
+The newer suites run standalone (they spawn their own bridges and never touch a real one):
+
+```bash
+node tools/test-guard.js        # refusal detection, the preamble override, the stream hold, seedTree
+node tools/test-guard-e2e.js    # guard + rotation end to end through the bridge
+node tools/test-background.mjs  # reconnect backoff, liveness, the Reconnect button
+node tools/test-mcp-hub.mjs     # MCP hub self-detection and recursion guard
+```
 
 ```bash
 npm run bench
 ```
 
 runs the same fake tab a few times and prints time-to-first-streamed-content and full round-trip numbers, so you can see whether a change actually made things faster.
+
+Every test binds an OS-assigned ephemeral port (`--port=0`) and a second guard test checks that no test can reach the real bridge on 8787.
 
 <br>
 
@@ -549,31 +671,45 @@ runs the same fake tab a few times and prints time-to-first-streamed-content and
 ```text
 NOAPI/
 ├── bridge/                 Local server (pure Node.js)
-│   ├── index.js            Entry point, WebSocket + HTTP + MCP wiring
+│   ├── index.js            Entry point, WebSocket + HTTP + MCP wiring, graceful shutdown
 │   ├── http.js             OpenAI compatible endpoints and dashboard
-│   ├── state.js            Request queue, routing, progress, cancel
-│   ├── toolproto.js        TOOL_CALL protocol: prompt building and parsing
-│   ├── mcp.js              MCP server over stdio (with proxy mode)
+│   ├── state.js            Request queue, routing, progress, cancel, chat usage
+│   ├── toolproto.js        TOOL_CALL protocol: preamble, raw blocks, parsing, repair, continue
+│   ├── guard.js            Refusal guard, reminder, seed tree, repeat-call guard
+│   ├── recap.js            Compact handover for a rotated chat
+│   ├── rotation.js         When to rotate a chat (limits, minimum turns)
+│   ├── mcp.js              MCP server, hub for your other MCP servers, proxy mode
 │   ├── consult.js          Consult mode: path rules, prompt + EDIT block logic
-│   ├── ws.js / wsclient.js Minimal WebSocket server and client
-│   └── sites.js            Supported sites
+│   ├── streamfilter.js     Streaming safety filter (holds back refusal / partial blocks)
+│   ├── tuning.js           Per-request timing overrides
+│   ├── security.js         Origin checks for HTTP + WebSocket
+│   ├── sites.js            Supported sites
+│   └── ws.js / wsclient.js Minimal WebSocket server and client
 ├── extension/
 │   ├── chrome/             Manifest V3 extension
-│   └── firefox/            Same code, Firefox manifest
+│   │   ├── background.js   Connection, routing, reconnect watchdog
+│   │   ├── content.js      Page logic: type, send, read, tool calls
+│   │   ├── keepalive.js    Never-discard tabs, keep-awake, alarms
+│   │   └── sse-observer.js MAIN-world stream observer
+│   └── firefox/            Same site logic and selectors, Firefox manifest
 ├── tools/
 │   ├── install-global.js   Register NOAPI? in your global OpenCode config
 │   ├── fake-extension.js   Fake browser tab for tests
 │   ├── bench-latency.js    Round-trip latency benchmark
 │   ├── test-all.js         End to end tests
 │   ├── lib/harness.js      Ephemeral-port test harness
-│   ├── test-content-logic.js  Unit tests for the pure content-script logic
-│   ├── test-toolproto.js   Unit tests for the TOOL_CALL protocol
-│   ├── test-streamfilter.js  Unit tests for the streaming safety filter
-│   ├── test-bridge-state.js  Unit tests for the bridge request queue
-│   ├── test-isolation.js   Checks tests never touch the default port
-│   ├── test-site-wiring.js Checks a new site is registered everywhere
+│   ├── test-content-logic.js  Pure content-script logic
+│   ├── test-toolproto.js   The TOOL_CALL protocol
+│   ├── test-streamfilter.js   The streaming safety filter
+│   ├── test-bridge-state.js   The bridge request queue
+│   ├── test-guard.js       Refusal guard and its wiring
+│   ├── test-guard-e2e.js   Guard + rotation through a real bridge
+│   ├── test-background.mjs The extension connection manager
+│   ├── test-mcp-hub.mjs    MCP hub self-detection
+│   ├── test-isolation.js   Tests never touch the default port
+│   ├── test-site-wiring.js A new site is registered everywhere
 │   ├── test-consult.js     Consult mode unit + MCP integration tests
-│   └── test-tools.js       Tool call round trip test
+│   └── test-tools.js       Tool call round trip
 ├── opencode.json           Project level OpenCode config
 └── AGENTS.md               Instructions for a non-NOAPI primary model
 ```
@@ -586,8 +722,8 @@ Sites change their HTML from time to time, so selectors rot. The good news is th
 
 1. In `extension/chrome/content.js`, find the `SITES` object. Each entry lists CSS selectors for the **input**, the **send** button, the **stop** button and the **reply** messages.
 2. Open the site, right click the element, choose Inspect, and update the selector.
-3. Copy the same file to `extension/firefox/content.js` so both browsers match.
-4. For a brand new site, also add it to `bridge/sites.js` (and to the `chat` tool `enum` in `bridge/mcp.js`) and to `opencode.json`.
+3. Mirror the same block into `extension/firefox/content.js`.
+4. For a brand new site, also add it to `bridge/sites.js` (and to the `SITE_ENUM` in `bridge/mcp.js`) and to `opencode.json`.
 5. Add the origin to both manifests: `host_permissions`, the `matches` of **both** content-script entries (the DOM script and the MAIN-world SSE observer) and `web_accessible_resources`. Miss one and the site silently never connects.
 6. Run `npm test` (`tools/test-site-wiring.js` checks every one of those spots), reload the extension, and try it on the real page.
 
@@ -603,8 +739,9 @@ I would rather tell you now than have you find out later.
 
 - **It depends on page layouts.** There is no official interface here. When a site redesigns its chat page, that site can break until the selectors are updated.
 - **Speed.** You are driving a real web page, so replies take as long as the website takes, plus a little overhead. The bridge streams the answer as it is written and returns finished tool calls immediately, but the site's own model time cannot be removed.
-- **Tool quality varies by model.** Tool use works through a text format the model has to follow. Strong models do it reliably, weaker ones occasionally slip.
-- **One conversation per site tab.** The website keeps the history, so a very long session may hit that site's own limits.
+- **Tool quality varies by model.** Tool use works through a text format the model has to follow, including raw blocks for large text. Strong models do it reliably, weaker ones occasionally slip; the guard and repair loops recover the common cases, but a weak model can still refuse or emit unrecoverable JSON.
+- **One conversation per site tab.** The website keeps the history, so a very long session may hit that site's own limits. The bridge rotates to a fresh chat with a recap before that happens, but rotation loses whatever detail did not fit in the recap.
+- **The Chrome build is the most hardened.** Background-proof timers, tab keep-awake and the reconnect watchdog currently ship in `extension/chrome`; Firefox runs the same site logic and selectors, with the standard timers.
 - **Free plans have limits too.** The websites still apply their own message caps and rules.
 - **Terms of service.** Automating a website may go against that site's terms. This project is meant for personal use with your own account. You are responsible for how you use it, and it is not affiliated with OpenAI, Anthropic, Google, DeepSeek, Perplexity, xAI, Mistral, Z.ai or OpenCode.
 
@@ -616,6 +753,7 @@ I would rather tell you now than have you find out later.
 - 🚫 No analytics, no tracking, no external servers.
 - 🍪 The extension never reads or stores your passwords or cookies. It only types into and reads from the chat page you already opened.
 - 🔒 To tell when an answer is finished, a small observer watches the page's *own* network calls. By default it never reads the response body — it only notes when the site's stream starts and ends. Only if you opt in to the experimental `sseText` flag (and `NOAPI_SSE_TEXT=1`) does it decode the stream inside your browser to notice a tool call slightly earlier. That text never leaves your machine, and the reply that is returned still comes from the page itself.
+- 📂 By default **nothing** from your disk is sent to a site for you. `consult` sends only the files you explicitly name; `NOAPI_SEED_TREE=1` sends the *names* (not contents) of files in the working directory; `NOAPI_AUTOREAD=1` sends the contents of files named in the latest user message. All three are opt-in or explicitly driven.
 - 👀 It is plain JavaScript with no build step, so what you read is what runs.
 
 <br>
