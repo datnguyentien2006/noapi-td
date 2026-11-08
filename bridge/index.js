@@ -21,9 +21,10 @@ import { runMcpStdio, ProxyGateway } from "./mcp.js";
 import { tuningFromEnv, sseTextFromEnv } from "./tuning.js";
 
 function parseArgs(argv) {
-  const args = { port: 8787, host: "127.0.0.1", mcp: false };
+  const args = { port: 8787, host: "127.0.0.1", mcp: false, proxyOnly: process.env.NOAPI_MCP_PROXY_ONLY === "1" };
   for (const a of argv) {
     if (a === "--mcp") args.mcp = true;
+    else if (a === "--proxy-only") args.proxyOnly = true;
     else if (a === "--help" || a === "-h") args.help = true;
     else if (a.startsWith("--port=")) args.port = Number(a.slice(7));
     else if (a.startsWith("--host=")) args.host = a.slice(7);
@@ -87,6 +88,14 @@ async function main() {
   let server = null;
   let allConns = new Set();
   try {
+    if (args.mcp && args.proxyOnly) {
+      // Started by OpenCode: never own the port, only forward to the standalone
+      // bridge (npm start). Otherwise this process grabs 8787 whenever the
+      // standalone bridge is down and `npm start` then fails with EADDRINUSE.
+      const e = new Error("proxy-only");
+      e.proxyOnly = true;
+      throw e;
+    }
     const b = new Bridge({ log, cancelAckMs: Number(process.env.NOAPI_CANCEL_ACK_MS) || 5000 });
     server = createHttpServer(b, log, { host: args.host });
     function handleProxyMessage(conn, msg) {
@@ -206,7 +215,9 @@ async function main() {
     log(`listening on http://${args.host}:${args.port}`);
     log("dashboard: http://127.0.0.1:" + args.port + "/");
   } catch (err) {
-    if (err.code === "EADDRINUSE" && args.mcp) {
+    if (err.proxyOnly) {
+      log("MCP proxy-only mode: not listening, forwarding to the bridge on port " + args.port);
+    } else if (err.code === "EADDRINUSE" && args.mcp) {
       log(`port ${args.port} is in use — assuming a bridge is already running; running in proxy mode`);
     } else {
       log(`failed to start: ${err.message}`);

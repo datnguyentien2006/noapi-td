@@ -20,7 +20,8 @@
   // Bridge-side fast paths are deliberately NOT here: NOAPI_SSE, NOAPI_TERSE,
   // NOAPI_NEW_CHAT and the early-return flags are read from the bridge process
   // environment and forwarded per request. See the README flag table.
-  const FLAG_DEFAULTS = { observerDriven: true, eagerSend: true, sseObserver: true, sseText: false };
+  const FLAG_DEFAULTS = { observerDriven: true, eagerSend: true, sseObserver: true, sseText: false, keepActive: true, streamReply: true };
+  try { console.log("[NOAPI] content.js build stale-fix-2 (lastReply guard + send watchdog)"); } catch {}
   const FLAGS = { ...FLAG_DEFAULTS };
   const applyFlags = (v) => {
     if (!v || typeof v !== "object") return;
@@ -257,7 +258,12 @@
      zai: {
        name: "Z.ai",
        debounce: 450,
+       // Background tabs: keep the page working while the tab is hidden (see page-active.js).
+       keepActive: true,
        hosts: ["chat.z.ai"],
+      // Read the answer from the page's own network stream (sse-observer.js decodes
+      // it) so a hidden tab, whose page stops painting, still answers.
+      sseReply: true,
        newChat: ['button#sidebar-new-chat-button'],
        input: [
          "textarea#chat-input",
@@ -282,6 +288,10 @@
        ],
        reply: [".chat-assistant", "#response-content-container"],
        transcript: "main",
+       // Human-verification popup (Alibaba Cloud captcha, drag-the-puzzle). While it
+       // is open the page does not take the prompt: we pause, tell OpenCode, and
+       // never touch it - the person solves it in the Z.ai tab.
+       captcha: ["#aliyunCaptcha-window-popup", "#aliyunCaptcha-mask"],
      },
    };
 
@@ -424,6 +434,34 @@
   const bgSetTimeout = (fn, ms) => BG.set(fn, ms, false);
   const bgSetInterval = (fn, ms) => BG.set(fn, ms, true);
   const bgClear = (id) => BG.clear(id);
+  // A terminal message (reply / error) must not be lost: the background worker can
+  // be asleep or restarting when it is sent, and sendMessage then rejects. Retry
+  // with backoff on the Worker timers, so a hidden tab keeps its pace. A duplicate
+  // is harmless: the bridge ignores a terminal message for an id it no longer waits on.
+  function sendTerminal(msg, attempt = 0) {
+    let p;
+    try {
+      p = ext.runtime.sendMessage(msg);
+    } catch (e) {
+      p = Promise.reject(e);
+    }
+    Promise.resolve(p).catch(() => {
+      if (attempt >= 6) {
+        console.warn("[noapi] could not deliver", msg.type, msg.id, "to the extension background");
+        return;
+      }
+      bgSetTimeout(() => sendTerminal(msg, attempt + 1), Math.min(500 * 2 ** attempt, 8000));
+    });
+  }
+  // True while the tab is in the background (this is the real value: the content
+  // script's isolated world never sees page-active.js's spoof).
+  const pageHidden = () => {
+    try {
+      return document.visibilityState === "hidden" || document.hidden === true;
+    } catch {
+      return false;
+    }
+  };
   // Check in the page's DevTools console (F12): true = background-proof timers are active.
   setTimeout(() => console.info("[NOAPI] timers run in a background Worker:", BG.isReady()), 1500);
 
@@ -557,7 +595,14 @@
     return i >= 0 ? text.slice(i + tail.length).trim() : text;
   }
 
-  const state = { bridge: false, busy: false, port: null, cancel: false, reqId: null, justStopped: false, lateGrowth: 0 };
+  try { console.info("[NOAPI] content.js build stream-auth-1"); } catch {}
+  const state = { bridge: false, busy: false, port: null, cancel: false, reqId: null, justStopped: false, lateGrowth: 0, lastReply: "" };
+  // Diagnostic line at a communication boundary (shows in the tab console).
+  const diag = (m) => {
+    try {
+      console.log("[noapi] " + m);
+    } catch {}
+  };
 
   // ---------------- SSE OBSERVATION (Phase 3) ----------------
   // A tiny MAIN-world script (sse-observer.js) watches the page's own fetch for
@@ -584,6 +629,10 @@
     streamText: "",
     streamAt: 0,
     textMismatches: 0,
+    // Stream reply: the newest stream id seen, and the reply decoded from the
+    // current reply stream ({ sid, text, finished, errored, at }).
+    lastSid: 0,
+    reply: null,
   };
 
   function injectSseObserver() {
@@ -625,12 +674,20 @@
     const d = e && e.data;
     if (!d || d.source !== "noapi-sse") return;
     if (!SSE.token || d.token !== SSE.token) return;
+    const sid = Number(d.sid) || 0;
+    if (sid > SSE.lastSid) SSE.lastSid = sid;
     if (d.event === "delta") {
       // Task 5: decoded stream text. Advisory only (an earlier trigger for the
       // tool-call early return); the reply text still comes from the DOM.
       if (typeof d.text === "string") {
         SSE.streamText = d.text;
         SSE.streamAt = Date.now();
+        if (sid) {
+          if (!SSE.reply || SSE.reply.sid !== sid) SSE.reply = { sid, text: "", finished: false, errored: false, at: 0 };
+          SSE.reply.text = d.text;
+          SSE.reply.at = Date.now();
+          if (d.done === true) SSE.reply.finished = true;
+        }
       }
       SSE.lastAt = Date.now();
       try {
@@ -645,10 +702,12 @@
     } else if (d.event === "ended") {
       SSE.ended++;
       if (SSE.active > 0) SSE.active--;
+      if (sid && SSE.reply && SSE.reply.sid === sid) SSE.reply.finished = true;
     } else if (d.event === "error") {
       // The stream failed, was aborted, or its end was unobservable. It still
       // counts as activity, but it must NEVER be treated as a finished answer.
       SSE.errored++;
+      if (sid && SSE.reply && SSE.reply.sid === sid) SSE.reply.errored = true;
       if (SSE.active > 0) SSE.active--;
     } else {
       return;
@@ -659,6 +718,170 @@
     try {
       SSE.wake?.();
     } catch {}
+  });
+
+  /* @noapi-shared-start keepActive */
+  // Background tabs. While a request is in flight the controller (a) marks <html> so
+  // page-active.js (MAIN world) makes the page believe it is visible and drives its
+  // animation frames, (b) holds a Web Lock (a page holding one is not frozen by the
+  // browser's tab freezing, as far as Chrome documents it), and (c) samples the page
+  // once a second so a hidden-tab stall is visible in the logs: every 5 s while the
+  // tab is hidden it prints "[noapi] hidden: dom=.. sse_active=.. mutations=.. raf=..".
+  // Pure factory (all browser pieces injected) so tools/test-keepactive.js can run it.
+  function createKeepActive(env) {
+    const { doc, locks, setInterval: setIv, clearInterval: clearIv, raf, caf, MO, domChars, sseActive, log, now } = env;
+    const clock = typeof now === "function" ? now : Date.now;
+    const ACTIVE = "data-noapi-active";
+    const KEEP = "data-noapi-keepactive";
+    const STATUS = "data-noapi-pa";
+    const safe = (fn) => {
+      try {
+        return fn();
+      } catch {
+        return undefined;
+      }
+    };
+    const rootEl = () => doc.documentElement;
+    return {
+      // Page-level opt-in (the site flag AND the panel flag).
+      setEnabled(on) {
+        safe(() => {
+          if (on) rootEl().setAttribute(KEEP, "1");
+          else {
+            rootEl().removeAttribute(ACTIVE);
+            rootEl().removeAttribute(KEEP);
+          }
+        });
+      },
+      // One request. spoof=false only samples (diagnostics), it does not touch the page.
+      begin({ spoof = true } = {}) {
+        let stopped = false;
+        const stats = { mut: 0, raf: 0, hiddenMs: 0, domMax: 0 };
+        if (spoof) safe(() => rootEl().setAttribute(ACTIVE, "1"));
+
+        let lockReleased = false;
+        let lockRelease = null;
+        if (spoof) {
+          safe(() => {
+            if (locks && typeof locks.request === "function") {
+              const p = locks.request("noapi-active-" + clock().toString(36), () => new Promise((res) => {
+                if (lockReleased) res();
+                else lockRelease = res;
+              }));
+              if (p && typeof p.catch === "function") p.catch(() => {});
+            }
+          });
+        }
+
+        let mo = null;
+        safe(() => {
+          if (MO && doc.body) {
+            mo = new MO(() => {
+              stats.mut++;
+            });
+            mo.observe(doc.body, { subtree: true, childList: true, characterData: true });
+          }
+        });
+
+        // Frames the BROWSER really produced for this tab: stays at 0 while hidden.
+        let rafId = null;
+        const loop = () => {
+          if (stopped) return;
+          stats.raf++;
+          rafId = safe(() => raf(loop));
+        };
+        if (typeof raf === "function") rafId = safe(() => raf(loop));
+
+        let last = clock();
+        let ticks = 0;
+        const iv = safe(() =>
+          setIv(() => {
+            if (stopped) return;
+            ticks++;
+            const t = clock();
+            const hidden = safe(() => doc.visibilityState) === "hidden";
+            if (hidden) stats.hiddenMs += t - last;
+            last = t;
+            const dom = safe(() => domChars()) || 0;
+            if (dom > stats.domMax) stats.domMax = dom;
+            if (hidden && ticks % 5 === 0) {
+              safe(() =>
+                log("[noapi] hidden: dom=" + dom + " sse_active=" + (safe(() => sseActive()) || 0) + " mutations=" + stats.mut +
+                  " raf=" + stats.raf + " pa=" + (safe(() => rootEl().getAttribute(STATUS)) || "-"))
+              );
+            }
+          }, 1000)
+        );
+
+        return {
+          stats,
+          // Add the visibility counters to the timings sent with the reply.
+          fill(timings) {
+            if (!timings) return;
+            const hiddenNow = safe(() => doc.visibilityState) === "hidden";
+            timings.vis = hiddenNow ? "hidden" : stats.hiddenMs > 0 ? "was-hidden" : "visible";
+            timings.hiddenMs = Math.round(stats.hiddenMs);
+            timings.mut = stats.mut;
+            timings.raf = stats.raf;
+            timings.domMax = stats.domMax;
+            timings.pa = safe(() => rootEl().getAttribute(STATUS)) || "";
+            timings.keepActive = spoof;
+          },
+          // Idempotent. ALWAYS removes the marker, whatever else failed.
+          stop() {
+            if (stopped) return;
+            stopped = true;
+            safe(() => rootEl().removeAttribute(ACTIVE));
+            lockReleased = true;
+            safe(() => lockRelease && lockRelease());
+            safe(() => mo && mo.disconnect());
+            safe(() => iv != null && clearIv(iv));
+            safe(() => rafId != null && typeof caf === "function" && caf(rafId));
+          },
+        };
+      },
+    };
+  }
+  /* @noapi-shared-end keepActive */
+
+  const keepActive = createKeepActive({
+    doc: document,
+    locks: typeof navigator !== "undefined" ? navigator.locks : null,
+    setInterval: bgSetInterval,
+    clearInterval: bgClear,
+    raf: (f) => requestAnimationFrame(f),
+    caf: (id) => cancelAnimationFrame(id),
+    MO: typeof MutationObserver === "function" ? MutationObserver : null,
+    domChars: () => {
+      const n = replyNodes();
+      return n.length ? extractText(n[n.length - 1]).length : 0;
+    },
+    sseActive: () => SSE.active,
+    log: (m) => console.info(m),
+  });
+  // True when this site opted in (SITES[x].keepActive) AND the panel flag is on.
+  const keepActiveOn = () => FLAGS.keepActive !== false && SITE.keepActive === true;
+  const applyKeepActive = () => keepActive.setEnabled(keepActiveOn());
+
+  // Firefox has no MAIN-world content scripts on our minimum version: inject
+  // page-active.js with a <script> tag, like sse-observer.js. Chrome already ran it
+  // (it leaves data-noapi-pa on <html>), so this is a no-op there.
+  function injectPageActive() {
+    try {
+      if (document.documentElement.getAttribute("data-noapi-pa")) return;
+      const s = document.createElement("script");
+      s.src = ext.runtime.getURL("page-active.js");
+      s.async = false;
+      s.onload = () => { try { s.remove(); } catch {} };
+      s.onerror = () => { try { s.remove(); } catch {} };
+      (document.head || document.documentElement).appendChild(s);
+    } catch {}
+  }
+  whenFlags(() => {
+    if (SITE.keepActive === true) injectPageActive();
+    applyKeepActive();
+    // The script may have loaded just after us (Firefox): set the marker again.
+    setTimeout(applyKeepActive, 500);
   });
 
   // Inject/read the token only once the stored flags are known, so the
@@ -906,6 +1129,8 @@
     <label title="Click Send the moment the site enables it instead of after a fixed 150ms"><input type="checkbox" data-flag="eagerSend"> send on enable</label>
     <label title="Use the page's own SSE stream as a completion signal (bridge NOAPI_SSE=0 also disables it)"><input type="checkbox" data-flag="sseObserver"> SSE signal</label>
     <label title="Decode the page's SSE stream for an earlier tool-call trigger; the reply text still comes from the DOM. The bridge NOAPI_SSE_TEXT=1 flag is also required."><input type="checkbox" data-flag="sseText"> SSE text</label>
+    <label title="Keep this tab working while it is hidden: the page is told it is visible and its animation frames are driven while a prompt is in flight (page-active.js)"><input type="checkbox" data-flag="keepActive"> keep active</label>
+    <label title="Z.ai: read the answer from the page's network stream so a hidden tab still answers (the DOM stays the authority while the tab is visible)"><input type="checkbox" data-flag="streamReply"> stream reply</label>
   </div>
   <div class="log-box">Ready. Waiting for OpenCode…</div>
 </div>
@@ -936,6 +1161,7 @@
   for (const b of flagBoxes) {
     b.addEventListener("change", () => {
       saveFlags({ [b.dataset.flag]: b.checked });
+      if (b.dataset.flag === "keepActive") applyKeepActive();
       if (flagsState) flagsState.textContent = "saved";
     });
   }
@@ -1167,6 +1393,19 @@
     return false;
   }
 
+  // True while the site shows a human-verification popup (SITE.captcha). Only
+  // looks; it never interacts with the challenge.
+  function captchaVisible() {
+    for (const sel of SITE.captcha || []) {
+      try {
+        const b = document.querySelector(sel);
+        if (b && visible(b) && !/hide/i.test(String(b.className || ""))) return true;
+      } catch {}
+    }
+    return false;
+  }
+  const CAPTCHA_WAIT_MS = 240_000; // how long we wait for a person to solve it
+
   // Condition-based typing helpers. The old code slept for a fixed 80+50+120+250ms
   // (plus 450ms in ensureTyped) "just in case"; instead we insert the text and then
   // poll until the composer really holds it, which is usually far quicker and still
@@ -1391,6 +1630,7 @@
     // there, the Enter fallback submits it; if it was wiped, say so (the recovery
     // loop re-types).
     if (composer) {
+      diag(`no enabled send button after ${SEND_READY_TIMEOUT_MS}ms (stop=${isStopVisible()}, hidden=${pageHidden()}); falling back to Enter`);
       if (prompt != null && !wantedFilled(composer, prompt)) {
         setLog(`${SITE.name} chat box is empty before send; the recovery loop will type the prompt again.`, true);
       }
@@ -1518,14 +1758,25 @@
   // or (once we have a previous sample) while the reply text is still changing.
   const stillBusy = (stopVisible, cur, prev) => stopVisible || (prev !== null && cur !== prev);
   /* @noapi-shared-end idleCheck */
+  // Stream-authoritative sites (Z.ai): the previous answer was read from the
+  // network stream, so the DOM may still show the busy state (stop square, no send
+  // button) after the stream is over, most of all in a hidden tab that repaints
+  // late. Typing then sends nothing: the send button is absent and Enter is
+  // ignored while the site is "busy". If the stop control is still there and no
+  // stream is open for this long, click it once to bring the page back to idle.
+  const STUCK_STOP_MS = 2500;
   async function waitForIdle(maxMs = 60_000) {
     // If the previous request was ended deliberately (we returned a complete
     // tool call and clicked stop ourselves), the page is already idle — skip
-    // the stability poll entirely.
+    // the stability poll entirely. Stream-authoritative sites still get a short
+    // bounded look, because the stop click is not instantaneous (hidden tab).
     if (state.justStopped) {
       state.justStopped = false;
-      return;
+      if (!SITE.sseReply) return;
+      maxMs = Math.min(maxMs, 8000);
     }
+    let stuckSince = 0;
+    let stuckClicked = false;
     const t0 = Date.now();
     const snap = () => {
       const n = replyNodes();
@@ -1537,7 +1788,20 @@
     while (Date.now() - t0 < maxMs) {
       if (state.cancel) throw new Error("Cancelled.");
       const cur = snap();
-      if (!stillBusy(isStopVisible(), cur, prev)) return;
+      const stop = isStopVisible();
+      if (!stillBusy(stop, cur, prev)) return;
+      if (SITE.sseReply) {
+        if (stop && SSE.active <= 0) {
+          if (!stuckSince) stuckSince = Date.now();
+          else if (!stuckClicked && Date.now() - stuckSince >= STUCK_STOP_MS) {
+            stuckClicked = true;
+            diag(`${SITE.name} still shows Stop but no answer stream is open (hidden=${pageHidden()}); clicking Stop to reach idle`);
+            stopGeneration();
+          }
+        } else {
+          stuckSince = 0;
+        }
+      }
       prev = cur;
       await sleep(700);
       setLog(SITE.name + " is still answering the previous message, waiting…", true);
@@ -1582,6 +1846,19 @@
   // Pure decision function, delimited so tools/test-content-logic.js can lift it
   // out of this file and unit-test it without a browser. Keep it self-contained
   // (no outer variables) — that is what makes the extraction possible.
+  /* @noapi-shared-start streamReply */
+  // What to do with the answer decoded from the page's own network stream.
+  // reply: { sid, text, finished, errored } or null. The stream is trusted when
+  // the page cannot be (the tab is hidden and stops painting) or has shown
+  // nothing yet; with a visible, painting page the DOM stays authoritative.
+  // Returns { use, finish }: adopt the stream text / the answer is complete.
+  function streamReplyDecision(reply, streamBefore, hidden, domSeen) {
+    if (!reply || !(reply.sid > streamBefore) || !reply.text) return { use: false, finish: false };
+    const trust = Boolean(hidden) || !domSeen;
+    return { use: trust, finish: trust && Boolean(reply.finished) && !reply.errored };
+  }
+  /* @noapi-shared-end streamReply */
+
   /* @noapi-shared-start completionDecision */
   function completionDecision(lastTextLength, stopVisible, stopSeen, quietMs, debounceMs, fallbackMs) {
     if (lastTextLength < 5 || stopVisible) return false;
@@ -1597,6 +1874,15 @@
   // the model is still writing (the next block, or the fence) the tail is not a
   // finished block, and the quiet timer keeps resetting anyway.
   const DEFAULT_EARLY_RETURN_MS = 400;
+  // Stream-authoritative mode (Z.ai): once the page's own answer stream has
+  // started, its decoded text is the ONLY source of the reply and the DOM is not
+  // read at all (a hidden tab paints late and shows the previous answer). Before
+  // the stream starts the DOM is not read for STREAM_START_MS either. The DOM is
+  // a fallback only when no stream ever starts or the stream errored.
+  const STREAM_AUTH = true;
+  const STREAM_START_MS = 15_000; // no new stream by then: the send may have been swallowed
+  const NO_STREAM_FAIL_MS = 60_000; // no stream and no text at all: fail fast, do not wait 590 s
+  const NO_STREAM_ACCEPTED_MS = 300_000; // ...unless the page shows it took the prompt (slow first byte on big prompts)
   // The early-return hard cap, the post-stop / post-SSE re-read windows and the
   // partial-stream throttle are all tunable per request; see TUNING_DEFAULTS.
 
@@ -1791,7 +2077,25 @@
   // characters in 590 s and then timed out with a half-written block.
   const MAX_REPLY_CHARS = 40_000;
 
-  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, baseline = null, typedLen, toolsEnabled = false, earlyReturn = true, earlyReturnMs = DEFAULT_EARLY_RETURN_MS, toolNames = [], pipelineT0 = null, timings = null, sseEnabled = true, sseTextOn = false }) {
+  // A hidden tab never paints the answer it streamed, so the DOM snapshot taken
+  // before the next send (before/beforeLast) misses that answer. When the page
+  // finally paints it, it looks like a NEW reply: it was returned a second time,
+  // the early return clicked Stop on the real answer, and the model never got
+  // its tool results. sameReply() recognises the reply we already returned
+  // (rendered DOM text and raw stream markdown differ in fences/whitespace, so
+  // only letters and digits are compared).
+  function replyKey(t) {
+    return String(t || "").replace(/[^\p{L}\p{N}]/gu, "");
+  }
+  function sameReply(domText, prevText) {
+    const a = replyKey(domText);
+    const b = replyKey(prevText);
+    if (!a || !b) return false;
+    if (a === b) return true;
+    return b.length >= 40 && a.includes(b);
+  }
+
+  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, baseline = null, typedLen, toolsEnabled = false, earlyReturn = true, earlyReturnMs = DEFAULT_EARLY_RETURN_MS, toolNames = [], pipelineT0 = null, timings = null, sseEnabled = true, sseTextOn = false, streamReplyOn = false, streamBefore = 0 }) {
     const t0 = Date.now();
     return new Promise((resolve, reject) => {
       let lastText = "";
@@ -1801,9 +2105,16 @@
       let resubmits = 0;
       let lastExtractAt = 0;
       let lastStallLog = 0;
+      let lastAcceptedLog = 0;
+      let captchaSince = 0; // when the verification popup was first seen (0 = not showing)
+      let captchaPaused = 0; // ms spent waiting on it; excluded from the no-stream timers
+      let lastCaptchaLog = 0;
       let dirty = true;
       let ticking = false;
       let done = false;
+      let domSeen = false; // the DOM has shown reply text for this turn
+      let streamAdopted = false; // lastText currently comes from the network stream
+      let streamResubmits = 0; // re-clicks of Send because no new answer stream started
       let observer = null;
       let timer = null;
       let scheduler = null;
@@ -1909,9 +2220,14 @@
         if (nodes.length > before) {
           text = extractText(nodes[nodes.length - 1]);
           fromSelector = true;
+          if (streamReplyOn && text && sameReply(text, state.lastReply)) {
+            // Late paint of the previous (already returned) answer, not a new one.
+            if (timings) timings.staleDom = (timings.staleDom || 0) + 1;
+            text = "";
+          }
         } else if (nodes.length && nodes.length === before) {
           const t = extractText(nodes[nodes.length - 1]);
-          if (t && t !== beforeLast && (generating || sawActivity || SITE.iconSend)) {
+          if (t && t !== beforeLast && !(streamReplyOn && sameReply(t, state.lastReply)) && (generating || sawActivity || SITE.iconSend)) {
             text = t;
             fromSelector = true;
           }
@@ -1920,6 +2236,14 @@
           text = await fallbackText();
         }
         return text;
+      };
+
+      const diagStr = () => {
+        try {
+          return ` [nodes=${replyNodes().length}/${before} sid=${SSE.lastSid}/${streamBefore} reply=${SSE.reply ? SSE.reply.sid + ":" + SSE.reply.text.length + (SSE.reply.finished ? "F" : "") + (SSE.reply.errored ? "E" : "") : "none"} sse=${SSE.started}/${SSE.ended}/${SSE.errored} sawActivity=${sawActivity} resubmits=${resubmits}/${streamResubmits} stop=${isStopVisible()} hidden=${pageHidden()} stale=${(timings && timings.staleDom) || 0}]`;
+        } catch {
+          return "";
+        }
       };
 
       const tick = async () => {
@@ -1940,16 +2264,49 @@
             } catch {}
             if (timings) timings.timedOut = true;
             if (lastText.length >= 5) finish(lastText);
-            else fail(new Error("Timed out waiting for " + SITE.name + " to complete response."));
+            else fail(new Error("Timed out waiting for " + SITE.name + " to complete response." + diagStr()));
             return;
           }
 
+          const hiddenNow = pageHidden();
           const generating = isStopVisible();
+          // Stream-authoritative bookkeeping: a NEW answer stream (sid above the
+          // one seen before this send) is the proof that the send was accepted.
+          const streamMode = streamReplyOn && STREAM_AUTH;
+          const streamStarted = streamMode && SSE.lastSid > streamBefore;
+          const rNow = SSE.reply && SSE.reply.sid > streamBefore ? SSE.reply : null;
           if (generating) {
             sawActivity = true;
             stopSeen = true;
             if (timings) timings.stopSeen = true;
           }
+
+          // Human verification: the page will not take the prompt until a person
+          // solves the popup. Pause the "no stream" timers and the re-send recovery
+          // (re-clicking Send would only reopen it), say so in OpenCode, and fail
+          // with a clear message if nobody solves it in CAPTCHA_WAIT_MS.
+          if (captchaVisible() && !streamStarted && lastText.length < 5) {
+            if (!captchaSince) {
+              captchaSince = now;
+              if (timings) timings.captcha = true;
+              diag(`${SITE.name} is asking for human verification (captcha); waiting for you to solve it in the ${SITE.name} tab`);
+            }
+            if (now - captchaSince > CAPTCHA_WAIT_MS) {
+              fail(new Error(`${SITE.name} needs human verification (captcha) and it was not solved within ${Math.round(CAPTCHA_WAIT_MS / 1000)}s. Solve it in the ${SITE.name} tab and send the prompt again.` + diagStr()));
+              return;
+            }
+            if (now - lastCaptchaLog >= 10_000) {
+              lastCaptchaLog = now;
+              setLog(`${SITE.name} needs human verification (captcha). Solve it in the ${SITE.name} tab; waiting (${Math.round((now - captchaSince) / 1000)}s)...`, true);
+            }
+            return;
+          }
+          if (captchaSince) {
+            captchaPaused += now - captchaSince;
+            captchaSince = 0;
+            diag(`${SITE.name} verification cleared after ${Math.round(captchaPaused / 1000)}s; resuming`);
+          }
+          const elapsed = now - t0 - captchaPaused; // time that counts toward "no stream" decisions
 
           // Phase 3: the page's own fetch SSE stream started/ended. A live or
           // newly-started stream proves the send was accepted, so the "swallowed
@@ -1961,11 +2318,53 @@
             if (sseState === "started") setLog(`${SITE.name} opened its answer stream...`, "tick");
           }
 
+          // Watchdog: the page never started an answer stream for this prompt and
+          // nothing else shows activity. The send was not accepted (or never
+          // left); fail in 60s with a diagnostic instead of hanging for 590s.
+          // The page's stream only "starts" when the response HEADERS arrive, and
+          // Z.ai holds them for a long time on big prompts (first text took 30-82 s
+          // for 33-46k characters). So 60 s without a stream is not proof that the
+          // send was swallowed: if the page shows it took the prompt (a new reply
+          // node, or the box is empty while Stop is up) keep waiting, up to
+          // NO_STREAM_ACCEPTED_MS, and say so.
+          if (streamMode && !streamStarted && lastText.length < 5 && elapsed > NO_STREAM_FAIL_MS) {
+            const c = (await findComposer()) || composer;
+            const accepted = replyNodes().length > before || (isStopVisible() && !(c && composerText(c).length >= 4));
+            if (accepted && elapsed < NO_STREAM_ACCEPTED_MS) {
+              if (now - lastAcceptedLog >= 20_000) {
+                lastAcceptedLog = now;
+                diag(`${SITE.name} accepted the prompt but has not started streaming after ${Math.round((now - t0) / 1000)}s (nodes=${replyNodes().length}/${before}, stop=${isStopVisible()}, hidden=${hiddenNow}); still waiting`);
+                setLog(`${SITE.name} accepted the prompt, waiting for it to start answering (${Math.round((now - t0) / 1000)}s)...`, true);
+              }
+            } else {
+              if (timings) timings.noSend = true;
+              fail(new Error(`Z.ai did not start answering within ${Math.round((now - t0) / 1000)}s (${accepted ? "accepted but no answer stream" : "prompt not accepted"})` + diagStr()));
+              return;
+            }
+          }
+
           // If the site swallowed the send (nothing started), recover. Two cases:
           //  - the composer still holds our text  -> click send again
           //  - the composer is EMPTY (re-render wiped it) and the page did not
           //    change -> type the prompt again and send
-          if (!sawActivity && now - t0 > 4000 * (resubmits + 1) && resubmits < 3) {
+          if (streamMode && !streamStarted && streamResubmits < 2 && elapsed > STREAM_START_MS * (streamResubmits + 1)) {
+            // No new answer stream after the send. Safe recovery only: if the box
+            // still holds our text the send never happened, so click Send again.
+            const c = (await findComposer()) || composer;
+            if (c && composerText(c).length >= 4) {
+              if (isStopVisible()) {
+                // The site is still "busy": it removed the send button, so the click
+                // (or Enter) was swallowed. Get it idle first; this is not a failed try.
+                diag(`send swallowed: ${SITE.name} still busy (stop visible, hidden=${hiddenNow}); waiting for idle before resending`);
+                await waitForIdle(10_000);
+              }
+              streamResubmits++;
+              setLog(`No answer stream yet, sending again (${streamResubmits}/2)...`, true);
+              await submitComposer(c, prompt);
+              return;
+            }
+          }
+          if (!sawActivity && !streamMode && now - t0 > 4000 * (resubmits + 1) && resubmits < 3) {
             const c = (await findComposer()) || composer;
             const tail = prompt.replace(/\s+/g, " ").trim().slice(-40);
             const pageHasPrompt = tail.length >= 8 && (scope?.textContent || "").replace(/\s+/g, " ").includes(tail);
@@ -1990,22 +2389,29 @@
 
           // Only read the DOM when it changed (or, at most once a second, in case
           // mutations happen somewhere we cannot observe).
-          if ((dirty || now - lastExtractAt >= UNSEEN_MUTATION_MS) && now - lastExtractAt >= TUNE.extractThrottle) {
+          // A hidden tab's DOM is not trusted once the stream supplies the text.
+          const domBlocked = streamMode && (streamStarted ? !(rNow && rNow.errored) : elapsed < STREAM_START_MS);
+          const skipDom = (streamReplyOn && streamAdopted && hiddenNow) || domBlocked;
+          if (!skipDom && (dirty || now - lastExtractAt >= UNSEEN_MUTATION_MS) && now - lastExtractAt >= TUNE.extractThrottle) {
             dirty = false;
             lastExtractAt = now;
             const text = await readText(generating);
+            if (text) domSeen = true;
             if (!text) {
-              lastText = "";
-              lastTextAt = 0;
+              if (!streamAdopted) {
+                lastText = "";
+                lastTextAt = 0;
+              }
               // Make a silent stall visible in OpenCode instead of "Finding input..." forever.
               const waited = Math.round((now - t0) / 1000);
-              if (waited >= 20 && waited - lastStallLog >= STALL_LOG_MS / 1000) {
+              if (!streamAdopted && waited >= 20 && waited - lastStallLog >= STALL_LOG_MS / 1000) {
                 lastStallLog = waited;
                 const c = (await findComposer()) || composer;
                 const dbg = `nodes=${replyNodes().length}/${before} box=${composerText(c).length}ch stop=${isStopVisible()} ${replyDiag()}`;
                 setLog(`Prompt sent, but no answer detected on ${SITE.name} yet (${waited}s) [${dbg}]. Still waiting...`, true);
               }
             } else if (text !== lastText) {
+              streamAdopted = false;
               lastText = text;
               lastTextAt = now;
               sawActivity = true;
@@ -2017,6 +2423,34 @@
               // the reply stopped changing.
               if (completionTimer) bgClear(completionTimer);
               completionTimer = bgSetTimeout(() => scheduler?.schedule(), debounceMs() + 30);
+            }
+          }
+
+          // Stream reply: the answer decoded from the page's own network stream (see
+          // sse-observer.js). It replaces the DOM when the tab is hidden (the page
+          // stops painting, so the DOM never shows the answer) or the DOM has shown
+          // nothing; a visible, painting page keeps the DOM as the authority.
+          if (streamReplyOn) {
+            const R = SSE.reply;
+            const dec = streamReplyDecision(R, streamBefore, hiddenNow || streamMode, domSeen);
+            if (timings && R && R.sid > streamBefore) {
+              timings.streamChars = R.text.length;
+              if (hiddenNow) timings.streamHidden = true;
+            }
+            if (dec.use && R.text !== lastText) {
+              streamAdopted = true;
+              lastText = R.text;
+              lastTextAt = R.at || now;
+              sawActivity = true;
+              if (timings && !timings.firstText) timings.firstText = Date.now() - (pipelineT0 ?? t0);
+              setLog(`${SITE.name} is answering... (${R.text.length} chars, from the network stream)`, "tick");
+              sendPartial(R.text);
+            }
+            if (dec.finish) {
+              if (timings) timings.streamReply = true;
+              setLog(`✓ ${SITE.name} answer read from the network stream (${R.text.length} chars).`);
+              finish(R.text.trim(), "sse-text");
+              return;
             }
           }
 
@@ -2086,7 +2520,7 @@
             // longer text if it now holds more complete blocks, so a block that
             // was being written when we clicked is not cut off.
             let finalText = lastText;
-            if (stopped) {
+            if (stopped && !(streamMode && streamStarted)) {
               await sleep(TUNE.earlyReturnReread);
               const nodes = replyNodes();
               const after = nodes.length ? extractText(nodes[nodes.length - 1]) : "";
@@ -2170,13 +2604,15 @@
     Object.assign(TUNE, resolveTuning(TUNING_DEFAULTS, opts.tuning));
     // Task 5: optional SSE-text fast path (panel flag AND bridge env), default off.
     const sseTextOn = Boolean(opts.sseText) && FLAGS.sseText;
-    setSseText(sseTextOn);
+    // Stream reply: sites that opt in (Z.ai) have their stream decoded for the
+    // reply text (panel flag "stream reply", needs the SSE observer).
+    const streamReplyOn = SITE.sseReply === true && FLAGS.streamReply !== false && FLAGS.sseObserver && sseEnabled;
+    if (streamReplyOn) readSseToken();
+    setSseText(sseTextOn || streamReplyOn);
     SSE.streamText = "";
     if (state.busy) {
       if (reqId) {
-        ext.runtime
-          .sendMessage({ type: "noapi_error", id: reqId, error: "This tab is already handling a prompt.", code: "busy" })
-          .catch(() => {});
+        sendTerminal({ type: "noapi_error", id: reqId, error: "This tab is already handling a prompt.", code: "busy" });
       }
       return;
     }
@@ -2194,8 +2630,10 @@
     const t0 = Date.now();
     const timings = { composer: 0, typed: 0, sent: 0, firstText: 0, complete: 0, stopSeen: false, earlyReturn: false };
     timings.bgTimers = BG.isReady(); // Phase 3: true = timers run in a Worker (not throttled in background tabs)
+    let activeRun = null; // background-tab controller for this request (stopped in `finally`)
 
     try {
+      activeRun = keepActive.begin({ spoof: keepActiveOn() });
       setLog("Finding " + SITE.name + " chat input…", true);
       if (opts.newChat) {
         // Phase 5: a new OpenCode session can start on a fresh chat page so old
@@ -2217,7 +2655,12 @@
       if (!composer) throw new Error("Could not find chat input on " + SITE.name + ". Is the chat page fully loaded?");
       timings.composer = Date.now() - t0;
 
-      if (SITE.iconSend) await waitForIdle(40_000);
+      if (SITE.iconSend || SITE.sseReply) {
+        const tIdle = Date.now();
+        const busyBefore = isStopVisible();
+        await waitForIdle(40_000);
+        if (busyBefore) diag(`waited ${Date.now() - tIdle}ms for ${SITE.name} to become idle before sending (hidden=${pageHidden()}, stop=${isStopVisible()})`);
+      }
       const scope =
         SITE.transcript
           .split(",")
@@ -2235,6 +2678,8 @@
       // Pre-send baseline for the selector-free fallback. Only needed when no reply was on the page
       // yet (new chat, small DOM, so cheap); with replies present the selectors evidently work.
       const baseline = before === 0 ? elementLengths(scope) : null;
+      // Streams that start from now on belong to this turn (see SSE.reply).
+      const streamBefore = SSE.lastSid;
 
       let composerNow = (await findComposer()) || composer;
       setLog("Typing prompt into " + SITE.name + "…", true);
@@ -2250,20 +2695,29 @@
       timings.sent = Date.now() - t0;
 
       setLog("Waiting for " + SITE.name + " to answer…", true);
-      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, baseline, typedLen, toolsEnabled, earlyReturn, earlyReturnMs, toolNames, pipelineT0: t0, timings, sseEnabled, sseTextOn });
+      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, baseline, typedLen, toolsEnabled, earlyReturn, earlyReturnMs, toolNames, pipelineT0: t0, timings, sseEnabled, sseTextOn, streamReplyOn, streamBefore });
       timings.complete = Date.now() - t0;
+      try {
+        activeRun?.fill(timings);
+      } catch {}
 
+      state.lastReply = text;
       setLog(`✓ Response captured (${text.length} chars). Sent to OpenCode.`);
-      if (reqId) ext.runtime.sendMessage({ type: "noapi_reply", id: reqId, text, timings: { ...timings, total: Date.now() - t0 } }).catch(() => {});
+      if (reqId) sendTerminal({ type: "noapi_reply", id: reqId, text, timings: { ...timings, total: Date.now() - t0 } });
       // Truncation canary: re-read the reply node once after the turn, without
       // blocking anything. Any growth means a completion fast path cut a reply.
-      scheduleLateGrowth();
+      // The truncation canary compares against the DOM, which a hidden tab never
+      // painted: skip it for replies read from the network stream.
+      if (!timings.streamReply) scheduleLateGrowth();
       return text;
     } catch (err) {
       setLog("Error: " + err.message);
-      if (reqId) ext.runtime.sendMessage({ type: "noapi_error", id: reqId, error: err.message }).catch(() => {});
+      if (reqId) sendTerminal({ type: "noapi_error", id: reqId, error: err.message });
       throw err;
     } finally {
+      try {
+        activeRun?.stop();
+      } catch {}
       state.busy = false;
       state.reqId = null;
       updateStatusUI();

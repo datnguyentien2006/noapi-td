@@ -1,0 +1,238 @@
+--- a/extension/content.js
++++ b/extension/content.js
+@@ -20,7 +20,7 @@
+   // Bridge-side fast paths are deliberately NOT here: NOAPI_SSE, NOAPI_TERSE,
+   // NOAPI_NEW_CHAT and the early-return flags are read from the bridge process
+   // environment and forwarded per request. See the README flag table.
+-  const FLAG_DEFAULTS = { observerDriven: true, eagerSend: true, sseObserver: true, sseText: false };
++  const FLAG_DEFAULTS = { observerDriven: true, eagerSend: true, sseObserver: true, sseText: false, keepActive: true };
+   const FLAGS = { ...FLAG_DEFAULTS };
+   const applyFlags = (v) => {
+     if (!v || typeof v !== "object") return;
+@@ -257,6 +257,8 @@
+      zai: {
+        name: "Z.ai",
+        debounce: 450,
++       // Background tabs: keep the page working while the tab is hidden (see page-active.js).
++       keepActive: true,
+        hosts: ["chat.z.ai"],
+        newChat: ['button#sidebar-new-chat-button'],
+        input: [
+@@ -661,6 +663,170 @@
+     } catch {}
+   });
+ 
++  /* @noapi-shared-start keepActive */
++  // Background tabs. While a request is in flight the controller (a) marks <html> so
++  // page-active.js (MAIN world) makes the page believe it is visible and drives its
++  // animation frames, (b) holds a Web Lock (a page holding one is not frozen by the
++  // browser's tab freezing, as far as Chrome documents it), and (c) samples the page
++  // once a second so a hidden-tab stall is visible in the logs: every 5 s while the
++  // tab is hidden it prints "[noapi] hidden: dom=.. sse_active=.. mutations=.. raf=..".
++  // Pure factory (all browser pieces injected) so tools/test-keepactive.js can run it.
++  function createKeepActive(env) {
++    const { doc, locks, setInterval: setIv, clearInterval: clearIv, raf, caf, MO, domChars, sseActive, log, now } = env;
++    const clock = typeof now === "function" ? now : Date.now;
++    const ACTIVE = "data-noapi-active";
++    const KEEP = "data-noapi-keepactive";
++    const STATUS = "data-noapi-pa";
++    const safe = (fn) => {
++      try {
++        return fn();
++      } catch {
++        return undefined;
++      }
++    };
++    const rootEl = () => doc.documentElement;
++    return {
++      // Page-level opt-in (the site flag AND the panel flag).
++      setEnabled(on) {
++        safe(() => {
++          if (on) rootEl().setAttribute(KEEP, "1");
++          else {
++            rootEl().removeAttribute(ACTIVE);
++            rootEl().removeAttribute(KEEP);
++          }
++        });
++      },
++      // One request. spoof=false only samples (diagnostics), it does not touch the page.
++      begin({ spoof = true } = {}) {
++        let stopped = false;
++        const stats = { mut: 0, raf: 0, hiddenMs: 0, domMax: 0 };
++        if (spoof) safe(() => rootEl().setAttribute(ACTIVE, "1"));
++
++        let lockReleased = false;
++        let lockRelease = null;
++        if (spoof) {
++          safe(() => {
++            if (locks && typeof locks.request === "function") {
++              const p = locks.request("noapi-active-" + clock().toString(36), () => new Promise((res) => {
++                if (lockReleased) res();
++                else lockRelease = res;
++              }));
++              if (p && typeof p.catch === "function") p.catch(() => {});
++            }
++          });
++        }
++
++        let mo = null;
++        safe(() => {
++          if (MO && doc.body) {
++            mo = new MO(() => {
++              stats.mut++;
++            });
++            mo.observe(doc.body, { subtree: true, childList: true, characterData: true });
++          }
++        });
++
++        // Frames the BROWSER really produced for this tab: stays at 0 while hidden.
++        let rafId = null;
++        const loop = () => {
++          if (stopped) return;
++          stats.raf++;
++          rafId = safe(() => raf(loop));
++        };
++        if (typeof raf === "function") rafId = safe(() => raf(loop));
++
++        let last = clock();
++        let ticks = 0;
++        const iv = safe(() =>
++          setIv(() => {
++            if (stopped) return;
++            ticks++;
++            const t = clock();
++            const hidden = safe(() => doc.visibilityState) === "hidden";
++            if (hidden) stats.hiddenMs += t - last;
++            last = t;
++            const dom = safe(() => domChars()) || 0;
++            if (dom > stats.domMax) stats.domMax = dom;
++            if (hidden && ticks % 5 === 0) {
++              safe(() =>
++                log("[noapi] hidden: dom=" + dom + " sse_active=" + (safe(() => sseActive()) || 0) + " mutations=" + stats.mut +
++                  " raf=" + stats.raf + " pa=" + (safe(() => rootEl().getAttribute(STATUS)) || "-"))
++              );
++            }
++          }, 1000)
++        );
++
++        return {
++          stats,
++          // Add the visibility counters to the timings sent with the reply.
++          fill(timings) {
++            if (!timings) return;
++            const hiddenNow = safe(() => doc.visibilityState) === "hidden";
++            timings.vis = hiddenNow ? "hidden" : stats.hiddenMs > 0 ? "was-hidden" : "visible";
++            timings.hiddenMs = Math.round(stats.hiddenMs);
++            timings.mut = stats.mut;
++            timings.raf = stats.raf;
++            timings.domMax = stats.domMax;
++            timings.pa = safe(() => rootEl().getAttribute(STATUS)) || "";
++            timings.keepActive = spoof;
++          },
++          // Idempotent. ALWAYS removes the marker, whatever else failed.
++          stop() {
++            if (stopped) return;
++            stopped = true;
++            safe(() => rootEl().removeAttribute(ACTIVE));
++            lockReleased = true;
++            safe(() => lockRelease && lockRelease());
++            safe(() => mo && mo.disconnect());
++            safe(() => iv != null && clearIv(iv));
++            safe(() => rafId != null && typeof caf === "function" && caf(rafId));
++          },
++        };
++      },
++    };
++  }
++  /* @noapi-shared-end keepActive */
++
++  const keepActive = createKeepActive({
++    doc: document,
++    locks: typeof navigator !== "undefined" ? navigator.locks : null,
++    setInterval: bgSetInterval,
++    clearInterval: bgClear,
++    raf: (f) => requestAnimationFrame(f),
++    caf: (id) => cancelAnimationFrame(id),
++    MO: typeof MutationObserver === "function" ? MutationObserver : null,
++    domChars: () => {
++      const n = replyNodes();
++      return n.length ? extractText(n[n.length - 1]).length : 0;
++    },
++    sseActive: () => SSE.active,
++    log: (m) => console.info(m),
++  });
++  // True when this site opted in (SITES[x].keepActive) AND the panel flag is on.
++  const keepActiveOn = () => FLAGS.keepActive !== false && SITE.keepActive === true;
++  const applyKeepActive = () => keepActive.setEnabled(keepActiveOn());
++
++  // Firefox has no MAIN-world content scripts on our minimum version: inject
++  // page-active.js with a <script> tag, like sse-observer.js. Chrome already ran it
++  // (it leaves data-noapi-pa on <html>), so this is a no-op there.
++  function injectPageActive() {
++    try {
++      if (document.documentElement.getAttribute("data-noapi-pa")) return;
++      const s = document.createElement("script");
++      s.src = ext.runtime.getURL("page-active.js");
++      s.async = false;
++      s.onload = () => { try { s.remove(); } catch {} };
++      s.onerror = () => { try { s.remove(); } catch {} };
++      (document.head || document.documentElement).appendChild(s);
++    } catch {}
++  }
++  whenFlags(() => {
++    if (SITE.keepActive === true) injectPageActive();
++    applyKeepActive();
++    // The script may have loaded just after us (Firefox): set the marker again.
++    setTimeout(applyKeepActive, 500);
++  });
++
+   // Inject/read the token only once the stored flags are known, so the
+   // "sseObserver" flag can suppress the Firefox <script> injection on load.
+   whenFlags(() => {
+@@ -906,6 +1072,7 @@
+     <label title="Click Send the moment the site enables it instead of after a fixed 150ms"><input type="checkbox" data-flag="eagerSend"> send on enable</label>
+     <label title="Use the page's own SSE stream as a completion signal (bridge NOAPI_SSE=0 also disables it)"><input type="checkbox" data-flag="sseObserver"> SSE signal</label>
+     <label title="Decode the page's SSE stream for an earlier tool-call trigger; the reply text still comes from the DOM. The bridge NOAPI_SSE_TEXT=1 flag is also required."><input type="checkbox" data-flag="sseText"> SSE text</label>
++    <label title="Keep this tab working while it is hidden: the page is told it is visible and its animation frames are driven while a prompt is in flight (page-active.js)"><input type="checkbox" data-flag="keepActive"> keep active</label>
+   </div>
+   <div class="log-box">Ready. Waiting for OpenCode…</div>
+ </div>
+@@ -936,6 +1103,7 @@
+   for (const b of flagBoxes) {
+     b.addEventListener("change", () => {
+       saveFlags({ [b.dataset.flag]: b.checked });
++      if (b.dataset.flag === "keepActive") applyKeepActive();
+       if (flagsState) flagsState.textContent = "saved";
+     });
+   }
+@@ -2194,8 +2362,10 @@
+     const t0 = Date.now();
+     const timings = { composer: 0, typed: 0, sent: 0, firstText: 0, complete: 0, stopSeen: false, earlyReturn: false };
+     timings.bgTimers = BG.isReady(); // Phase 3: true = timers run in a Worker (not throttled in background tabs)
++    let activeRun = null; // background-tab controller for this request (stopped in `finally`)
+ 
+     try {
++      activeRun = keepActive.begin({ spoof: keepActiveOn() });
+       setLog("Finding " + SITE.name + " chat input…", true);
+       if (opts.newChat) {
+         // Phase 5: a new OpenCode session can start on a fresh chat page so old
+@@ -2252,6 +2422,9 @@
+       setLog("Waiting for " + SITE.name + " to answer…", true);
+       const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, baseline, typedLen, toolsEnabled, earlyReturn, earlyReturnMs, toolNames, pipelineT0: t0, timings, sseEnabled, sseTextOn });
+       timings.complete = Date.now() - t0;
++      try {
++        activeRun?.fill(timings);
++      } catch {}
+ 
+       setLog(`✓ Response captured (${text.length} chars). Sent to OpenCode.`);
+       if (reqId) ext.runtime.sendMessage({ type: "noapi_reply", id: reqId, text, timings: { ...timings, total: Date.now() - t0 } }).catch(() => {});
+@@ -2264,6 +2437,9 @@
+       if (reqId) ext.runtime.sendMessage({ type: "noapi_error", id: reqId, error: err.message }).catch(() => {});
+       throw err;
+     } finally {
++      try {
++        activeRun?.stop();
++      } catch {}
+       state.busy = false;
+       state.reqId = null;
+       updateStatusUI();

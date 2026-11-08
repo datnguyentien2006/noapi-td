@@ -16,6 +16,20 @@ const FIREFOX = "extension/firefox/sse-observer.js";
 const chromeSrc = fs.readFileSync(CHROME, "utf8");
 const firefoxSrc = fs.readFileSync(FIREFOX, "utf8");
 
+// Lift one `@noapi-shared` block out of the observer and return the named
+// function. The block must be identical in both browser copies (the shared
+// convention), so a drift fails loudly here too.
+function loadShared(name) {
+  const re = new RegExp(
+    "\\/\\* @noapi-shared-start " + name + " \\*\\/([\\s\\S]*?)\\/\\* @noapi-shared-end " + name + " \\*\\/"
+  );
+  const c = chromeSrc.match(re);
+  const f = firefoxSrc.match(re);
+  if (!c || !f) throw new Error(`shared block "${name}" not found`);
+  if (c[1] !== f[1]) throw new Error(`shared block "${name}" differs between browsers`);
+  return new Function(c[1] + "\nreturn " + name + ";")();
+}
+
 let failed = 0;
 function ok(name, cond, extra = "") {
   if (cond) console.log("ok:", name);
@@ -190,6 +204,61 @@ const events = (posts) => posts.map((p) => p.event);
   const r = await observe(original);
   ok("observer drains only the clone, never the page's own body", cloneReads === 1 && originalReads === 0, `clone=${cloneReads} original=${originalReads}`);
   ok("clone read still reported a clean end", events(r.posts).includes("ended"), JSON.stringify(events(r.posts)));
+}
+
+// ---- sseSummary: the pure builder behind window.__noapiSseShow() -----------
+const sseSummary = loadShared("sseSummary");
+
+// empty / missing entry
+{
+  const s = sseSummary(null);
+  ok("sseSummary: no entry reports an empty capture", /no SSE response captured yet/.test(s), s);
+  ok("sseSummary: a non-object entry is treated as empty", /no SSE response captured yet/.test(sseSummary("nope")));
+}
+
+// head / middle / tail slicing (head 3000, middle 1500 from the centre, tail 1500)
+{
+  const text = "H".repeat(3000) + "M".repeat(4000) + "T".repeat(3000); // 10000 chars
+  const s = sseSummary({
+    text,
+    path: "/api/chat",
+    status: 200,
+    contentType: "text/event-stream",
+    startedAt: 1000,
+    endedAt: 2000,
+  });
+  const json = s.split("\n").filter((l) => l.startsWith('"')).map((l) => JSON.parse(l));
+  ok("sseSummary: three slices are emitted", json.length === 3, String(json.length));
+  ok("sseSummary: head is the first 3000 chars", json[0].length === 3000 && /^H+$/.test(json[0]), `len=${json[0].length}`);
+  ok("sseSummary: middle is 1500 chars from the centre", json[1].length === 1500 && /^M+$/.test(json[1]), `len=${json[1].length}`);
+  ok("sseSummary: tail is the last 1500 chars", json[2].length === 1500 && /^T+$/.test(json[2]), `len=${json[2].length}`);
+  ok(
+    "sseSummary: header carries path/status/content-type/chars",
+    s.includes("path: /api/chat") && s.includes("status: 200") && s.includes("content-type: text/event-stream") && s.includes("chars: 10000"),
+    s
+  );
+}
+
+// cap behaviour: a huge body yields capped slices but the full length is reported
+{
+  const s = sseSummary({ text: "x".repeat(500000) });
+  const json = s.split("\n").filter((l) => l.startsWith('"')).map((l) => JSON.parse(l));
+  ok("sseSummary: slices stay capped on a huge body", json[0].length === 3000 && json[1].length === 1500 && json[2].length === 1500, JSON.stringify(json.map((j) => j.length)));
+  ok("sseSummary: header reports the full captured length", s.includes("chars: 500000"), s.slice(0, 120));
+}
+
+// frame count: blank-line separated frames, including the empty body
+{
+  ok("sseSummary: counts blank-line-separated frames", sseSummary({ text: "data: a\n\ndata: b\n\ndata: c" }).includes("frames: 3"));
+  ok("sseSummary: one frame with no separator", sseSummary({ text: "oneframe" }).includes("frames: 1"));
+  ok("sseSummary: an empty body has zero frames", sseSummary({ text: "" }).includes("frames: 0"));
+}
+
+// control characters stay visible (JSON-escaped, never a real newline)
+{
+  const s = sseSummary({ text: "line1\nline2" });
+  ok("sseSummary: \\n stays visible in the slice", s.includes('"line1\\nline2"'), s);
+  ok("sseSummary: an open entry shows ended as (open)", sseSummary({ text: "a" }).includes("ended: (open)"));
 }
 
 if (failed) {

@@ -409,7 +409,7 @@ All are read by the bridge process at request time. Defaults are the shipped beh
 | `NOAPI_DUMP_PREAMBLE` | off | Set to `1` to write the exact prompt (preamble + first turn) sent to the site into `./noapi-preamble.txt` and log its length. |
 | `NOAPI_STREAM` | on | Set to `0` to stop streaming live deltas and emit the reply once at the end (the old behaviour). |
 
-Failed tool-call replies are also written to `./noapi-debug/` (one file per failure) so the real text can be inspected after the fact.
+Failed tool-call replies are also written to `./noapi-debug/` (one file per failure) so the real text can be inspected after the fact. The directory is created lazily on the first failure, keeps only the newest 20 files at up to 200 KB each, and holds the **raw reply only** — never the request prompt. A reply can still quote file contents from the conversation, so the directory is gitignored and should be treated as sensitive; delete it when you are done.
 
 </details>
 
