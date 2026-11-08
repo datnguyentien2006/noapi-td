@@ -17,6 +17,16 @@ import { autoreadReport } from "./consult.js";
 import { StreamFilter, streamEnabled } from "./streamfilter.js";
 import { tuningFromEnv, sseTextFromEnv } from "./tuning.js";
 
+// Failed tool-call replies are dumped here so the real text can be inspected
+// afterwards. The directory is created lazily (only on a real failure, never at
+// startup), holds at most 20 files, and each file is capped at 200 KB. Only the
+// raw reply is written - never the request prompt - but a reply can quote file
+// contents from the conversation, so the directory is gitignored and should be
+// treated as sensitive.
+const DEBUG_DIR = "noapi-debug";
+const DEBUG_MAX_FILES = 20;
+const DEBUG_MAX_BYTES = 200 * 1024;
+
 function readBody(req, limit = 5 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -372,13 +382,27 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
           }).then((reply) => track(repairPrompt, reply));
         // Save the raw reply of a failed tool call to ./noapi-debug so the real
         // text (length, where it is cut, escaping) can be inspected afterwards.
+        // Lazy: the directory only appears after a real failure. Each file holds
+        // the raw reply only (no request prompt), capped at DEBUG_MAX_BYTES, and
+        // only the newest DEBUG_MAX_FILES dumps are kept.
         const dumpReply = (tag, reply, issue) => {
           try {
-            const dir = nodePath.join(process.cwd(), "noapi-debug");
+            const dir = nodePath.join(process.cwd(), DEBUG_DIR);
             fs.mkdirSync(dir, { recursive: true });
             const stamp = new Date().toISOString().replace(/[:.]/g, "-");
             const file = nodePath.join(dir, `${stamp}_${tag}_${issue.reason}.txt`);
-            fs.writeFileSync(file, String(reply), "utf8");
+            let body = String(reply);
+            if (Buffer.byteLength(body, "utf8") > DEBUG_MAX_BYTES) {
+              body = Buffer.from(body, "utf8").subarray(0, DEBUG_MAX_BYTES).toString("utf8");
+            }
+            fs.writeFileSync(file, body, "utf8");
+            // Timestamped names sort chronologically, so the oldest are first.
+            const names = fs.readdirSync(dir).filter((n) => n.endsWith(".txt")).sort();
+            for (const old of names.slice(0, Math.max(0, names.length - DEBUG_MAX_FILES))) {
+              try {
+                fs.unlinkSync(nodePath.join(dir, old));
+              } catch {}
+            }
             log(`debug: saved ${String(reply).length} chars of the ${tag} reply -> ${file}`);
           } catch {}
         };

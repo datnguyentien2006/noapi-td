@@ -566,6 +566,19 @@ export class Bridge {
         entry.postToken = Math.max(0, Number(entry.complete) - Number(entry.lastToken));
       }
       if (timings.completedBy) entry.completedBy = String(timings.completedBy);
+      // Background-tab diagnostics from the content script (see content.js keepActive):
+      // visibility during the turn, how long it was hidden, DOM mutations seen,
+      // real animation frames, and page-active.js's own status.
+      if (typeof timings.vis === "string") entry.vis = timings.vis.slice(0, 12);
+      for (const k of ["hiddenMs", "mut", "raf", "domMax"]) {
+        if (Number.isFinite(Number(timings[k]))) entry[k] = Number(timings[k]);
+      }
+      if (typeof timings.pa === "string" && timings.pa) entry.pa = timings.pa.slice(0, 32);
+      if (timings.keepActive === true) entry.keepActive = true;
+      // Stream reply (content.js): the answer was decoded from the network stream.
+      if (timings.streamReply === true) entry.streamReply = true;
+      if (timings.streamHidden === true) entry.streamHidden = true;
+      if (Number.isFinite(Number(timings.streamChars))) entry.streamChars = Number(timings.streamChars);
       if (Number.isFinite(Number(timings.resubmits))) entry.resubmits = Number(timings.resubmits);
     }
     this.timings.push(entry);
@@ -593,7 +606,10 @@ export class Bridge {
         `${entry.postToken != null ? ` post-token=${entry.postToken}ms` : ""}` +
         `${entry.promptChars != null ? ` prompt=${entry.promptChars}ch` : ""}` +
         `${entry.replyChars != null ? ` reply=${entry.replyChars}ch` : ""}` +
-        `${entry.stopSeen ? " stop=yes" : ""}${entry.sseSeen ? " sse=yes" : ""}${entry.earlyReturn ? " early-return=yes" : ""}`
+        `${entry.stopSeen ? " stop=yes" : ""}${entry.sseSeen ? " sse=yes" : ""}${entry.earlyReturn ? " early-return=yes" : ""}` +
+        `${entry.vis ? ` vis=${entry.vis}` : ""}${entry.hiddenMs != null ? ` hidden=${entry.hiddenMs}ms` : ""}${entry.mut != null ? ` mut=${entry.mut}` : ""}` +
+        `${entry.raf != null ? ` raf=${entry.raf}` : ""}${entry.domMax != null ? ` dom=${entry.domMax}ch` : ""}${entry.pa ? ` pa=${entry.pa}` : ""}${entry.keepActive ? " keep-active=yes" : ""}` +
+        `${entry.streamChars != null ? ` stream=${entry.streamChars}ch${entry.streamReply ? "(used)" : ""}${entry.streamHidden ? "(tab-hidden)" : ""}` : ""}`
     );
   }
 

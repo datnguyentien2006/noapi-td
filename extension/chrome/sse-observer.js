@@ -93,6 +93,47 @@
     }
   };
 
+  // Z.ai stream parser. Written against a captured sample of
+  // /api/v2/chat/completions: every frame is one line
+  //   data: {"type":"chat:completion","data":{"delta_content":"...","phase":"thinking"|"answer"}}
+  // "thinking" frames are the model's reasoning (the page keeps them out of the
+  // reply, so do we), "answer" frames are the reply text, a "phase":"other" frame
+  // carries token usage, and the stream ends with {"phase":"done","done":true}.
+  // Returns { text, done } for a frame that matters, or null.
+  function extractZaiFrame(frame) {
+    let text = "";
+    let done = false;
+    let any = false;
+    for (const line of String(frame).split("\n")) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload) continue;
+      if (payload === "[DONE]") {
+        done = true;
+        any = true;
+        continue;
+      }
+      let obj;
+      try {
+        obj = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      const d = obj && obj.data;
+      if (!d || typeof d !== "object") continue;
+      if (d.phase === "answer" && typeof d.delta_content === "string") {
+        text += d.delta_content;
+        any = true;
+      }
+      if (d.done === true || d.phase === "done") {
+        done = true;
+        any = true;
+      }
+    }
+    return any ? { text, done } : null;
+  }
+  const IS_ZAI = /(^|\.)z\.ai$/i.test(String(location.hostname || ""));
+
   // ChatGPT stream parser placeholder. The stream format is undocumented, so the
   // parser must be written against a captured sample
   // (tools/fixtures/chatgpt-stream.txt). That sample is not present in this
@@ -101,6 +142,13 @@
   // script handling) is wired and ready for the parser.
   function extractChatGptText(_frame) {
     return null;
+  }
+
+  // One decoded SSE frame -> { text, done } or null, by site.
+  function parseFrame(frame) {
+    if (IS_ZAI) return extractZaiFrame(frame);
+    const t = extractChatGptText(frame);
+    return t ? { text: t, done: false } : null;
   }
 
   /* @noapi-shared-start sseSummary */
@@ -169,6 +217,7 @@
     };
   } catch {}
 
+  let streamSeq = 0; // numbers the streams so the content script can tell this turn's from an old one
   const origFetch = window.fetch;
   if (typeof origFetch !== "function") return;
   window.fetch = function (...args) {
@@ -179,10 +228,18 @@
       Promise.resolve(p).then(
         (res) => {
           let started = false;
+          let sid = 0; // hoisted so the outer catch can close the stream out under the same id
+          const emit = (event, extra) => post(event, { sid, ...(extra || {}) });
           try {
             const ct = res && res.headers && typeof res.headers.get === "function" ? res.headers.get("content-type") : null;
             if (!ct || !String(ct).toLowerCase().startsWith("text/event-stream")) return;
-            post("started");
+            sid = ++streamSeq;
+            let spath = "";
+            try {
+              const rawUrl = typeof args[0] === "string" ? args[0] : args[0] && args[0].url;
+              spath = new URL(String(rawUrl || ""), location.href).pathname;
+            } catch {}
+            emit("started", { path: spath });
             started = true;
             // Drain a clone in the background so we can tell when the stream
             // ends. The page keeps its own body untouched, byte for byte.
@@ -220,6 +277,15 @@
             };
             let sseBuf = "";
             let acc = "";
+            let doneSeen = false;
+            let unsent = false;
+            let lastDeltaAt = 0;
+            const flushDelta = () => {
+              if (!unsent) return;
+              unsent = false;
+              lastDeltaAt = Date.now();
+              emit("delta", { text: acc, done: doneSeen });
+            };
             if (clone && clone.body && typeof clone.body.getReader === "function") {
               const reader = clone.body.getReader();
               const pump = () =>
@@ -227,7 +293,8 @@
                   ({ done, value }) => {
                     if (done) {
                       endCapture();
-                      post("ended");
+                      if (wantText) flushDelta();
+                      emit("ended");
                       return;
                     }
                     if (decoder && value) {
@@ -238,26 +305,30 @@
                         // A decode failure must never turn into an "ended": fall
                         // back to the DOM path for the rest of the turn.
                         endCapture();
-                        post("error");
+                        emit("error");
                         return;
                       }
                       appendCapture(chunk);
                       if (wantText) {
                         try {
-                          sseBuf += chunk;
+                          sseBuf = (sseBuf + chunk).replace(/\r\n/g, "\n");
                           let idx;
                           while ((idx = sseBuf.indexOf("\n\n")) !== -1) {
                             const frame = sseBuf.slice(0, idx);
                             sseBuf = sseBuf.slice(idx + 2);
-                            const t = extractChatGptText(frame);
-                            if (t) {
-                              acc += t;
-                              post("delta", { text: acc });
+                            const r = parseFrame(frame);
+                            if (r) {
+                              if (r.text) acc += r.text;
+                              if (r.done) doneSeen = true;
+                              if (r.text || r.done) unsent = true;
                             }
                           }
+                          // Post at most every 40 ms (the text so far is cumulative),
+                          // always right away on the final frame.
+                          if (unsent && (doneSeen || Date.now() - lastDeltaAt >= 40)) flushDelta();
                         } catch {
                           endCapture();
-                          post("error");
+                          emit("error");
                           return;
                         }
                       }
@@ -270,7 +341,7 @@
                   // returning a truncated reply as "complete".
                   () => {
                     endCapture();
-                    post("error");
+                    emit("error");
                   }
                 );
               pump();
@@ -279,23 +350,23 @@
                 (body) => {
                   appendCapture(String(body));
                   endCapture();
-                  post("ended");
+                  emit("ended");
                 },
                 () => {
                   endCapture();
-                  post("error");
+                  emit("error");
                 }
               );
             } else {
               // We cannot observe when this stream ends, so never claim it did.
               endCapture();
-              post("error");
+              emit("error");
             }
           } catch {
             // Cloning or reading failed after we announced the start: close it
             // out as an error so the live-stream count does not leak (a leaked
             // count would suppress every later "ended" for the rest of the turn).
-            if (started) post("error");
+            if (started) emit("error");
           }
         },
         () => {}

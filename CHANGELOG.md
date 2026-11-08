@@ -51,6 +51,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Tool descriptions are no longer clipped uniformly: tools whose semantics are subtle (edit, write, bash, read, patch-like, or anything with an `oldString`/`newString`/`replace` parameter) keep up to 400 characters, while the rest stay short
 - The preamble is only re-sent when tool names or parameter schemas change, not when descriptions change
 - The tool-call parser is stricter: a `TOOL_CALL` block whose `arguments` string does not parse as JSON, or whose flattened keys are not all parameters of the named tool, is refused instead of being executed with empty arguments
+- `./noapi-debug/` (raw replies saved when a `TOOL_CALL` cannot be recovered) is now created lazily on the first failure, ignored by git, capped at 20 files of at most 200 KB each, and holds the raw reply only — never the request prompt. A reply can still quote file contents from the conversation, so the README says to treat the directory as sensitive
 
 ### Fixed
 
@@ -60,6 +61,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The extension background only serves a request from a tab of the requested site (no cross-site fallback), accepts `noapi-tab` ports only from the top frame, sends `hello-update` only on a real change, and tells the bridge when a closed tab leaves a site with no tab (`site-gone`)
 - The content script's busy guard reports `code: "busy"`; cancelling now wakes sleeps immediately, is checked in `waitForComposer` / `ensureTyped` / `submitComposer` / `waitForIdle`, and clears typed-but-unsent text so it cannot leak into the next request
 - Tests can no longer reach a real bridge or type into a real chat tab: each runner binds an ephemeral port (`--port=0`) and hands it to the fake tab, and refuses to use the default port at all
+- `tools/test-toolrepair.js` now matches the documented behaviour: two failed repairs end the turn with a 503 and a retry hint instead of the broken block as plain text (`NOAPI_REPAIR_FAIL=text` still restores the old way), and a request that defines **no** tools never enters the repair path at all — a reply that merely contains the word `TOOL_CALL` stays plain text, with no repair calls and no 503
 
 ## [0.1.0] - 2026-10-11
 

@@ -4,5 +4,9 @@ ab-results/
 # Prompt dump written by NOAPI_DUMP_PREAMBLE=1 (see tools/prompt-report.js)
 noapi-preamble.txt
 
+# Raw replies saved when a TOOL_CALL cannot be recovered. These can quote file
+# contents from the conversation, so they are never committed. (bridge/http.js)
+noapi-debug/
+
 # Node modules (dependencies are installed locally, never committed)
 node_modules/

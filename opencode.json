@@ -47,7 +47,7 @@
   "mcp": {
     "noapi": {
       "type": "local",
-      "command": ["node", "bridge/index.js", "--mcp"],
+      "command": ["node", "bridge/index.js", "--mcp", "--proxy-only"],
       "enabled": true,
       "timeout": 30000
     }

@@ -58,6 +58,122 @@ if (typeof importScripts === "function") importScripts("keepalive.js");
     return false;
   }
 
+  // ---- reliable outbound queue ---------------------------------------------
+  // Terminal messages (response / error / cancelled) and the newest partial of a
+  // request must survive a bridge link that is down for a moment: sendWs() returns
+  // false then, and the old code dropped the message, leaving the bridge waiting
+  // until its timeout. They are queued here and flushed, in order, as soon as the
+  // socket is open again (onopen) or the liveness tick runs. The bridge keys
+  // response/partial/error by request id, not by connection, so a message that
+  // arrives on the new socket is accepted, and one for an id it no longer waits on
+  // is ignored (so a resend is harmless). Terminal items are also kept in
+  // chrome.storage.session, so they outlive a service-worker restart.
+  const OUTBOX_MAX = 200;
+  const OUTBOX_TTL = 11 * 60 * 1000; // the bridge never waits longer than 10 minutes
+  const outbox = []; // { msg, at }
+  const isTerminal = (m) => m.t === "response" || m.t === "error" || m.t === "cancelled";
+  function sendReliable(obj) {
+    if (!outbox.length && sendWs(obj)) return true;
+    if (obj.id) {
+      // Only the newest partial of a request is worth keeping, and a terminal
+      // message supersedes every partial of that request.
+      for (let i = outbox.length - 1; i >= 0; i--) {
+        if (outbox[i].msg.t === "partial" && outbox[i].msg.id === obj.id) outbox.splice(i, 1);
+      }
+    }
+    outbox.push({ msg: obj, at: Date.now() });
+    while (outbox.length > OUTBOX_MAX) {
+      const i = outbox.findIndex((o) => o.msg.t === "partial");
+      outbox.splice(i >= 0 ? i : 0, 1);
+    }
+    log(`bridge link down: queued ${obj.t} ${obj.id || ""} (${outbox.length} waiting)`);
+    persistOutbox();
+    return false;
+  }
+  function flushOutbox() {
+    let sent = 0;
+    const now = Date.now();
+    while (outbox.length) {
+      const item = outbox[0];
+      if (now - item.at > OUTBOX_TTL) {
+        outbox.shift();
+        continue;
+      }
+      if (!sendWs(item.msg)) break;
+      outbox.shift();
+      sent++;
+    }
+    if (sent) {
+      log(`flushed ${sent} queued message(s) to the bridge (${outbox.length} left)`);
+      persistOutbox();
+    }
+  }
+  const sessionStore = () => {
+    try {
+      return ext.storage?.session || null;
+    } catch {
+      return null;
+    }
+  };
+  function persistOutbox() {
+    try {
+      sessionStore()?.set?.({ noapi_outbox: outbox.filter((o) => isTerminal(o.msg)) })?.catch?.(() => {});
+    } catch {}
+  }
+  // Pending ids and known tabs also live only in RAM, so a restarted worker would
+  // forget which tab runs what and answer "No open tab" until every tab reconnects.
+  let persistTimer = null;
+  function persistState() {
+    if (persistTimer) return;
+    persistTimer = setTimeout(() => {
+      persistTimer = null;
+      try {
+        const tabs = [...state.tabs].filter(([, i]) => i.site).map(([id, i]) => [id, { site: i.site, url: i.url }]);
+        sessionStore()?.set?.({ noapi_tabs: tabs, noapi_pending: [...state.pending] })?.catch?.(() => {});
+      } catch {}
+    }, 200);
+  }
+  async function restoreState() {
+    const store = sessionStore();
+    if (!store?.get) return;
+    let saved;
+    try {
+      saved = await store.get(["noapi_outbox", "noapi_tabs", "noapi_pending"]);
+    } catch {
+      return;
+    }
+    const alive = async (tabId) => {
+      try {
+        return Boolean(await ext.tabs.get(tabId));
+      } catch {
+        return false;
+      }
+    };
+    // Tabs: a port that already connected wins; fill in what it did not tell us.
+    for (const [tabId, info] of saved.noapi_tabs || []) {
+      if (!(await alive(tabId))) continue;
+      const cur = state.tabs.get(tabId) || {};
+      if (!cur.site) {
+        cur.site = info.site;
+        cur.url = info.url;
+        state.tabs.set(tabId, cur);
+      }
+    }
+    for (const [id, tabId] of saved.noapi_pending || []) {
+      if (state.pending.has(id)) continue;
+      if (await alive(tabId)) state.pending.set(id, tabId);
+      else outbox.push({ msg: { t: "error", id, error: "The AI site tab was closed by the user." }, at: Date.now() });
+    }
+    for (const o of saved.noapi_outbox || []) {
+      if (o && o.msg && !outbox.some((x) => x.msg.t === o.msg.t && x.msg.id === o.msg.id)) outbox.push(o);
+    }
+    if (state.tabs.size || state.pending.size || outbox.length) {
+      log(`restored after worker restart: ${state.tabs.size} tab(s), ${state.pending.size} pending, ${outbox.length} queued`);
+    }
+    updateAction();
+    flushOutbox();
+  }
+
   function broadcastToTabs(msg) {
     for (const [tabId, info] of state.tabs) {
       try {
@@ -171,6 +287,7 @@ if (typeof importScripts === "function") importScripts("keepalive.js");
 
       updateAction();
       broadcastToTabs({ type: "noapi_bridge_status", connected: true });
+      flushOutbox();
 
       // Heartbeat + ping: keeps the MV3 worker alive AND proves the bridge is
       // still there (it answers ping with pong; see livenessTick).
@@ -221,6 +338,7 @@ if (typeof importScripts === "function") importScripts("keepalive.js");
     }
     sendWs({ t: "heartbeat" });
     sendWs({ t: "ping" });
+    flushOutbox();
   }
 
   // Manual "Reconnect" (the panel button). Tears down the current socket,
@@ -429,6 +547,7 @@ if (typeof importScripts === "function") importScripts("keepalive.js");
           entry.site = msg.site;
           entry.url = msg.url;
           state.tabs.set(tabId, entry);
+          if (changed) persistState();
 
           if (state.connected && changed) {
             sendWs({ t: "hello-update", site: msg.site, url: msg.url });
@@ -462,7 +581,7 @@ if (typeof importScripts === "function") importScripts("keepalive.js");
       }
 
       case "noapi_partial": {
-        if (msg.id && typeof msg.text === "string") sendWs({ t: "partial", id: msg.id, text: msg.text });
+        if (msg.id && typeof msg.text === "string") sendReliable({ t: "partial", id: msg.id, text: msg.text });
         sendResponse?.({ ok: true });
         break;
       }
@@ -474,11 +593,11 @@ if (typeof importScripts === "function") importScripts("keepalive.js");
             // The tab finished a cancelled request anyway; acknowledge the stop
             // instead of forwarding a reply the caller already gave up on.
             state.cancelling.delete(msg.id);
-            sendWs({ t: "cancelled", id: msg.id });
+            sendReliable({ t: "cancelled", id: msg.id });
             updateAction();
             break;
           }
-          sendWs({ t: "response", id: msg.id, text: msg.text, timings: msg.timings || null });
+          sendReliable({ t: "response", id: msg.id, text: msg.text, timings: msg.timings || null });
           log(`replied to bridge for request ${msg.id}`);
           updateAction();
         }
@@ -491,12 +610,12 @@ if (typeof importScripts === "function") importScripts("keepalive.js");
           state.pending.delete(msg.id);
           if (state.cancelling.has(msg.id)) {
             state.cancelling.delete(msg.id);
-            sendWs({ t: "cancelled", id: msg.id });
+            sendReliable({ t: "cancelled", id: msg.id });
             log(`request ${msg.id} confirmed cancelled by the tab`);
             updateAction();
             break;
           }
-          sendWs({ t: "error", id: msg.id, error: msg.error, code: msg.code });
+          sendReliable({ t: "error", id: msg.id, error: msg.error, code: msg.code });
           log(`error for request ${msg.id}: ${msg.error}`);
           updateAction();
         }
@@ -518,13 +637,13 @@ if (typeof importScripts === "function") importScripts("keepalive.js");
     for (const [id, tid] of state.cancelling) {
       if (tid === tabId) {
         state.cancelling.delete(id);
-        sendWs({ t: "cancelled", id });
+        sendReliable({ t: "cancelled", id });
       }
     }
     for (const [id, tid] of state.pending) {
       if (tid === tabId) {
         state.pending.delete(id);
-        sendWs({ t: "error", id, error: "The AI site tab was closed by the user." });
+        sendReliable({ t: "error", id, error: "The AI site tab was closed by the user." });
       }
     }
     // If no tab serves that site any more, tell the bridge so it stops
@@ -544,6 +663,7 @@ if (typeof importScripts === "function") importScripts("keepalive.js");
   } catch {}
 
   function updateAction() {
+    persistState();
     try {
       const n = state.pending.size;
       ext.action?.setBadgeText?.({ text: n ? String(n) : "" });
@@ -561,6 +681,11 @@ if (typeof importScripts === "function") importScripts("keepalive.js");
       const stored = await ext.storage.local.get(["noapi_url"]);
       if (stored.noapi_url) state.url = String(stored.noapi_url);
     } catch {}
+    try {
+      await restoreState();
+    } catch (e) {
+      log("restore failed", e);
+    }
     connect();
   })();
 })();
