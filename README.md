@@ -103,7 +103,7 @@ Plain Node.js 18+, no `npm install`, no build step. Everything stays on `127.0.0
 
 You need to be logged in, and the site has to be open in a tab. If you open several, each one can serve its own model.
 
-> 🆕 **Z.ai (`noapi/zai`)** is supported here. The page renders every code block with a CodeMirror editor instead of `<pre>`, so the extension re-emits those blocks as fenced code (that is what keeps tool calls working) and skips the collapsed *Thought Process* panel so reasoning never leaks into the reply. Its square stop control has no `id`/`aria-label`, so it is matched by class rather than `:has()` — which keeps Firefox 115 working too.
+> 🆕 **Z.ai (`noapi/zai`)** is supported here. The page renders every code block with a CodeMirror editor instead of `<pre>`, so the extension re-emits those blocks as fenced code (that is what keeps tool calls working) and skips the collapsed *Thought Process* panel so reasoning never leaks into the reply. Its square stop control has no `id`/`aria-label`, so it is matched by class rather than `:has()` — which keeps Firefox 115 working too. It is also the first site with background-tab support: **keep active** and **stream reply** let it answer while its tab is hidden (see [keeping the tabs alive](#keeping-the-tabs-alive)).
 
 <br>
 
@@ -272,7 +272,8 @@ A long reply can stop mid-block. If the block is *truncated* (the reply does not
 - 🔁 The extension reconnects on its own with exponential backoff, proves the link is alive with a ping/pong, and abandons a socket that stalls mid-handshake.
 - 🏷️ OpenCode's session title requests are answered locally, so they do not clutter your real chat.
 - 🖥️ The **Reconnect** button in the `?` panel reports the real outcome instead of guessing.
-- 🌙 While an AI tab is open, the extension asks the browser not to discard the tab and (optionally) keeps the computer awake; timers run in a background Worker so a hidden tab still types and polls at full speed.
+- 🌙 While an AI tab is open, the extension asks the browser not to discard the tab and (optionally) keeps the computer awake; timers run in a background Worker so a hidden tab still types and polls at full speed. Chrome also ships hidden-tab support for sites that pause when the tab is hidden (see [keeping the tabs alive](#keeping-the-tabs-alive)).
+- 📬 A reply or error produced while the bridge link is down is queued and delivered, in order, once the socket is back (only the newest partial of a request is kept), and the queue survives a service-worker restart.
 
 <br>
 
@@ -333,6 +334,7 @@ node bridge/index.js [--mcp] [--port=8787] [--host=127.0.0.1]
 | `--port=8788` | Use another port. Update `baseURL` in your config to match. |
 | `--host=...` | Bind address. Keep it on `127.0.0.1` unless you know why you are changing it. |
 | `--mcp` | Also expose the MCP server on stdio. If the port is already taken by a running bridge, it switches to proxy mode and forwards to it. |
+| `--proxy-only` | With `--mcp`: never bind the port, only forward to the bridge already running on it (also `NOAPI_MCP_PROXY_ONLY=1`). This is what the shipped `opencode.json` uses, so the helper process OpenCode starts can never grab 8787 and make `npm start` fail with `EADDRINUSE`. |
 
 | Endpoint | Purpose |
 |---|---|
@@ -342,6 +344,8 @@ node bridge/index.js [--mcp] [--port=8787] [--host=127.0.0.1]
 | `POST /v1/chat/completions` | OpenAI compatible chat, streaming and non streaming |
 
 The bridge treats `Ctrl+C` as "close the sockets and exit"; a second press more than a second later forces the exit. Without that the extension kept its socket open and stayed "connected" to a bridge that had already gone.
+
+`npm start` also runs `node tools/free-port.js` first (Windows only). Windows keeps a port busy while a dead server's accepted sockets linger, so if an old bridge process still holds it, that one process is stopped (matched by its command line); a listener that is not this bridge is reported and left alone.
 
 </details>
 
@@ -356,6 +360,8 @@ Every latency fast path can be turned off to compare a run with it on against a 
 | `eagerSend` | extension storage (panel) | on | Click Send the moment the site enables it instead of after a fixed 150ms. Off = the old fixed settle. |
 | `sseObserver` | extension storage (panel) | on | Use the page's own SSE stream as a completion signal. Off = the DOM-only completion path. |
 | `sseText` | extension storage (panel) | off | **Experimental.** Let the SSE observer decode the page's stream for an even earlier tool-call trigger. The reply text still comes from the DOM. Also needs `NOAPI_SSE_TEXT=1` on the bridge (the two are ANDed). |
+| `keepActive` | extension storage (panel) | on | Keep an AI tab working while it is hidden: the page is told it is visible, and if it is really hidden its animation frames are driven by a Worker while a prompt is in flight (`page-active.js`). Only sites that opt in today (Z.ai) are affected. Off = the old Worker-timer behaviour. |
+| `streamReply` | extension storage (panel) | on | **Z.ai only.** Read the answer from the page's own network stream (decoded by `sse-observer.js`) so a hidden tab, whose page stops painting, still answers. The DOM stays authoritative while the tab is visible. |
 | `NOAPI_SSE` | env (bridge) | on | Set to `0` to stop using the page's SSE stream for this bridge. The panel flag and this env var are ANDed. |
 | `NOAPI_EARLY_RETURN` | env (bridge) | on | Set to `0` to disable the early return on a complete `TOOL_CALL` block **and** the stop click; the turn then falls back to normal completion detection. |
 | `NOAPI_EARLY_RETURN_MS` | env (bridge) | `400` | Grace window after the last reply text before an early return is allowed. Clamped to 50–5000. |
@@ -450,6 +456,20 @@ Only one fresh chat is opened per session (the first request); later turns in th
 3. Wakes the background worker every 30 s with an alarm, so it and the bridge connection stay alive.
 
 The content script also moves its timers into a dedicated Worker, because a hidden tab's `setTimeout` is throttled to roughly once a second and then to once a minute. The `?` panel's status and each reply's timing report `[NOAPI] timers run in a background Worker: true` when this is active; if a page's CSP blocks the Worker, everything falls back to the ordinary timers.
+
+#### A hidden tab is not a stopped tab
+
+Most sites keep answering in a background tab, but a few react to the browser's "this tab is hidden" signal by pausing their stream rendering: `requestAnimationFrame` never fires, so the reply text never reaches the DOM and the content script — which reads the reply from the DOM — waits until you come back.
+
+Z.ai opts in (`SITES.zai.keepActive`). `extension/chrome/page-active.js` runs in the page's MAIN world and, **only while a request is in flight**, tells the page it is visible (`visibilityState`, `hidden`, `hasFocus`), swallows `visibilitychange` / `blur` / `pagehide`, and — if the tab is really hidden — drives its animation frames from a Worker (about every 16 ms). It never focuses, reloads or switches tabs, and undoes everything when the turn ends; a stuck marker is dropped after 12 minutes. The **keep active** flag in the `?` panel switches it off.
+
+The content script also holds a **Web Lock** for the length of a turn and samples the page once a second, so a hidden-tab stall is visible in the log: while hidden it prints `[noapi] hidden: dom=.. sse_active=.. mutations=.. raf=..`, and every reply's timings carry `vis`, `hiddenMs`, `mut`, `raf`, `domMax`, `pa` and `keepActive`.
+
+For Z.ai there is a second line of defence, **stream reply**: the same stream that the experimental `sseText` flag decodes can become the answer text itself when the tab is hidden (the DOM stays the authority while the tab is visible). It is on by default for Z.ai and has its own panel flag.
+
+#### A dedicated browser window
+
+`start-noapi-browser.bat` (Windows) starts a **separate Brave profile** with the extension loaded and the flags that throttle background work turned off, opening one window per site. A background *tab* is still hidden — that is exactly what **keep active** and **stream reply** are for — so the launcher opens each site in its own window instead. Your normal browser is untouched; log in to each site once in the `noapi-brave` profile. Choose the sites with the `SITES` line at the top of the file.
 
 ### Running an A/B comparison
 
@@ -628,6 +648,7 @@ The hub refuses to start inside itself (`NOAPI_HUB_CHILD` is set for every child
 | **"The model refused to use tools ... even after 2 corrections"** | The site's own system prompt is winning. Open a NEW chat on that site, switch off its built-in tools (code execution / uploads), then send *"continue"*. Or try `NOAPI_SEED_TREE=1` so the model sees real paths. |
 | **"TOOL_CALL ... could not be parsed ... even after auto-repair"** | The model produced unrecoverable JSON three times. Send *"continue"*; if it repeats, switch to a stronger model. Raw replies are in `./noapi-debug/`. |
 | **Stuck at "Waiting for ... to answer"** | The site may have changed its layout. Open the `?` panel and read the last status line. The stall message includes a short technical summary you can paste into an issue. |
+| **A background tab never answers (Z.ai)** | Turn on **keep active** (and **stream reply**) in the `?` panel, or keep the tab visible. `start-noapi-browser.bat` opens each site in its own window so it is never a hidden background tab. |
 | **"Waiting for the browser extension to connect"** | The bridge started before the extension reconnected. It waits ~15 s; reload the tab if it persists. |
 | **The prompt gets typed but never sent** | The extension retries a few times on its own. If it keeps failing, the send button selector for that site probably needs an update. |
 | **It worked yesterday, today it does not** | Sites change their pages. See [Limitations](#-honest-limitations) and [Adding or fixing a site](#-adding-or-fixing-a-site). |
@@ -654,6 +675,16 @@ node tools/test-guard.js        # refusal detection, the preamble override, the 
 node tools/test-guard-e2e.js    # guard + rotation end to end through the bridge
 node tools/test-background.mjs  # reconnect backoff, liveness, the Reconnect button
 node tools/test-mcp-hub.mjs     # MCP hub self-detection and recursion guard
+node tools/test-page-active.js  # the MAIN-world visibility spoof + animation-frame driver
+node tools/test-keepactive.js   # the keepActive controller lifted out of content.js
+node tools/test-background-outbox.js  # the outbound queue + worker-restart recovery
+```
+
+`tools/test-stream-reply.mjs` is a manual runner for the Z.ai stream-reply path; run it from
+`extension/chrome` so it can find the two files, or pass their paths:
+
+```bash
+node ../tools/test-stream-reply.mjs sse-observer.js content.js
 ```
 
 ```bash
@@ -687,13 +718,15 @@ NOAPI/
 │   └── ws.js / wsclient.js Minimal WebSocket server and client
 ├── extension/
 │   ├── chrome/             Manifest V3 extension
-│   │   ├── background.js   Connection, routing, reconnect watchdog
-│   │   ├── content.js      Page logic: type, send, read, tool calls
+│   │   ├── background.js   Connection, routing, reconnect watchdog, outbound queue
+│   │   ├── content.js      Page logic: type, send, read, tool calls, keepActive
 │   │   ├── keepalive.js    Never-discard tabs, keep-awake, alarms
-│   │   └── sse-observer.js MAIN-world stream observer
+│   │   ├── sse-observer.js MAIN-world stream observer
+│   │   └── page-active.js  MAIN-world hidden-tab support (visibility + frame driver)
 │   └── firefox/            Same site logic and selectors, Firefox manifest
 ├── tools/
 │   ├── install-global.js   Register NOAPI? in your global OpenCode config
+│   ├── free-port.js        Stop a stale bridge holding the port before `npm start`
 │   ├── fake-extension.js   Fake browser tab for tests
 │   ├── bench-latency.js    Round-trip latency benchmark
 │   ├── test-all.js         End to end tests
@@ -705,11 +738,16 @@ NOAPI/
 │   ├── test-guard.js       Refusal guard and its wiring
 │   ├── test-guard-e2e.js   Guard + rotation through a real bridge
 │   ├── test-background.mjs The extension connection manager
+│   ├── test-background-outbox.js  The outbound queue and worker-restart recovery
 │   ├── test-mcp-hub.mjs    MCP hub self-detection
+│   ├── test-page-active.js The hidden-tab visibility spoof and frame driver
+│   ├── test-keepactive.js  The keepActive controller from content.js
+│   ├── test-stream-reply.mjs  Manual runner for the Z.ai stream-reply path
 │   ├── test-isolation.js   Tests never touch the default port
 │   ├── test-site-wiring.js A new site is registered everywhere
 │   ├── test-consult.js     Consult mode unit + MCP integration tests
 │   └── test-tools.js       Tool call round trip
+├── start-noapi-browser.bat Windows launcher: dedicated browser profile for the extension
 ├── opencode.json           Project level OpenCode config
 └── AGENTS.md               Instructions for a non-NOAPI primary model
 ```
@@ -741,7 +779,7 @@ I would rather tell you now than have you find out later.
 - **Speed.** You are driving a real web page, so replies take as long as the website takes, plus a little overhead. The bridge streams the answer as it is written and returns finished tool calls immediately, but the site's own model time cannot be removed.
 - **Tool quality varies by model.** Tool use works through a text format the model has to follow, including raw blocks for large text. Strong models do it reliably, weaker ones occasionally slip; the guard and repair loops recover the common cases, but a weak model can still refuse or emit unrecoverable JSON.
 - **One conversation per site tab.** The website keeps the history, so a very long session may hit that site's own limits. The bridge rotates to a fresh chat with a recap before that happens, but rotation loses whatever detail did not fit in the recap.
-- **The Chrome build is the most hardened.** Background-proof timers, tab keep-awake and the reconnect watchdog currently ship in `extension/chrome`; Firefox runs the same site logic and selectors, with the standard timers.
+- **The Chrome build is the most hardened.** Background-proof timers, tab keep-awake, the reconnect watchdog, the reliable outbound queue, hidden-tab support (`page-active.js`) and Z.ai's stream reply currently ship in `extension/chrome`; Firefox runs the same site logic and selectors, with the standard timers.
 - **Free plans have limits too.** The websites still apply their own message caps and rules.
 - **Terms of service.** Automating a website may go against that site's terms. This project is meant for personal use with your own account. You are responsible for how you use it, and it is not affiliated with OpenAI, Anthropic, Google, DeepSeek, Perplexity, xAI, Mistral, Z.ai or OpenCode.
 
@@ -752,7 +790,7 @@ I would rather tell you now than have you find out later.
 - 🏠 The bridge listens on `127.0.0.1` only. Nothing is exposed to your network.
 - 🚫 No analytics, no tracking, no external servers.
 - 🍪 The extension never reads or stores your passwords or cookies. It only types into and reads from the chat page you already opened.
-- 🔒 To tell when an answer is finished, a small observer watches the page's *own* network calls. By default it never reads the response body — it only notes when the site's stream starts and ends. Only if you opt in to the experimental `sseText` flag (and `NOAPI_SSE_TEXT=1`) does it decode the stream inside your browser to notice a tool call slightly earlier. That text never leaves your machine, and the reply that is returned still comes from the page itself.
+- 🔒 To tell when an answer is finished, a small observer watches the page's *own* network calls. By default it never reads the response body — it only notes when the site's stream starts and ends. Two opt-in paths do read it, both inside your browser: Z.ai's **stream reply** (on by default for Z.ai, panel flag) uses the decoded stream as the reply text when the tab is hidden, and the experimental `sseText` flag (plus `NOAPI_SSE_TEXT=1`) decodes it to notice a tool call slightly earlier. That text never leaves your machine, and while the tab is visible the reply still comes from the page itself.
 - 📂 By default **nothing** from your disk is sent to a site for you. `consult` sends only the files you explicitly name; `NOAPI_SEED_TREE=1` sends the *names* (not contents) of files in the working directory; `NOAPI_AUTOREAD=1` sends the contents of files named in the latest user message. All three are opt-in or explicitly driven.
 - 👀 It is plain JavaScript with no build step, so what you read is what runs.
 
