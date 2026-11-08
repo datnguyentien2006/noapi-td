@@ -1,0 +1,4 @@
+```
+TOOL_CALL
+{"name":"bash","command":"mkdir broken","bogus":1}
+```
