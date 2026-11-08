@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 import { WsClient } from "./wsclient.js";
 import { buildConsultPrompt, parseEditBlocks, validateEditBlocks, validationReport } from "./consult.js";
 
@@ -162,10 +163,13 @@ async function initializeAndCollectTools(proc, name) {
     let collectingTools = false;
     let allTools = [];
 
+    let buf = "";
     proc.stdout.on("data", (data) => {
-      const lines = data.toString().split("\n");
-      for (const line of lines) {
-        line = line.trim();
+      buf += data.toString();
+      const lines = buf.split("\n");
+      buf = lines.pop(); // keep a trailing partial line for the next chunk
+      for (const raw of lines) {
+        const line = raw.trim();
         if (!line) continue;
         let msg;
         try {
@@ -175,6 +179,7 @@ async function initializeAndCollectTools(proc, name) {
         }
         if (msg.id === "init" && msg.result) {
           initialized = true;
+          send({ jsonrpc: "2.0", method: "notifications/initialized" });
           if (!collectingTools) {
             collectingTools = true;
             send({ jsonrpc: "2.0", id: "tools-" + Date.now(), method: "tools/list", params: {} });
@@ -225,7 +230,7 @@ function spawnExternalServer(entry, log) {
     });
 
     // Send initialize handshake
-    proc.stdin.write(JSON.stringify({ id: "init", method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {} } }) + "\n");
+    proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: "init", method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "noapi", version: "0.1.0" } } }) + "\n");
     
     return proc;
   } catch (err) {
@@ -235,6 +240,13 @@ function spawnExternalServer(entry, log) {
 }
 
 async function loadExternalServers(log) {
+  // A hub never starts inside a hub (that is how a server that lists itself
+  // would fork-bomb), and NOAPI_HUB=0 turns the feature off.
+  if (process.env.NOAPI_HUB_CHILD) return;
+  if (process.env.NOAPI_HUB === "0") {
+    log("[mcp-hub] disabled (NOAPI_HUB=0)");
+    return;
+  }
   const configPath = findOpencodeConfig();
   if (!configPath) {
     log("[mcp-hub] no opencode config found");
@@ -282,7 +294,18 @@ function findOpencodeConfig() {
   return null;
 }
 
-function loadMcpConfig(configPath) {
+// Is this config entry NOAPI? itself? The old test (`command.includes("bridge/index.js")`)
+// compared an ARRAY element to a string and never matched a Windows path such as
+// C:\\NOAPI\\bridge\\index.js, so only the exact name "noapi" was skipped; any other
+// entry that starts this bridge would be spawned again, by every instance.
+export function isSelfEntry(name, entry) {
+  if (String(name).toLowerCase().startsWith("noapi")) return true;
+  const here = fileURLToPath(import.meta.url).replace(/\\/g, "/").toLowerCase().replace(/mcp\.js$/, "index.js");
+  const parts = [].concat(entry?.command || [], entry?.args || []).map((p) => String(p).replace(/\\/g, "/").toLowerCase());
+  return parts.some((p) => p.includes(here) || p.includes("/bridge/index.js"));
+}
+
+export function loadMcpConfig(configPath) {
   try {
     const raw = fs.readFileSync(configPath, "utf-8");
     const parsed = JSON.parse(raw);
@@ -290,12 +313,18 @@ function loadMcpConfig(configPath) {
     const result = [];
     for (const [name, entry] of Object.entries(servers)) {
       if (!entry || !entry.command) continue;
-      if (name === "noapi" || (entry.command && entry.command.includes("bridge/index.js"))) continue;
+      if (entry.enabled === false) continue;
+      if (isSelfEntry(name, entry)) continue;
       result.push({
         name,
         command: Array.isArray(entry.command) ? entry.command[0] : entry.command,
         args: Array.isArray(entry.command) ? entry.command.slice(1) : (entry.args || []),
-        env: { ...process.env, ...(entry.env || {}) },
+        env: {
+          ...process.env,
+          ...(entry.env || {}),
+          ...(entry.environment || {}),
+          NOAPI_HUB_CHILD: "1",
+        },
         cwd: entry.cwd || undefined,
       });
     }
@@ -439,25 +468,60 @@ export class ProxyGateway {
   constructor(url, { log = () => {} } = {}) {
     this.url = url;
     this.log = log;
-    this.ws = null;
+    this.ws = null; // the ONE client: connecting or open
     this.connected = false;
     this.pending = new Map();
     this.seq = 0;
-    this._reconnectDelay = 500;
+    this._gen = 0; // id of the current client; events of older clients are ignored
+    this._attempt = 0; // failed attempts since the last good connection
+    this._timer = null; // the ONE pending retry timer
     this._stop = false;
   }
 
+  // Rules (each was a bug): at most one client and one retry timer exist; an
+  // error and a close for the same client count once (some engines emit both);
+  // the hello goes out on the client that opened, not on whatever `this.ws` is
+  // now; retries back off exponentially for connect errors too.
   _connect() {
-    this.ws = new WsClient(this.url, {
+    if (this._stop) return;
+    if (this._timer) {
+      clearTimeout(this._timer);
+      this._timer = null;
+    }
+    if (this.ws) return; // an attempt is already connecting or open
+    const gen = ++this._gen;
+    let client = null;
+    const fail = (why) => {
+      if (gen !== this._gen) return; // stale or duplicate event
+      this._gen++;
+      const c = client || this.ws;
+      this.ws = null;
+      try {
+        c?.close();
+      } catch {}
+      const wasConnected = this.connected;
+      this.connected = false;
+      for (const p of this.pending.values()) {
+        clearTimeout(p.timer);
+        p.reject(new Error("Lost connection to the running bridge."));
+      }
+      this.pending.clear();
+      if (this._stop) return;
+      this.log(wasConnected ? "proxy: bridge connection dropped, will retry" : `proxy: cannot reach bridge at ${this.url} (${why}); retrying`);
+      this._retry();
+    };
+    client = new WsClient(this.url, {
       onOpen: () => {
+        if (gen !== this._gen) return;
         this.connected = true;
-        this._reconnectDelay = 500;
+        this._attempt = 0;
         this.log(`proxy: connected to running bridge at ${this.url}`);
         try {
-          this.ws.send({ t: "hello", client: "noapi-mcp-proxy" });
+          client.send({ t: "hello", client: "noapi-mcp-proxy", pid: process.pid });
         } catch {}
       },
       onMessage: (text) => {
+        if (gen !== this._gen) return;
         let m;
         try {
           m = JSON.parse(text);
@@ -478,33 +542,35 @@ export class ProxyGateway {
           else p.resolve(m.data);
         }
       },
-      onClose: () => {
-        this.connected = false;
-        for (const p of this.pending.values()) {
-          clearTimeout(p.timer);
-          p.reject(new Error("Lost connection to the running bridge."));
-        }
-        this.pending.clear();
-        if (!this._stop) {
-          this.log("proxy: bridge connection dropped, will retry");
-          setTimeout(() => this._connect(), this._reconnectDelay);
-          this._reconnectDelay = Math.min(this._reconnectDelay * 2, 15_000);
-        }
-      },
-      onConnectError: (err) => {
-        if (!this._stop) {
-          this.log(`proxy: cannot reach bridge at ${this.url} (${err.message}); retrying`);
-          setTimeout(() => this._connect(), this._reconnectDelay);
-        }
-      },
+      onClose: () => fail("closed"),
+      onConnectError: (err) => fail(err?.message || "error"),
     });
+    this.ws = client;
+    // A socket that stays CONNECTING (accepted but no handshake) is abandoned.
+    setTimeout(() => {
+      if (gen === this._gen && !this.connected) fail("connect timeout");
+    }, 10_000).unref?.();
+  }
+
+  _retry() {
+    if (this._timer || this._stop) return;
+    const base = Math.min(15_000, 500 * 2 ** this._attempt);
+    this._attempt++;
+    this._timer = setTimeout(() => {
+      this._timer = null;
+      this._connect();
+    }, Math.round(base * (0.8 + Math.random() * 0.4)));
   }
 
   stop() {
     this._stop = true;
+    clearTimeout(this._timer);
+    this._timer = null;
+    this._gen++;
     try {
       this.ws?.close();
     } catch {}
+    this.ws = null;
   }
 
   _call(payload, timeoutMs) {
@@ -517,6 +583,7 @@ export class ProxyGateway {
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       try {
+        if (!this.connected) throw new Error("not connected");
         this.ws.send(payload);
       } catch (err) {
         this.pending.delete(id);

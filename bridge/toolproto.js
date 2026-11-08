@@ -13,6 +13,7 @@
 // prompt, and (3) parses TOOL_CALL blocks out of the reply and converts them
 // into real OpenAI `tool_calls` so OpenCode executes them.
 import crypto from "node:crypto";
+import { guardEnabled, remindEnabled, overrideLines, workedExample, REMINDER } from "./guard.js";
 
 const DEFAULT_MAX_TOOL_RESULT = 16_000;
 // Descriptions are clipped, but not uniformly: tools whose semantics are subtle
@@ -196,6 +197,28 @@ function exampleArgs(f) {
   return out;
 }
 
+// Phase 1: a call whose big text argument travels in a RAW BLOCK instead of
+// being escaped inside the JSON. Prefers a `write`-like tool.
+const RAW_ARG_HINT = ["content", "contents", "text", "newString", "new_string", "command", "code"];
+function rawExample(fns) {
+  const ordered = [...fns].sort((a, b) => Number(/^write$/i.test(b.name)) - Number(/^write$/i.test(a.name)));
+  for (const f of ordered) {
+    const props = f.parameters?.properties || {};
+    const req = f.parameters?.required || [];
+    const key = RAW_ARG_HINT.find((k) => props[k] && props[k].type === "string" && req.includes(k));
+    if (!key) continue;
+    const args = {};
+    for (const k of req.filter((x) => x !== key).slice(0, 2)) args[k] = `<${k}>`;
+    const block =
+      "```\nTOOL_CALL\n" +
+      JSON.stringify({ name: f.name, arguments: args }) +
+      `\n<<<${key}\n<the text exactly as it must appear>\n${key}>>>\n` +
+      "```";
+    return { tool: f.name, key, block };
+  }
+  return null;
+}
+
 function exampleBlock(f) {
   return "```\nTOOL_CALL\n" + JSON.stringify({ name: f.name, arguments: exampleArgs(f) }) + "\n```";
 }
@@ -237,10 +260,29 @@ export function renderPreambleParts(tools, messages, { terse = terseEnabled(), d
       "8. Keep the final answer terse: state the result and stop. No preamble, no restating the request, no offers of further help."
     );
   }
+  // Phase 1: raw blocks for large text, small calls, edit instead of rewrite.
+  const hasEdit = fns.some((f) => /^(edit|patch|replace)/i.test(f.name));
+  const rawEx = rawExample(fns);
+  const addRule = (t) => rules.push(`${rules.length + 1}. ${t}`);
+  if (rawEx) {
+    addRule("Never put multi-line text (file content, edit text, a long command) inside the JSON. Use a RAW BLOCK right after the JSON line, as shown under LARGE TEXT.");
+    addRule(
+      hasEdit
+        ? "Keep every call small: at most about 150 lines of raw text. For a bigger file, write the first part ending with a line like '# CONTINUE HERE', then add each next part with a separate edit call that replaces that marker line with the next part plus the marker."
+        : "Keep every call small: at most about 150 lines of raw text. For a bigger file, split it into several smaller files or several calls."
+    );
+  }
+  if (hasEdit) {
+    addRule("To change an existing file use the edit tool with a small, unique old text and the new text. Do not rewrite a whole existing file with write.");
+  }
+  if (hints.some((h) => /^Platform:.*win/i.test(h))) {
+    addRule("The platform is Windows: inside the JSON write paths with forward slashes (C:/dir/file.py) or doubled backslashes (C:\\\\dir\\\\file.py), never single backslashes.");
+  }
   const beforeTools = [
     "You are being used as the brain of OpenCode, a coding agent that runs on the user's computer.",
     "You cannot run anything yourself in this chat, BUT the agent can run tools for you: when you need to act (create files or folders, run commands, read or edit files, search...), request a tool call using the exact format below. Never say that you are unable to access the computer or the file system - request the tool instead.",
     "",
+    ...(guardEnabled() ? overrideLines() : []),
     "FORMAT - to call a tool, output a fenced code block whose first line is TOOL_CALL, followed by one JSON object:",
     "```",
     "TOOL_CALL",
@@ -251,6 +293,21 @@ export function renderPreambleParts(tools, messages, { terse = terseEnabled(), d
       (examples.length > 1 ? `${examples.length} calls batched together:` : "one call:"),
     ...examples,
     "",
+    ...(guardEnabled()
+      ? workedExample(
+          fns.map((f) => f.name),
+          (hints.find((h) => /^Working directory:/i.test(h)) || "").replace(/^Working directory:\s*/i, ""),
+          (hints.find((h) => /^Platform:/i.test(h)) || "").replace(/^Platform:\s*/i, "")
+        )
+      : []),
+    ...(rawEx
+      ? [
+          "LARGE TEXT - the JSON line carries only short arguments. Any argument that holds multi-line text goes in a RAW BLOCK straight after the JSON: a line `<<<argname`, the text exactly as it must appear (no escaping, no JSON quotes), then a line `argname>>>`. Example:",
+          rawEx.block,
+          "If the raw text itself contains three backticks, wrap the whole call in a fence of four backticks instead.",
+          "",
+        ]
+      : []),
     "RULES:",
     ...rules,
     ...(hints.length ? ["", ...hints] : []),
@@ -272,13 +329,17 @@ export function renderPreamble(tools, messages, opts = {}) {
 
 // Everything the website has not seen yet: messages after the last assistant
 // turn (user text and tool results), rendered as plain text.
-export function buildDelta(messages) {
+export function buildDelta(messages, { resultBudget = 0 } = {}) {
   const msgs = (messages || []).filter((m) => m.role !== "system");
   let lastAssistant = -1;
   msgs.forEach((m, i) => {
     if (m.role === "assistant") lastAssistant = i;
   });
   const fresh = msgs.slice(lastAssistant + 1);
+  // A rotation prompt may cap the total size of the pending tool results.
+  const toolCount = fresh.filter((m) => m.role === "tool").length;
+  const perResult =
+    resultBudget > 0 && toolCount ? Math.min(maxToolResult(), Math.max(1500, Math.floor(resultBudget / toolCount))) : maxToolResult();
 
   const callNames = new Map();
   for (const m of msgs) {
@@ -301,7 +362,7 @@ export function buildDelta(messages) {
     } else if (m.role === "tool") {
       sawTool = true;
       const name = callNames.get(m.tool_call_id) || m.name || "tool";
-      const block = `TOOL_RESULT ${name} (id ${m.tool_call_id})\n${clipMiddle(tidyToolResult(msgText(m).trim() || "(empty output)"), maxToolResult())}\nEND_TOOL_RESULT`;
+      const block = `TOOL_RESULT ${name} (id ${m.tool_call_id})\n${clipMiddle(tidyToolResult(msgText(m).trim() || "(empty output)"), perResult)}\nEND_TOOL_RESULT`;
       parts.push(block);
       toolChars += block.length;
     }
@@ -313,17 +374,31 @@ export function buildDelta(messages) {
     sawUser,
     userChars,
     toolChars,
+    // The tool calls the agent ran after the model's last turn: their results
+    // are in `text`. Needed to tell a brand-new chat what the results answer.
+    lastCalls: lastAssistant >= 0 ? msgs[lastAssistant].tool_calls || [] : [],
   };
 }
 
-export function buildPrompt(messages, tools, { includePreamble }) {
-  const d = buildDelta(messages);
+export function buildPrompt(messages, tools, { includePreamble, recap = "", resultBudget = 0 }) {
+  const d = buildDelta(messages, { resultBudget });
   const hasTools = toolList(tools).length > 0;
   let text = d.text;
   if (hasTools && d.sawTool) {
     text +=
       "\n\nContinue the task. If you need more tools, output TOOL_CALL block(s) and stop; if the task is finished, give the final answer in plain text.";
+  } else if (hasTools && d.sawUser && text && remindEnabled()) {
+    // A real user turn (no tool result): remind the model of the protocol even
+    // when the preamble is not re-sent, e.g. after the user opened a new chat.
+    text += `\n\n${REMINDER}`;
   }
+  // Phase 2: a brand-new chat continuing earlier work gets a recap (see
+  // recap.js) between the protocol and the newest input.
+  if (recap && d.sawTool && d.lastCalls.length) {
+    const lines = d.lastCalls.map((tc) => `- ${tc.function?.name || "tool"} ${clip(String(tc.function?.arguments || ""), 300)}`);
+    text = `YOUR PREVIOUS TOOL CALLS (already executed; their results are below - do NOT run them again, continue with the next step):\n${lines.join("\n")}\n\n${text}`;
+  }
+  if (recap) text = `${recap}\n\n---\nNEW INPUT FOR YOU NOW:\n${text}`;
   let preambleChars = 0;
   let toolListChars = 0;
   if (hasTools && includePreamble) {
@@ -391,6 +466,108 @@ function extractJsonObject(text, start) {
   return null;
 }
 
+// Phase 1: RAW BLOCKS. After the JSON of a TOOL_CALL the model may add
+//   <<<argname
+//   text exactly as it must appear (no escaping)
+//   argname>>>
+// Each block becomes the string argument `argname`. Returns the blocks found,
+// where they end, and `incomplete` (the block name) when a block never closed.
+function readRawBlocks(text, from) {
+  const blocks = {};
+  let count = 0;
+  let pos = from;
+  for (;;) {
+    const rest = text.slice(pos);
+    const m = /^\s*<<<([A-Za-z_][\w-]*)[ \t]*\r?\n/.exec(rest);
+    if (!m) break;
+    const name = m[1];
+    const bodyStart = m[0].length;
+    const closeRe = new RegExp("^[ \\t]*" + name + ">>>[ \\t]*$", "gm");
+    closeRe.lastIndex = bodyStart;
+    const c = closeRe.exec(rest);
+    if (!c) return { blocks, count, end: pos, incomplete: name };
+    blocks[name] = rest.slice(bodyStart, c.index).replace(/\r?\n$/, "");
+    count += 1;
+    pos += c.index + c[0].length;
+  }
+  return { blocks, count, end: pos, incomplete: null };
+}
+
+// Folds raw blocks into the call's arguments. Returns the offending block name
+// when it is not a string argument of the tool, otherwise null.
+function mergeRawBlocks(obj, blocks, specs) {
+  const rawName = obj.name || obj.tool || obj.tool_name || obj.function?.name;
+  const spec = typeof rawName === "string" ? specs.get(rawName.toLowerCase()) : null;
+  const ARG_KEYS = ["arguments", "parameters", "args", "input"];
+  const key = ARG_KEYS.find((k) => obj[k] !== undefined && obj[k] !== null);
+  let args;
+  if (key) {
+    if (typeof obj[key] === "string") obj[key] = tryParse(obj[key]);
+    args = obj[key];
+    if (!args || typeof args !== "object" || Array.isArray(args)) return "arguments";
+  } else {
+    args = {};
+    for (const k of Object.keys(obj)) {
+      if (NAME_KEYS.has(k) || k === "function") continue;
+      args[k] = obj[k];
+      delete obj[k];
+    }
+    obj.arguments = args;
+  }
+  for (const [k, v] of Object.entries(blocks)) {
+    if (spec?.props && !spec.props.has(k)) return k;
+    const t = spec?.def?.parameters?.properties?.[k]?.type;
+    if (t && !(t === "string" || (Array.isArray(t) && t.includes("string")))) return k;
+    args[k] = v;
+  }
+  return null;
+}
+
+// A complete reply ends with the closing code fence; one that stops anywhere
+// else was most likely cut off.
+function endsWithFence(text) {
+  return /`{3,}\s*$/.test(String(text || ""));
+}
+
+// Repairs the two most common defects of long JSON strings written by a model:
+// raw control characters (a real newline/tab inside a string) and invalid
+// escapes such as \s \w \. (typical in regexes inside a file being written).
+// Only text INSIDE strings is touched; the structure is left alone.
+function lenientJsonFix(raw) {
+  let out = "";
+  let inStr = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (!inStr) {
+      out += ch;
+      if (ch === '"') inStr = true;
+      continue;
+    }
+    if (ch === "\\") {
+      const n = raw[i + 1];
+      if (n !== undefined && '"\\/bfnrt'.includes(n)) {
+        out += ch + n;
+        i++;
+      } else if (n === "u" && /^[0-9a-fA-F]{4}$/.test(raw.slice(i + 2, i + 6))) {
+        out += raw.slice(i, i + 6);
+        i += 5;
+      } else {
+        out += "\\\\"; // invalid escape: keep the backslash literally
+      }
+      continue;
+    }
+    if (ch === '"') {
+      out += ch;
+      inStr = false;
+    } else if (ch === "\n") out += "\\n";
+    else if (ch === "\r") out += "\\r";
+    else if (ch === "\t") out += "\\t";
+    else if (ch < " ") out += "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0");
+    else out += ch;
+  }
+  return out;
+}
+
 function tryParse(raw) {
   try {
     return JSON.parse(raw);
@@ -399,6 +576,10 @@ function tryParse(raw) {
     // tolerate smart quotes and trailing commas
     const fixed = raw.replace(/[“”]/g, '"').replace(/,\s*([}\]])/g, "$1");
     return JSON.parse(fixed);
+  } catch {}
+  try {
+    // tolerate raw newlines/tabs and invalid escapes inside strings
+    return JSON.parse(lenientJsonFix(raw));
   } catch {}
   return null;
 }
@@ -426,6 +607,24 @@ function findTool(tools, name) {
   if (typeof name !== "string") return null;
   const want = name.toLowerCase();
   return toolList(tools).find((f) => f.name.toLowerCase() === want) || null;
+}
+
+// A Windows path typed with single backslashes inside JSON ("C:\test\new.py")
+// parses WITHOUT error: \t becomes a TAB and \n a newline, so the tool silently
+// gets a different file name. No real path holds those control characters, so
+// for path-like arguments turn them back into backslash + letter.
+function fixPathArgs(args) {
+  if (!args || typeof args !== "object") return;
+  for (const [k, v] of Object.entries(args)) {
+    if (typeof v !== "string" || !/path|file|dir|cwd/i.test(k)) continue;
+    if (!/[\t\n\r\f\x08]/.test(v)) continue;
+    args[k] = v
+      .replace(/\t/g, "\\t")
+      .replace(/\r/g, "\\r")
+      .replace(/\n/g, "\\n")
+      .replace(/\f/g, "\\f")
+      .replace(/\x08/g, "\\b");
+  }
 }
 
 function normalizeCall(obj, specs) {
@@ -464,6 +663,7 @@ function normalizeCall(obj, specs) {
       return null;
     }
   }
+  fixPathArgs(args);
   return {
     id: `call_${crypto.randomBytes(8).toString("hex")}`,
     type: "function",
@@ -482,6 +682,7 @@ export function parseToolCalls(reply, tools) {
   const spans = [];
   const calls = [];
   let issue = null;
+  let stopScan = false; // an unterminated block swallows the rest of the reply
   const noteIssue = (reason, tool) => {
     if (!issue) issue = { reason, tool: typeof tool === "string" ? tool : null };
   };
@@ -499,12 +700,23 @@ export function parseToolCalls(reply, tools) {
     }
     const ext = extractJsonObject(text, brace);
     if (!ext) {
-      noteIssue("invalid-json", nameNear(text.slice(markerStart)));
+      noteIssue(endsWithFence(text) ? "invalid-json" : "truncated", nameNear(text.slice(markerStart)));
+      stopScan = true;
       return;
     }
     const obj = tryParse(ext.raw);
     if (!obj || typeof obj !== "object") {
       noteIssue("invalid-json", nameNear(ext.raw));
+      return;
+    }
+    const rawBlocks = readRawBlocks(text, ext.end);
+    if (rawBlocks.incomplete) {
+      noteIssue(endsWithFence(text) ? "bad-block" : "truncated", nameNear(ext.raw));
+      stopScan = true; // whatever follows is raw text, never another call
+      return;
+    }
+    if (rawBlocks.count && mergeRawBlocks(obj, rawBlocks.blocks, specs)) {
+      noteIssue("bad-block", nameNear(ext.raw));
       return;
     }
     const rawName = obj.name || obj.tool || obj.tool_name || obj.function?.name;
@@ -516,24 +728,33 @@ export function parseToolCalls(reply, tools) {
       return;
     }
     calls.push(call);
-    spans.push([markerStart, ext.end]);
+    spans.push([markerStart, rawBlocks.end]);
   };
 
   // 1) explicit sentinel
   const re = /TOOL_CALL\b/g;
   let m;
   while ((m = re.exec(text))) {
+    if (stopScan) break;
     if (spans.some(([a, b]) => m.index >= a && m.index < b)) continue;
+    // A call starts a line (optionally right after its opening fence). The word in
+    // the middle of a sentence ("I fixed the TOOL_CALL parser") is prose, not a
+    // broken call: it must not start the repair loop or fail the turn.
+    const lineStart = text.lastIndexOf("\n", m.index - 1) + 1;
+    if (!/^[ \t]*(?:`{3,}[\w-]*[ \t]*)?$/.test(text.slice(lineStart, m.index))) continue;
     tryAt(m.index, m.index + m[0].length);
   }
 
   // 2) fallback: a bare JSON object with a known tool name
-  if (!calls.length) {
+  if (!calls.length && !stopScan) {
     const reObj = /\{\s*"(?:name|tool)"\s*:\s*"/g;
     while ((m = reObj.exec(text))) {
       if (spans.some(([a, b]) => m.index >= a && m.index < b)) continue;
       const ext = extractJsonObject(text, m.index);
       if (!ext) continue;
+      // A JSON object followed by a raw block belongs to a TOOL_CALL whose text
+      // arguments would be lost here; never turn it into a call without them.
+      if (/^\s*<<<[A-Za-z_]/.test(text.slice(ext.end, ext.end + 80))) continue;
       const call = normalizeCall(tryParse(ext.raw), specs);
       if (!call) continue;
       calls.push(call);
@@ -547,23 +768,34 @@ export function parseToolCalls(reply, tools) {
   let out = "";
   let cursor = 0;
   for (const [a, b] of spans) {
-    out += text.slice(cursor, a).replace(/```[\w-]*[ \t]*\n?[ \t]*$/, "");
+    out += text.slice(cursor, a).replace(/`{3,}[\w-]*[ \t]*\n?[ \t]*$/, "");
     cursor = b;
     const rest = text.slice(cursor);
-    const fence = rest.match(/^[ \t]*\n?[ \t]*```/);
+    const fence = rest.match(/^[ \t]*\n?[ \t]*`{3,}/);
     if (fence) cursor += fence[0].length;
   }
   out += text.slice(cursor);
-  out = out.replace(/```[\w-]*\s*```/g, "").replace(/\n{3,}/g, "\n\n").trim();
+  out = out.replace(/`{3,}[\w-]*\s*`{3,}/g, "").replace(/\n{3,}/g, "\n\n").trim();
   return { calls, text: out, issue: null };
 }
 
 // ------------------------------------------------------- auto-correction
 
 export const TOOL_REPAIR_MAX = 2;
+// Extra budget used only when a reply was cut off in the middle of a call: ask
+// the site to continue and stitch the pieces together (NOAPI_CONTINUE=0 turns
+// it off). A reply that is already this long is not continued but re-asked.
+export const TOOL_CONTINUE_MAX = 3;
+const CONTINUE_LIMIT = 30_000;
+
+export function continueEnabled() {
+  return process.env.NOAPI_CONTINUE !== "0";
+}
 
 const REPAIR_PROBLEM = {
-  "invalid-json": "the JSON in your TOOL_CALL block could not be parsed as valid JSON",
+  "invalid-json": "the JSON in your TOOL_CALL block could not be parsed as valid JSON (every quote, backslash and newline inside a JSON string must be escaped; better: keep the JSON short and put any multi-line text in a RAW BLOCK <<<argname ... argname>>> after it)",
+  "truncated": "your reply was cut off before the TOOL_CALL block was complete. Resend it as a COMPLETE and much shorter call: at most about 150 lines of raw text per call; for a bigger file write the first part now and add the rest with later calls",
+  "bad-block": "a RAW BLOCK was not valid: it must start with <<<argname on its own line, end with argname>>> on its own line, and argname must be a text argument of that tool",
   "no-json": "there was no JSON object after the TOOL_CALL marker",
   "no-arguments": "the arguments must be inside an \"arguments\" object, not spread next to the tool name",
   "unknown-tool": "the tool name in the block is not a tool that is available here",
@@ -585,27 +817,82 @@ export function toolRepairPrompt({ reason, tool, toolDef } = {}) {
   ].join("\n");
 }
 
+export function toolContinuePrompt() {
+  return [
+    "Your last reply was cut off before the TOOL_CALL block was complete.",
+    "Continue EXACTLY where it stopped: output only the missing remainder, starting right after the last character you wrote.",
+    "Do not repeat anything and do not start a new TOOL_CALL or a new code fence. Finish the raw block (argname>>>) and close the code fence.",
+  ].join("\n");
+}
+
+// Joins a cut-off reply and its continuation. A continuation that restarts the
+// call from TOOL_CALL replaces the old reply; otherwise a new opening fence is
+// dropped and any text the model repeated from the end of the old reply (up to
+// 400 chars) is trimmed.
+export function stitchReplies(prev, cont) {
+  prev = String(prev || "");
+  let c = String(cont || "");
+  if (/^\s*(?:`{3,}[\w-]*[ \t]*\r?\n\s*)?TOOL_CALL\b/.test(c)) return c;
+  c = c.replace(/^\s*`{3,}[\w-]*[ \t]*\r?\n/, "");
+  const max = Math.min(400, prev.length, c.length);
+  for (let k = max; k >= 24; k--) {
+    if (prev.endsWith(c.slice(0, k))) {
+      c = c.slice(k);
+      break;
+    }
+  }
+  return prev + c;
+}
+
 // Auto-correction round trip. `ask(prompt, attempt)` sends a short follow-up to
-// the same chat and returns the next raw reply. At most `maxRepairs` prompts per
-// user turn; if the reply is still unusable the last parse is returned as-is so
-// the caller can hand it back to OpenCode. `enabled=false` is a no-op.
-export async function repairToolCall({ reply, tools, ask, log = () => {}, enabled = true, maxRepairs = TOOL_REPAIR_MAX } = {}) {
+// the same chat and returns the next raw reply. At most `maxRepairs` correction
+// prompts per user turn, plus up to `maxContinues` continuations when the reply
+// was cut off; if the reply is still unusable the last parse is returned as-is
+// so the caller can decide. `enabled=false` is a no-op.
+export async function repairToolCall({
+  reply,
+  tools,
+  ask,
+  log = () => {},
+  enabled = true,
+  maxRepairs = TOOL_REPAIR_MAX,
+  maxContinues = TOOL_CONTINUE_MAX,
+} = {}) {
   let parsed = parseToolCalls(reply, tools);
   let lastReply = reply;
   let attempt = 0;
-  while (enabled && attempt < maxRepairs && !parsed.calls.length && parsed.issue) {
-    attempt += 1;
+  let continues = 0;
+  while (enabled && !parsed.calls.length && parsed.issue) {
     const { reason, tool } = parsed.issue;
-    log(`tool repair: attempt ${attempt}/${maxRepairs} reason=${reason} tool=${tool || "?"}`);
+    const canContinue =
+      reason === "truncated" && continueEnabled() && continues < maxContinues && String(lastReply).length < CONTINUE_LIMIT;
+    if (!canContinue && attempt >= maxRepairs) break;
+    const prevReply = lastReply;
     try {
-      lastReply = await ask(toolRepairPrompt({ reason, tool, toolDef: findTool(tools, tool) }), attempt);
+      if (canContinue) {
+        continues += 1;
+        log(`tool repair: continue ${continues}/${maxContinues} reason=truncated tool=${tool || "?"} (${String(lastReply).length} chars so far)`);
+        const cont = await ask(toolContinuePrompt(), continues);
+        if (cont === prevReply) {
+          log(`tool repair: continue ${continues} returned the SAME reply as before (stale read, the model was not asked again)`);
+        } else {
+          lastReply = stitchReplies(prevReply, cont);
+        }
+      } else {
+        attempt += 1;
+        log(`tool repair: attempt ${attempt}/${maxRepairs} reason=${reason} tool=${tool || "?"}`);
+        lastReply = await ask(toolRepairPrompt({ reason, tool, toolDef: findTool(tools, tool) }), attempt);
+        if (lastReply === prevReply) {
+          log(`tool repair: attempt ${attempt} returned the SAME reply as before (stale read, the model was not asked again)`);
+        }
+      }
     } catch (err) {
       log(`tool repair: failed after ${attempt}/${maxRepairs} reason=${reason} tool=${tool || "?"}`);
       return { ...parsed, reply: lastReply };
     }
     parsed = parseToolCalls(lastReply, tools);
   }
-  if (enabled && parsed.issue && attempt > 0) {
+  if (enabled && parsed.issue && !parsed.calls.length && (attempt > 0 || continues > 0)) {
     log(`tool repair: failed after ${attempt}/${maxRepairs} reason=${parsed.issue.reason} tool=${parsed.issue.tool || "?"}`);
   }
   return { ...parsed, reply: lastReply };

@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "Lets local tools (opencode) use your logged-in AI websites (ChatGPT, Claude, Gemini, …) without API keys, via a local bridge on 127.0.0.1.",
   "minimum_chrome_version": "116",
-  "permissions": ["storage"],
+  "permissions": ["storage", "power", "alarms"],
   "host_permissions": [
     "http://127.0.0.1/*",
     "http://localhost/*",

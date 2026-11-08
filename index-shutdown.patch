@@ -1,0 +1,157 @@
+--- a/bridge/index.js
++++ b/bridge/index.js
+@@ -38,6 +38,29 @@
+   });
+ }
+ 
++// Connection-flood protection. A client stuck in a reconnect loop must not be
++// able to bury the log or exhaust the bridge (and, through loopback ports, the
++// machine): cap the open sockets and the ones still waiting for their hello.
++const MAX_WS = Number(process.env.NOAPI_MAX_WS) || 256;
++const MAX_PENDING_HELLO = Number(process.env.NOAPI_MAX_PENDING_HELLO) || 32;
++
++// Log the first event at once, then at most one summary line per window.
++function burstLogger(log, label, windowMs = 3000) {
++  let extra = 0;
++  let timer = null;
++  return () => {
++    if (!timer) {
++      log(label);
++      timer = setTimeout(() => {
++        if (extra) log(`${label} (+${extra} more in the last ${windowMs / 1000}s)`);
++        extra = 0;
++        timer = null;
++      }, windowMs);
++      timer.unref?.();
++    } else extra++;
++  };
++}
++
+ async function main() {
+   const args = parseArgs(process.argv.slice(2));
+   if (args.help) {
+@@ -54,10 +77,15 @@
+   }
+ 
+   const log = (...a) => process.stderr.write("[noapi] " + a.join(" ") + "\n");
++  const logProxy = burstLogger(log, "mcp proxy client connected (this process will forward to this bridge)");
++  const logNoHello = burstLogger(log, "closing websocket that never sent a hello");
++  const logRefused = burstLogger(log, "refusing websocket: too many open or unidentified connections (NOAPI_MAX_WS / NOAPI_MAX_PENDING_HELLO)");
++  let helloPending = 0; // sockets that opened and have not said hello yet
+ 
+   // ---- start the HTTP + WS server (the actual bridge) ----
+   let bridge = null;
+   let server = null;
++  let allConns = new Set();
+   try {
+     const b = new Bridge({ log, cancelAckMs: Number(process.env.NOAPI_CANCEL_ACK_MS) || 5000 });
+     server = createHttpServer(b, log, { host: args.host });
+@@ -90,16 +118,26 @@
+       }
+     }
+ 
++    // Every open WebSocket (browser tabs and MCP proxies), so shutdown can close
++    // them: server.close() alone waits for them forever.
++    allConns = new Set();
+     attachWebSocketServer(server, {
+       verify: (req) => {
+         const ok = requestAllowed(req, args.host);
+         if (!ok) log(`blocked websocket from origin "${req.headers.origin || "?"}"`);
++        if (ok && (allConns.size >= MAX_WS || helloPending >= MAX_PENDING_HELLO)) {
++          logRefused();
++          return false;
++        }
+         return ok;
+       },
+       onOpen: (conn) => {
++        allConns.add(conn);
++        conn.awaitingHello = true;
++        helloPending++;
+         conn.helloTimer = setTimeout(() => {
+           if (!b.clients.has(conn) && !conn.isProxy) {
+-            log("closing websocket that never sent a hello");
++            logNoHello();
+             conn.close();
+           }
+         }, 10_000);
+@@ -113,9 +151,13 @@
+         }
+         if (msg.t === "hello") {
+           clearTimeout(conn.helloTimer);
++          if (conn.awaitingHello) {
++            conn.awaitingHello = false;
++            helloPending--;
++          }
+           if (msg.client === "noapi-mcp-proxy") {
+             conn.isProxy = true;
+-            log("mcp proxy client connected (this process will forward to this bridge)");
++            logProxy();
+             conn.send(JSON.stringify({ t: "welcome", bridge: "noapi-bridge", version: "0.1.0" }));
+             return;
+           }
+@@ -147,7 +189,12 @@
+         }
+       },
+       onClose: (conn) => {
++        allConns.delete(conn);
+         clearTimeout(conn.helloTimer);
++        if (conn.awaitingHello) {
++          conn.awaitingHello = false;
++          helloPending--;
++        }
+         b.unregister(conn);
+       },
+     });
+@@ -180,14 +227,45 @@
+   }
+   if (args.mcp) runMcpStdio(gateway, log);
+ 
+-  const shutdown = () => {
+-    log("shutting down");
+-    if (gateway?.stop) gateway.stop();
+-    if (server) server.close(() => process.exit(0));
+-    else process.exit(0);
++  // server.close() only stops NEW connections and its callback waits until every
++  // existing one has ended. The extension's WebSocket never ends by itself, so
++  // the old shutdown never reached process.exit: the process stayed alive as a
++  // zombie, the extension stayed "connected" to it and never reconnected to the
++  // next bridge. Close the sockets, and never wait more than 2s.
++  let shuttingDown = false;
++  let firstAt = 0;
++  const shutdown = (sig) => {
++    if (shuttingDown) {
++      // A duplicate signal from the same Ctrl+C is ignored; a deliberate second
++      // press later than 1s forces the exit.
++      if (Date.now() - firstAt > 1000) {
++        log(`${sig} again - forcing exit`);
++        process.exit(0);
++      }
++      return;
++    }
++    shuttingDown = true;
++    firstAt = Date.now();
++    log(`shutting down (${sig})`);
++    setTimeout(() => process.exit(0), 2000).unref();
++    try {
++      gateway?.stop?.();
++    } catch {}
++    for (const conn of allConns) {
++      try {
++        conn.close();
++      } catch {}
++    }
++    if (server) {
++      server.close(() => process.exit(0));
++      server.closeAllConnections?.(); // Node 18.2+: drop idle/keep-alive HTTP sockets
++    } else {
++      process.exit(0);
++    }
+   };
+-  process.on("SIGINT", shutdown);
+-  process.on("SIGTERM", shutdown);
++  for (const sig of ["SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP"]) {
++    process.on(sig, () => shutdown(sig));
++  }
+ }
+ 
+ main();

@@ -40,6 +40,7 @@ export class Bridge {
     this.locks = new Map(); // site -> promise chain (one in-flight prompt per site)
     this.busy = new Map(); // site -> queued + running count
     this.toolHashes = new Map(); // site -> hash of the tool set the website chat already knows
+    this.chatUsage = new Map(); // site -> chars sent + received in the site's CURRENT chat (Phase 2 rotation)
     this.timings = []; // most recent completed requests, oldest first
     this.stats = new Map(); // site -> lifetime counters (debug; see statsSummary)
     this.startedAt = Date.now();
@@ -184,6 +185,28 @@ export class Bridge {
     }));
   }
 
+  // True when a tab (or MCP proxy) for `site` is connected right now.
+  _hasTarget(site) {
+    return [...this.clients.entries()].some(([conn, c]) => !conn.closed && (!site || c.site === site || c.sites?.has(site)));
+  }
+
+  // The extension reconnects to a freshly started bridge with a delay (MV3
+  // service worker backoff, alarms), so a request that arrives first is held
+  // for up to NOAPI_CLIENT_WAIT_MS (default 15000, 0 = fail at once) instead
+  // of failing with "No browser tab ... is connected".
+  async _waitForClient({ site, signal, onProgress }) {
+    const raw = Number(process.env.NOAPI_CLIENT_WAIT_MS);
+    const ms = Number.isFinite(raw) && process.env.NOAPI_CLIENT_WAIT_MS !== "" ? Math.min(Math.max(raw, 0), 120_000) : 15_000;
+    if (ms <= 0 || this._hasTarget(site)) return;
+    onProgress?.(`Waiting for the browser extension to connect${site ? ` on ${site}` : ""}`);
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 400));
+      if (signal?.aborted) throw new Error("Request cancelled.");
+      if (this._hasTarget(site)) return;
+    }
+  }
+
   _nextId() {
     this.seq += 1;
     return `req_${Date.now().toString(36)}_${this.seq}`;
@@ -236,6 +259,7 @@ export class Bridge {
     try {
       await prev;
       if (signal?.aborted) throw new Error("Request cancelled.");
+      await this._waitForClient({ site, signal, onProgress });
       return await this._dispatch({
         prompt,
         system,

@@ -6,9 +6,13 @@
 //  - /                     human status dashboard
 import http from "node:http";
 import fs from "node:fs";
+import nodePath from "node:path";
 import { SITES, SITE_KEYS } from "./sites.js";
 import { requestAllowed } from "./security.js";
-import { buildPrompt, parseToolCalls, toolList, toolsHash, isTitleRequest, localTitle, repairToolCall } from "./toolproto.js";
+import { buildPrompt, buildDelta, parseToolCalls, toolList, toolsHash, isTitleRequest, localTitle, repairToolCall } from "./toolproto.js";
+import { guardEnabled, detectRefusal, refusalPrompt, seedTree, seedTreeEnabled, GUARD_MAX, isRepeat, repeatGuardEnabled, REPEAT_PROMPT } from "./guard.js";
+import { effectiveRotateLimit, rotateMinTurns, rotateResultBudget } from "./rotation.js";
+import { rotateLimit, shouldRotate, buildRecap } from "./recap.js";
 import { autoreadReport } from "./consult.js";
 import { StreamFilter, streamEnabled } from "./streamfilter.js";
 import { tuningFromEnv, sseTextFromEnv } from "./tuning.js";
@@ -133,6 +137,9 @@ setInterval(render, 2000);
 }
 
 export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } = {}) {
+  // Refusal-guard counters, per site, since start. Shown under "guard" in /health.
+  const guardStats = {};
+  const gstat = (site) => (guardStats[site] ||= { refusals: 0, recovered: 0, failed: 0 });
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     const path = url.pathname;
@@ -158,7 +165,7 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         return;
       }
       if (path === "/health" && req.method === "GET") {
-        sendJson(res, 200, bridge.status());
+        sendJson(res, 200, { ...bridge.status(), guard: guardStats });
         return;
       }
       if (path === "/v1/models" && req.method === "GET") {
@@ -215,10 +222,34 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         // (no assistant message yet). Default OFF. Opening a new chat also means
         // the site forgets the tool preamble, so drop the hash (the preamble is
         // re-sent because the conversation is fresh anyway).
-        const newChat = process.env.NOAPI_NEW_CHAT === "1" && fresh;
-        if (newChat) bridge.toolHashes.delete(model);
-        const includePreamble = tools.length > 0 && (fresh || bridge.toolHashes.get(model) !== hash);
-        let { prompt, parts: promptParts } = buildPrompt(messages, tools, { includePreamble });
+        const titleOnly = isTitleRequest(messages, tools);
+        // Phase 2: chat rotation. Once the site's current chat has carried
+        // NOAPI_ROTATE_CHARS characters (default 150000, 0 = off) in the middle
+        // of agent work, open a new chat and send the protocol plus a recap built
+        // from OpenCode's own message list, then carry on there.
+        bridge.chatTurns ||= new Map(); // site -> turns sent to the site's CURRENT chat
+        bridge.rotatePrompt ||= new Map(); // site -> size of the last rotation prompt
+        const rotateAt = effectiveRotateLimit(model, rotateLimit(), bridge.rotatePrompt.get(model) || 0);
+        const chatUsed = bridge.chatUsage.get(model) || 0;
+        const chatTurns = bridge.chatTurns.get(model) || 0;
+        let rotate = shouldRotate({ limit: rotateAt, usage: chatUsed, tools, messages, titleOnly });
+        if (rotate && chatTurns < rotateMinTurns()) {
+          log(`chat rotate skipped: ${model} chat has only ${chatTurns} turn(s) since it was opened (min ${rotateMinTurns()})`);
+          rotate = false;
+        }
+        const newChat = (process.env.NOAPI_NEW_CHAT === "1" && fresh) || rotate;
+        if (newChat) {
+          bridge.toolHashes.delete(model);
+          bridge.chatUsage.set(model, 0);
+          bridge.chatTurns.set(model, 0);
+        }
+        const recap = rotate ? buildRecap(messages) : "";
+        if (rotate) {
+          log(`chat rotate: ${model} chat reached ${chatUsed} chars (limit ${rotateAt}); opening a new chat with a ${recap.length}-char recap`);
+        }
+        const includePreamble = tools.length > 0 && (fresh || rotate || bridge.toolHashes.get(model) !== hash);
+        let { prompt, parts: promptParts } = buildPrompt(messages, tools, { includePreamble, recap, resultBudget: rotate ? rotateResultBudget() : 0 });
+        if (rotate) bridge.rotatePrompt.set(model, prompt.length);
         // Task 2: dump the exact prompt (preamble + first turn) sent to the site
         // so its size and per-tool cost can be measured without a live change.
         if (process.env.NOAPI_DUMP_PREAMBLE === "1") {
@@ -229,7 +260,18 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
             log(`could not dump preamble: ${err.message}`);
           }
         }
-        const titleOnly = isTitleRequest(messages, tools);
+        // Opt-in (NOAPI_SEED_TREE=1): list the working directory in the first
+        // prompt so the model sees real paths instead of assuming it is blind.
+        if (includePreamble && !titleOnly && seedTreeEnabled()) {
+          try {
+            const sysText = messages.filter((m) => m.role === "system").map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n");
+            const wd = (sysText.match(/Working directory:\s*(.+)/i) || [])[1];
+            const tree = wd ? seedTree(wd.trim()) : "";
+            if (tree) prompt = `${prompt}\n\n${tree}`;
+          } catch (err) {
+            log(`seed tree skipped: ${err.message}`);
+          }
+        }
         let filesChars = 0;
         // NOAPI_AUTOREAD=1 (off by default, fully inert when off): attach the
         // files named in the latest real user message only — never system or
@@ -285,6 +327,12 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
           if (tools.length) bridge.toolHashes.set(model, hash);
           return { calls, text };
         };
+        // Characters exchanged with the site's current chat (prompt + reply).
+        const track = (sent, reply) => {
+          bridge.chatUsage.set(model, (bridge.chatUsage.get(model) || 0) + String(sent || "").length + String(reply || "").length);
+          bridge.chatTurns.set(model, (bridge.chatTurns.get(model) || 0) + 1);
+          return reply;
+        };
         const ask = (onProgress, onPartial) =>
           titleOnly
             ? Promise.resolve(localTitle(messages))
@@ -302,7 +350,7 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
                 newChat,
                 tuning,
                 sseText,
-              });
+              }).then((reply) => track(prompt, reply));
         // NOAPI_TOOL_REPAIR (default ON): when a reply carries a TOOL_CALL marker
         // but no valid block, send a short follow-up to the same chat and try
         // again (max 2 per user turn) instead of handing the broken block to
@@ -321,11 +369,89 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
             newChat: false,
             tuning,
             sseText,
-          });
+          }).then((reply) => track(repairPrompt, reply));
+        // Save the raw reply of a failed tool call to ./noapi-debug so the real
+        // text (length, where it is cut, escaping) can be inspected afterwards.
+        const dumpReply = (tag, reply, issue) => {
+          try {
+            const dir = nodePath.join(process.cwd(), "noapi-debug");
+            fs.mkdirSync(dir, { recursive: true });
+            const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+            const file = nodePath.join(dir, `${stamp}_${tag}_${issue.reason}.txt`);
+            fs.writeFileSync(file, String(reply), "utf8");
+            log(`debug: saved ${String(reply).length} chars of the ${tag} reply -> ${file}`);
+          } catch {}
+        };
+        // Refusal guard: a reply with no TOOL_CALL at all that says "I cannot
+        // access your files / upload them" is off-protocol. Correct it in the
+        // same chat (max GUARD_MAX times) and, if the model still refuses, fail
+        // loudly instead of handing the refusal to OpenCode as a final answer.
+        const guardOn = guardEnabled() && tools.length > 0 && !titleOnly;
+        const delta = buildDelta(messages);
+        const sysTextAll = messages.filter((m) => m.role === "system").map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n");
+        const wdHint = ((sysTextAll.match(/Working directory:\s*(.+)/i) || [])[1] || "").trim();
+        const platHint = ((sysTextAll.match(/Platform:\s*(.+)/i) || [])[1] || "").trim();
+        const recoverRefusal = async (first) => {
+          let current = first;
+          for (let attempt = 0; ; attempt++) {
+            const p = parseToolCalls(current, tools);
+            if (p.calls.length || p.issue) return { reply: current, refused: false };
+            const det = detectRefusal(current, { strict: delta.sawTool });
+            if (!det.refused) return { reply: current, refused: false };
+            if (attempt === 0) gstat(model).refusals++;
+            if (attempt >= GUARD_MAX) return { reply: current, refused: true, det };
+            log(`refusal guard: ${model} refused the protocol (${det.reason}: "${det.match}"); correction ${attempt + 1}/${GUARD_MAX}`);
+            current = await askRepair(refusalPrompt({ task: delta.sawTool ? "" : delta.text, tools, wd: wdHint, platform: platHint }));
+          }
+        };
         const askAndRepair = async (onProgress, onPartial) => {
-          const reply = await ask(onProgress, onPartial);
+          let reply = await ask(onProgress, onPartial);
           if (titleOnly) return reply;
+          if (guardOn) {
+            const g = await recoverRefusal(reply);
+            if (g.refused) {
+              gstat(model).failed++;
+              dumpReply("refusal", g.reply, { reason: "refusal" });
+              // The next turn must re-teach the protocol.
+              bridge.toolHashes.delete(model);
+              throw new Error(
+                `${model} refused to use tools (it claimed it cannot access your files) even after ${GUARD_MAX} corrections. Raw reply saved in ./noapi-debug. Open a NEW chat on the site, turn off its built-in tools (code execution / uploads), then send "continue".`
+              );
+            }
+            if (g.reply !== reply) {
+              gstat(model).recovered++;
+              log(`refusal guard: ${model} recovered`);
+              reply = g.reply;
+            }
+          }
+          const first = parseToolCalls(reply, tools);
+          if (first.issue) dumpReply("first", reply, first.issue);
           const repaired = await repairToolCall({ reply, tools, ask: askRepair, log, enabled: repairEnabled });
+          if (repaired.issue && !repaired.calls.length) {
+            dumpReply("final", repaired.reply, repaired.issue);
+            // Handing a broken TOOL_CALL back as plain text ends the turn in
+            // OpenCode (it looks like a final answer), so the agent just stops.
+            // Report an error instead. NOAPI_REPAIR_FAIL=text restores the old way.
+            if (repairEnabled && process.env.NOAPI_REPAIR_FAIL !== "text") {
+              throw new Error(
+                `The model produced a TOOL_CALL that could not be parsed (${repaired.issue.reason}, tool=${repaired.issue.tool || "?"}) even after auto-repair. Send "continue" to retry; raw reply saved in ./noapi-debug.`
+              );
+            }
+          }
+          // Repeat guard: the very same call(s) as the previous step, right after
+          // their results were delivered, means the model lost the thread (typical
+          // right after a chat rotation). Ask once for the NEXT step instead.
+          if (repeatGuardEnabled() && delta.sawTool && !repaired.issue && repaired.calls.length && isRepeat(repaired.calls, delta.lastCalls)) {
+            gstat(model).repeats = (gstat(model).repeats || 0) + 1;
+            log(`repeat guard: ${model} re-issued the previous tool call(s); asking for the next step`);
+            try {
+              const again = await askRepair(REPEAT_PROMPT);
+              const p2 = parseToolCalls(again, tools);
+              if (p2.calls.length || !p2.issue) return again;
+            } catch (err) {
+              log(`repeat guard: follow-up failed (${err.message}); keeping the original reply`);
+            }
+          }
           return repaired.reply;
         };
 
@@ -378,7 +504,7 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
         // TOOL_CALL block (or the parser's bare-JSON fallback) and streams
         // everything else, including ordinary fenced code. NOAPI_STREAM=0
         // restores the old "emit once at the end" behaviour.
-        const filter = streamEnabled() ? new StreamFilter({ tools }) : null;
+        const filter = streamEnabled() ? new StreamFilter({ tools, guard: guardOn && !delta.sawTool }) : null;
         const emit = (part) => {
           if (!part || res.writableEnded) return;
           chunk({ content: part });

@@ -337,6 +337,96 @@
   const debounceMs = () => (TUNE.debounce != null ? TUNE.debounce : Number(SITE.debounce) || 400);
 
 
+  // Phase 3: timers that keep their pace in a background tab. A hidden tab's
+  // setTimeout/setInterval are slowed to about once per second and, after a few
+  // minutes, to once per minute; typing, polling and completion checks then
+  // crawl. Timers inside a dedicated Worker are not throttled, so they run
+  // there and call back here. If a Worker cannot be created (page CSP) or dies,
+  // everything silently falls back to the ordinary timers.
+  const BG = (() => {
+    const pending = new Map(); // id -> { fn, ms, rep, native }
+    let worker = null;
+    let ready = false; // true once the Worker answered a ping
+    let seq = 0;
+    const startNative = (id, p) => {
+      p.native = (p.rep ? setInterval : setTimeout)(() => {
+        if (!p.rep) pending.delete(id);
+        try {
+          p.fn();
+        } catch {}
+      }, p.ms);
+    };
+    try {
+      const src = [
+        "const t = new Map();",
+        "onmessage = (e) => {",
+        "  const d = e.data;",
+        "  if (d.op === 'ping') { postMessage('pong'); return; }",
+        "  if (d.op === 'set') {",
+        "    const h = (d.rep ? setInterval : setTimeout)(() => {",
+        "      postMessage(d.id);",
+        "      if (!d.rep) t.delete(d.id);",
+        "    }, d.ms);",
+        "    t.set(d.id, h);",
+        "  } else if (d.op === 'clear') {",
+        "    const h = t.get(d.id);",
+        "    clearTimeout(h); clearInterval(h); t.delete(d.id);",
+        "  }",
+        "};",
+      ].join("\n");
+      worker = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+      worker.onmessage = (e) => {
+        if (e.data === "pong") {
+          ready = true;
+          return;
+        }
+        const p = pending.get(e.data);
+        if (!p) return;
+        if (!p.rep) pending.delete(e.data);
+        try {
+          p.fn();
+        } catch {}
+      };
+      worker.onerror = () => {
+        // Blocked or crashed: move every waiting timer to the ordinary ones.
+        ready = false;
+        try {
+          worker.terminate();
+        } catch {}
+        worker = null;
+        for (const [id, p] of pending) if (p.native == null) startNative(id, p);
+      };
+      worker.postMessage({ op: "ping" });
+    } catch {
+      worker = null;
+    }
+    const set = (fn, ms, rep) => {
+      const id = ++seq;
+      const p = { fn, ms, rep, native: null };
+      pending.set(id, p);
+      if (worker && ready) worker.postMessage({ op: "set", id, ms, rep });
+      else startNative(id, p);
+      return id;
+    };
+    const clear = (id) => {
+      const p = pending.get(id);
+      if (!p) return;
+      pending.delete(id);
+      if (p.native != null) {
+        clearTimeout(p.native);
+        clearInterval(p.native);
+      } else if (worker) {
+        worker.postMessage({ op: "clear", id });
+      }
+    };
+    return { set, clear, isReady: () => Boolean(worker && ready) };
+  })();
+  const bgSetTimeout = (fn, ms) => BG.set(fn, ms, false);
+  const bgSetInterval = (fn, ms) => BG.set(fn, ms, true);
+  const bgClear = (id) => BG.clear(id);
+  // Check in the page's DevTools console (F12): true = background-proof timers are active.
+  setTimeout(() => console.info("[NOAPI] timers run in a background Worker:", BG.isReady()), 1500);
+
   // Cancel-aware sleep: cancelCurrent() wakes every waiter immediately, so a
   // cancel is noticed during typing/polling instead of only after the current
   // sleep (which could otherwise keep the tab "busy" for 700ms+ while the bridge
@@ -345,11 +435,11 @@
   const sleep = (ms) =>
     new Promise((resolve) => {
       const done = () => {
-        clearTimeout(timer);
+        bgClear(timer);
         sleepWaiters.delete(done);
         resolve();
       };
-      const timer = setTimeout(done, ms);
+      const timer = bgSetTimeout(done, ms);
       sleepWaiters.add(done);
     });
   function wakeSleepers() {
@@ -934,7 +1024,7 @@
       state.port.onMessage.addListener((msg) => handleIncomingMessage(msg));
       state.port.onDisconnect.addListener(() => {
         state.port = null;
-        setTimeout(initPort, 3000);
+        bgSetTimeout(initPort, 3000);
       });
       state.port.postMessage({ type: "noapi_hello", site: SITE.key, url: location.href });
     } catch (e) {}
@@ -1696,6 +1786,11 @@
   }
   /* @noapi-shared-end tickScheduler */
 
+  // Runaway guard: with tools on, a reply this long is never a usable tool call
+  // (a call carries at most a few thousand characters). One run produced 75k
+  // characters in 590 s and then timed out with a half-written block.
+  const MAX_REPLY_CHARS = 40_000;
+
   async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, baseline = null, typedLen, toolsEnabled = false, earlyReturn = true, earlyReturnMs = DEFAULT_EARLY_RETURN_MS, toolNames = [], pipelineT0 = null, timings = null, sseEnabled = true, sseTextOn = false }) {
     const t0 = Date.now();
     return new Promise((resolve, reject) => {
@@ -1720,9 +1815,9 @@
       const sseTurn = { started: SSE.started, ended: SSE.ended, errored: SSE.errored };
 
       const cleanup = () => {
-        if (timer) clearInterval(timer);
+        if (timer) bgClear(timer);
         timer = null;
-        if (completionTimer) clearTimeout(completionTimer);
+        if (completionTimer) bgClear(completionTimer);
         completionTimer = null;
         SSE.wake = null;
         scheduler?.stop();
@@ -1798,6 +1893,15 @@
         return grownNode ? dropEcho(extractText(grownNode), prompt) : "";
       };
 
+      // FIX: true only when the page shows a reply that is not the previous turn's.
+      const replyIsFresh = () => {
+        const nodes = replyNodes();
+        if (!nodes.length) return false;
+        if (nodes.length > before) return true;
+        const t = extractText(nodes[nodes.length - 1]);
+        return Boolean(t) && t !== beforeLast;
+      };
+
       const readText = async (generating) => {
         const nodes = replyNodes();
         let text = "";
@@ -1828,6 +1932,13 @@
           }
           const now = Date.now();
           if (now - t0 >= timeoutMs) {
+            // FIX: stop the site, otherwise it keeps streaming and the next send
+            // waits for the send button to come back (minutes). The text is a
+            // partial reply, so flag it for the bridge/logs.
+            try {
+              if (isStopVisible()) state.justStopped = stopGeneration();
+            } catch {}
+            if (timings) timings.timedOut = true;
             if (lastText.length >= 5) finish(lastText);
             else fail(new Error("Timed out waiting for " + SITE.name + " to complete response."));
             return;
@@ -1904,8 +2015,8 @@
               // Wake once more when the quiet window should have elapsed, so the
               // turn does not wait for the next fallback interval to notice that
               // the reply stopped changing.
-              if (completionTimer) clearTimeout(completionTimer);
-              completionTimer = setTimeout(() => scheduler?.schedule(), debounceMs() + 30);
+              if (completionTimer) bgClear(completionTimer);
+              completionTimer = bgSetTimeout(() => scheduler?.schedule(), debounceMs() + 30);
             }
           }
 
@@ -1928,6 +2039,18 @@
               }
               if (timings) timings.sseTextTriggers = (timings.sseTextTriggers || 0) + 1;
             }
+          }
+
+          // Runaway guard (see MAX_REPLY_CHARS): stop the site and hand back what
+          // exists so the bridge can ask for smaller calls instead of waiting.
+          if (toolsEnabled && lastText.length > MAX_REPLY_CHARS) {
+            try {
+              if (isStopVisible()) state.justStopped = stopGeneration();
+            } catch {}
+            if (timings) timings.tooLong = true;
+            setLog(`✗ ${SITE.name} reply passed ${MAX_REPLY_CHARS} chars — stopped.`);
+            finish(lastText);
+            return;
           }
 
           // Tools on: a settled, complete TOOL_CALL block is actionable now.
@@ -1983,7 +2106,9 @@
           // that observed the token and replayed "ended" cannot cut a reply
           // short while the site is visibly still generating. An "error" event
           // never reaches here (sseDecision only returns "ended" for a clean end).
-          if (sseState === "ended" && !generating) {
+          // FIX: a late "ended" event from the previous stream used to return the
+          // previous reply (firstText=0, complete~180ms). Require a fresh reply.
+          if (sseState === "ended" && !generating && (lastText.length >= 5 || replyIsFresh())) {
             const readNow = () => {
               const nodes = replyNodes();
               return (nodes.length ? extractText(nodes[nodes.length - 1]) : "") || lastText;
@@ -2024,7 +2149,7 @@
       // cannot see (shadow DOM) and keeps the timeout / stop-button checks alive.
       scheduler = createTickScheduler(tick, (fn) => queueMicrotask(fn));
       SSE.wake = () => scheduler?.schedule();
-      timer = setInterval(() => scheduler?.schedule(), TUNE.fallbackTick);
+      timer = bgSetInterval(() => scheduler?.schedule(), TUNE.fallbackTick);
       scheduler.schedule();
     });
   }
@@ -2068,6 +2193,7 @@
     // the time goes. Shape: false|0 for "not reached yet". See bridge/state.js.
     const t0 = Date.now();
     const timings = { composer: 0, typed: 0, sent: 0, firstText: 0, complete: 0, stopSeen: false, earlyReturn: false };
+    timings.bgTimers = BG.isReady(); // Phase 3: true = timers run in a Worker (not throttled in background tabs)
 
     try {
       setLog("Finding " + SITE.name + " chat input…", true);

@@ -1,0 +1,901 @@
+diff --git a/bridge/http.js b/bridge/http.js
+index 887bd3a..df8ac38 100644
+--- a/bridge/http.js
++++ b/bridge/http.js
+@@ -5,10 +5,12 @@
+ //  - /health               JSON status
+ //  - /                     human status dashboard
+ import http from "node:http";
++import fs from "node:fs";
+ import { SITES, SITE_KEYS } from "./sites.js";
+ import { requestAllowed } from "./security.js";
+ import { buildPrompt, parseToolCalls, toolList, toolsHash, isTitleRequest, localTitle } from "./toolproto.js";
+ import { StreamFilter, streamEnabled } from "./streamfilter.js";
++import { tuningFromEnv, sseTextFromEnv } from "./tuning.js";
+ 
+ function readBody(req, limit = 5 * 1024 * 1024) {
+   return new Promise((resolve, reject) => {
+@@ -102,20 +104,20 @@ async function render() {
+     const t = s.timings || {};
+     const fmt = v => (v == null ? "" : Math.round(v) + " ms");
+     const timingRows = Object.entries(t.bySite || {}).map(([site, v]) =>
+-      \`<tr><td>\${site}</td><td>\${v.avg.count}</td><td>\${fmt(v.last.total)}</td><td>\${fmt(v.last.composer)}</td><td>\${fmt(v.last.typed)}</td><td>\${fmt(v.last.sent)}</td><td>\${fmt(v.last.firstText)}</td><td>\${fmt(v.last.complete)}</td><td>\${fmt(v.avg.total)}</td></tr>\`
+-    ).join("") || '<tr><td colspan="9">no completed requests yet</td></tr>';
++      \`<tr><td>\${site}</td><td>\${v.avg.count}</td><td>\${fmt(v.last.total)}</td><td>\${fmt(v.last.composer)}</td><td>\${fmt(v.last.typed)}</td><td>\${fmt(v.last.sent)}</td><td>\${fmt(v.last.firstText)}</td><td>\${fmt(v.last.complete)}</td><td>\${fmt(v.last.postToken)}</td><td>\${v.last.replyChars ?? ""}</td><td>\${fmt(v.avg.total)}</td></tr>\`
++    ).join("") || '<tr><td colspan="11">no completed requests yet</td></tr>';
+     const statRows = Object.entries(s.stats || {}).map(([site, v]) =>
+-      \`<tr><td>\${site}</td><td>\${v.requests}</td><td>\${v.completedBySse}</td><td>\${v.completedByStop}</td><td>\${v.completedByFallback}</td><td>\${v.sseSeen}</td><td>\${v.earlyReturn}</td><td>\${v.resubmits}</td><td>\${v.aborted}</td><td>\${v.timeouts}</td></tr>\`
+-    ).join("") || '<tr><td colspan="10">no requests yet</td></tr>';
++      \`<tr><td>\${site}</td><td>\${v.requests}</td><td>\${v.completedBySse}</td><td>\${v.completedByStop}</td><td>\${v.completedByFallback}</td><td>\${v.sseSeen}</td><td>\${v.earlyReturn}</td><td>\${v.resubmits}</td><td>\${v.aborted}</td><td>\${v.timeouts}</td><td class="\${v.lateGrowth ? "bad" : ""}">\${v.lateGrowth || 0}</td></tr>\`
++    ).join("") || '<tr><td colspan="11">no requests yet</td></tr>';
+     el.innerHTML = \`
+       <h2>browser clients</h2>
+       <table><tr><th>id</th><th>site</th><th>url</th></tr>\${clientRows}</table>
+       <h2>pending requests</h2>
+       <table><tr><th>id</th><th>site</th><th>chars</th><th>waiting</th></tr>\${pendingRows}</table>
+       <h2>timings (last request per site, and average)</h2>
+-      <table><tr><th>site</th><th>n</th><th>total</th><th>composer</th><th>typed</th><th>sent</th><th>first&nbsp;text</th><th>complete</th><th>avg&nbsp;total</th></tr>\${timingRows}</table>
++      <table><tr><th>site</th><th>n</th><th>total</th><th>composer</th><th>typed</th><th>sent</th><th>first&nbsp;text</th><th>complete</th><th>post&nbsp;tok</th><th>reply&nbsp;chars</th><th>avg&nbsp;total</th></tr>\${timingRows}</table>
+       <h2>debug counters (per site, since start)</h2>
+-      <table><tr><th>site</th><th>requests</th><th>by sse</th><th>by stop</th><th>by fallback</th><th>sse seen</th><th>early</th><th>resubmits</th><th>aborted</th><th>timeouts</th></tr>\${statRows}</table>
++      <table><tr><th>site</th><th>requests</th><th>by sse</th><th>by stop</th><th>by fallback</th><th>sse seen</th><th>early</th><th>resubmits</th><th>aborted</th><th>timeouts</th><th>late growth</th></tr>\${statRows}</table>
+       <h2>models</h2>
+       <table><tr><th>id</th><th>name</th><th>status</th></tr>\${siteRows}</table>\`;
+   } catch (e) {
+@@ -198,6 +200,11 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
+         // Phase 3: observe the page's own SSE stream as a completion signal.
+         // NOAPI_SSE=0 disables it (forwarded as sse:false).
+         const sse = process.env.NOAPI_SSE !== "0";
++        // Task 1: timing knobs for the content script (read here, forwarded per
++        // request; a content script cannot read process.env). Task 5: optional
++        // SSE-text fast path, default off.
++        const tuning = tuningFromEnv();
++        const sseText = sseTextFromEnv();
+         const toolNames = tools.map((t) => t.name);
+ 
+         // Re-send the tool protocol for new conversations or when the tool set changed.
+@@ -211,6 +218,16 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
+         if (newChat) bridge.toolHashes.delete(model);
+         const includePreamble = tools.length > 0 && (fresh || bridge.toolHashes.get(model) !== hash);
+         const { prompt } = buildPrompt(messages, tools, { includePreamble });
++        // Task 2: dump the exact prompt (preamble + first turn) sent to the site
++        // so its size and per-tool cost can be measured without a live change.
++        if (process.env.NOAPI_DUMP_PREAMBLE === "1") {
++          try {
++            fs.writeFileSync("noapi-preamble.txt", prompt);
++            log(`dumped preamble (${prompt.length} chars) to noapi-preamble.txt`);
++          } catch (err) {
++            log(`could not dump preamble: ${err.message}`);
++          }
++        }
+         const titleOnly = isTitleRequest(messages, tools);
+         if (!prompt && !titleOnly) {
+           errorJson(res, 400, "No user message found in request.");
+@@ -243,6 +260,8 @@ export function createHttpServer(bridge, log, { host: bindHost = "127.0.0.1" } =
+                 toolNames,
+                 sse,
+                 newChat,
++                tuning,
++                sseText,
+               });
+ 
+         if (!stream) {
+diff --git a/bridge/index.js b/bridge/index.js
+index ccd6354..27a914e 100644
+--- a/bridge/index.js
++++ b/bridge/index.js
+@@ -18,6 +18,7 @@ import { createHttpServer } from "./http.js";
+ import { attachWebSocketServer } from "./ws.js";
+ import { requestAllowed } from "./security.js";
+ import { runMcpStdio, ProxyGateway } from "./mcp.js";
++import { tuningFromEnv, sseTextFromEnv } from "./tuning.js";
+ 
+ function parseArgs(argv) {
+   const args = { port: 8787, host: "127.0.0.1", mcp: false };
+@@ -77,6 +78,8 @@ async function main() {
+             earlyReturn: msg.early_return !== false,
+             earlyReturnMs: Number(msg.early_return_ms) || 400,
+             toolNames: Array.isArray(msg.tool_names) ? msg.tool_names : [],
++            tuning: tuningFromEnv(),
++            sseText: sseTextFromEnv(),
+           })
+           .then((text) => {
+             conn.send(JSON.stringify({ t: "proxy-response", id: msg.id, data: text }));
+@@ -132,7 +135,7 @@ async function main() {
+           // A tab closed and no tab of that site is left.
+           b.removeSite(conn, msg.site);
+         } else if (msg.t === "progress") {
+-          b.progress(msg.id, msg.status);
++          b.progress(msg.id, msg.status, { site: msg.site, lateGrowth: msg.lateGrowth });
+         } else if (msg.t === "partial") {
+           b.partial(msg.id, msg.text);
+         } else if (msg.t === "error") {
+diff --git a/bridge/state.js b/bridge/state.js
+index a41f5ce..ddfaf12 100644
+--- a/bridge/state.js
++++ b/bridge/state.js
+@@ -65,6 +65,11 @@ export class Bridge {
+         resubmits: 0,
+         aborted: 0,
+         timeouts: 0,
++        // Truncation canary: how many times the page grew the last reply after
++        // the turn was already returned, and the total extra characters. Both
++        // must stay 0 for the fast paths to be trustworthy.
++        lateGrowth: 0,
++        lateGrowthChars: 0,
+       };
+       this.stats.set(key, s);
+     }
+@@ -200,6 +205,8 @@ export class Bridge {
+     toolNames = [],
+     sse = true,
+     newChat = false,
++    tuning = null,
++    sseText = false,
+   }) {
+     const key = site || "*";
+     const prev = this.locks.get(key) || Promise.resolve();
+@@ -243,6 +250,8 @@ export class Bridge {
+         toolNames,
+         sse,
+         newChat,
++        tuning,
++        sseText,
+         slot,
+       });
+     } finally {
+@@ -264,6 +273,8 @@ export class Bridge {
+     toolNames = [],
+     sse = true,
+     newChat = false,
++    tuning = null,
++    sseText = false,
+     slot = null,
+   }) {
+     return new Promise((resolve, reject) => {
+@@ -340,6 +351,12 @@ export class Bridge {
+         sse: Boolean(sse),
+         // Phase 5: NOAPI_NEW_CHAT=1 asks the tab to open a fresh chat first.
+         new_chat: Boolean(newChat),
++        // Task 1: timing knobs read from the bridge environment and forwarded
++        // because a content script cannot read process.env. Absent keys keep the
++        // content script's shipped defaults.
++        tuning: tuning && typeof tuning === "object" ? tuning : null,
++        // Task 5: optional SSE-text fast path (default off).
++        sse_text: Boolean(sseText),
+       });
+       record.payload = payload;
+       let delivered = 0;
+@@ -443,14 +460,30 @@ export class Bridge {
+     }, delay);
+   }
+ 
+-  progress(id, status) {
++  progress(id, status, { site = null, lateGrowth = 0 } = {}) {
++    // The truncation canary may arrive with no request in flight (it fires ~1s
++    // after a turn ended), so count it before the request lookup.
++    const extra = Number(lateGrowth);
++    if (Number.isFinite(extra) && extra > 0) this.lateGrowth(site, extra);
++    if (!status) return;
+     const record = this.pending.get(id);
+-    if (!record || !status) return;
++    if (!record) return;
+     try {
+       record.onProgress?.(String(status));
+     } catch {}
+   }
+ 
++  // Truncation canary: the page grew the last reply after the turn was already
++  // returned. Any occurrence means a completion fast path may have cut a reply.
++  lateGrowth(site, chars) {
++    const stats = this.statsFor(site);
++    stats.lateGrowth += 1;
++    stats.lateGrowthChars += Math.max(0, Math.round(Number(chars) || 0));
++    this.log(
++      `warning: late reply growth after completion on ${site || "any"} (+${chars} chars) - a fast path may have truncated a reply`
++    );
++  }
++
+   // Streaming text so far, from the browser. Advisory only: the final
+   // `response` remains the source of truth (and may differ slightly, e.g. when
+   // the site re-renders a message).
+@@ -478,14 +511,19 @@ export class Bridge {
+       record.reject(new Error("The browser returned an empty response."));
+       return;
+     }
+-    this.recordTiming(record, timings);
++    this.recordTiming(record, timings, clean.length);
+     this.log(`response ${id} received (${clean.length} chars)`);
+     record.resolve(clean);
+   }
+ 
+   // Keep the last few timing records and log a one-line summary per request.
+-  recordTiming(record, timings) {
++  recordTiming(record, timings, replyChars = null) {
+     const entry = { id: record.id, site: record.site, at: Date.now(), total: Date.now() - record.startedAt };
++    // Prompt / reply sizes make the A/B report able to tell a slow reply from a
++    // big one, and postToken = the client overhead after the model's last token.
++    const promptChars = String(record.prompt || "").length;
++    if (promptChars) entry.promptChars = promptChars;
++    if (Number.isFinite(Number(replyChars))) entry.replyChars = Number(replyChars);
+     if (timings && typeof timings === "object") {
+       for (const k of TIMING_STAGES) {
+         if (Number.isFinite(Number(timings[k]))) entry[k] = Number(timings[k]);
+@@ -498,6 +536,11 @@ export class Bridge {
+       // When the model produced its last token, so the benchmark can separate
+       // model time from the overhead the client adds after it.
+       if (Number.isFinite(Number(timings.lastToken))) entry.lastToken = Number(timings.lastToken);
++      // Client overhead after the model's final token: what every completion
++      // fast path is chasing. Only meaningful when both stages were reported.
++      if (Number.isFinite(Number(entry.lastToken)) && Number.isFinite(Number(entry.complete))) {
++        entry.postToken = Math.max(0, Number(entry.complete) - Number(entry.lastToken));
++      }
+       if (timings.completedBy) entry.completedBy = String(timings.completedBy);
+       if (Number.isFinite(Number(timings.resubmits))) entry.resubmits = Number(timings.resubmits);
+     }
+@@ -523,6 +566,9 @@ export class Bridge {
+     const parts = TIMING_STAGES.filter((k) => entry[k] != null).map((k) => `${k}=${entry[k]}ms`);
+     this.log(
+       `timing ${record.site || "any"}: total=${entry.total}ms${parts.length ? " " + parts.join(" ") : ""}` +
++        `${entry.postToken != null ? ` post-token=${entry.postToken}ms` : ""}` +
++        `${entry.promptChars != null ? ` prompt=${entry.promptChars}ch` : ""}` +
++        `${entry.replyChars != null ? ` reply=${entry.replyChars}ch` : ""}` +
+         `${entry.stopSeen ? " stop=yes" : ""}${entry.sseSeen ? " sse=yes" : ""}${entry.earlyReturn ? " early-return=yes" : ""}`
+     );
+   }
+diff --git a/bridge/toolproto.js b/bridge/toolproto.js
+index bae13fc..ec0de9a 100644
+--- a/bridge/toolproto.js
++++ b/bridge/toolproto.js
+@@ -59,10 +59,30 @@ export function isPriorityTool(f) {
+ }
+ 
+ function descLimit(f) {
+-  return isPriorityTool(f) ? descMax() : SHORT_DESC;
++  return !leanDescMode() && isPriorityTool(f) ? descMax() : SHORT_DESC;
+ }
+ function paramDescLimit(f) {
+-  return isPriorityTool(f) ? paramDescMax() : SHORT_PARAM_DESC;
++  return !leanDescMode() && isPriorityTool(f) ? paramDescMax() : SHORT_PARAM_DESC;
++}
++
++// Task 2: optional lower-cost description mode (default OFF). "lean" gives even
++// the priority tools the short caps, shrinking the preamble for the same tool
++// set. Tool semantics are unchanged; only description verbosity drops.
++export function descMode() {
++  return String(process.env.NOAPI_DESC_MODE || "full").toLowerCase();
++}
++function leanDescMode() {
++  return descMode() === "lean";
++}
++
++// Task 2: tools left out of the preamble (default OFF). They are still fully
++// callable: parseToolCalls/normalizeCall validate against the request's tool
++// list, not the rendered preamble.
++export function toolDenyList() {
++  return String(process.env.NOAPI_TOOL_DENY || "")
++    .split(",")
++    .map((s) => s.trim())
++    .filter(Boolean);
+ }
+ 
+ function msgText(m) {
+@@ -85,6 +105,22 @@ function clipMiddle(s, n) {
+   return `${s.slice(0, half)}\n[... ${cut} chars truncated; re-run the tool with a narrower range (offset/limit, grep, or head/tail) to see the missing part ...]\n${s.slice(-half)}`;
+ }
+ 
++// Task 3: cheap, lossless cleanup applied to a tool result before clipping.
++// Strips ANSI escape sequences (colour codes a command emitted), normalises line
++// endings, trims trailing whitespace per line and collapses runs of blank lines.
++// None of this removes information the model needs, so it is always on and saves
++// prompt characters for free.
++export function tidyToolResult(s) {
++  return String(s ?? "")
++    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "") // OSC sequences
++    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "") // CSI sequences (colours, cursor)
++    .replace(/\u001b[@-Z\\-_]/g, "") // other single-char escapes
++    .replace(/\r\n?/g, "\n")
++    .replace(/[ \t]+\n/g, "\n")
++    .replace(/\n{3,}/g, "\n\n")
++    .trim();
++}
++
+ function describeType(schema, depth = 0) {
+   if (!schema || typeof schema !== "object") return "any";
+   if (Array.isArray(schema.enum)) return schema.enum.map((v) => JSON.stringify(v)).join("|");
+@@ -182,8 +218,9 @@ export function terseEnabled() {
+   return process.env.NOAPI_TERSE !== "0";
+ }
+ 
+-export function renderPreamble(tools, messages, { terse = terseEnabled() } = {}) {
+-  const fns = toolList(tools);
++export function renderPreamble(tools, messages, { terse = terseEnabled(), deny = toolDenyList() } = {}) {
++  const denied = new Set(deny || []);
++  const fns = toolList(tools).filter((f) => !denied.has(f.name));
+   const hints = envHints(messages);
+   const examples = fns.slice(0, 3).map(exampleBlock);
+   const rules = [
+@@ -254,7 +291,7 @@ export function buildDelta(messages) {
+       sawTool = true;
+       const name = callNames.get(m.tool_call_id) || m.name || "tool";
+       parts.push(
+-        `TOOL_RESULT ${name} (id ${m.tool_call_id})\n${clipMiddle(msgText(m).trim() || "(empty output)", maxToolResult())}\nEND_TOOL_RESULT`
++        `TOOL_RESULT ${name} (id ${m.tool_call_id})\n${clipMiddle(tidyToolResult(msgText(m).trim() || "(empty output)"), maxToolResult())}\nEND_TOOL_RESULT`
+       );
+     }
+   }
+diff --git a/bridge/tuning.js b/bridge/tuning.js
+new file mode 100644
+index 0000000..ba45ed8
+--- /dev/null
++++ b/bridge/tuning.js
+@@ -0,0 +1,44 @@
++// Per-request timing knobs for the content script.
++//
++// A content script cannot read process.env, so the bridge reads these variables
++// here and forwards the values with every request (see state.js `tuning` and
++// extension/*/background.js). Every value is optional: an unset or invalid
++// variable leaves the content script's shipped default in place. This is what
++// lets a latency A/B run change a timing constant without editing source.
++//
++//   NOAPI_DEBOUNCE_MS              per-site completion debounce (350-550 default)
++//   NOAPI_SSE_END_REREAD_MS        re-read after the page's SSE stream closes (120)
++//   NOAPI_EARLY_RETURN_REREAD_MS   re-read after the early-return stop click (120)
++//   NOAPI_EXTRACT_THROTTLE_MS      minimum gap between DOM reads (120)
++//   NOAPI_FALLBACK_TICK_MS         safety-net poll interval (400)
++//   NOAPI_PARTIAL_THROTTLE_MS      minimum gap between streamed partials (150)
++//   NOAPI_EARLY_RETURN_HARD_CAP_MS cap on waiting for a second tool block (1500)
++const KNOBS = [
++  ["debounce", "NOAPI_DEBOUNCE_MS", { min: 30, max: 5000 }],
++  ["sseEndReread", "NOAPI_SSE_END_REREAD_MS", { min: 0, max: 5000 }],
++  ["earlyReturnReread", "NOAPI_EARLY_RETURN_REREAD_MS", { min: 0, max: 5000 }],
++  ["extractThrottle", "NOAPI_EXTRACT_THROTTLE_MS", { min: 10, max: 5000 }],
++  ["fallbackTick", "NOAPI_FALLBACK_TICK_MS", { min: 50, max: 10_000 }],
++  ["partialThrottle", "NOAPI_PARTIAL_THROTTLE_MS", { min: 20, max: 5000 }],
++  ["earlyReturnHardCap", "NOAPI_EARLY_RETURN_HARD_CAP_MS", { min: 50, max: 30_000 }],
++];
++
++// Read the bridge environment into a small, validated patch. Clamped so a typo
++// cannot wedge the content script (a 0ms debounce would complete on a half
++// painted reply; a giant tick would stall the timeout checks).
++export function tuningFromEnv(env = process.env) {
++  const out = {};
++  for (const [key, name, { min, max }] of KNOBS) {
++    const raw = env[name];
++    if (raw === undefined || raw === "") continue;
++    const v = Number(raw);
++    if (!Number.isFinite(v)) continue;
++    out[key] = Math.min(Math.max(v, min), max);
++  }
++  return out;
++}
++
++// Optional SSE-text fast path (task 5). Off unless explicitly enabled.
++export function sseTextFromEnv(env = process.env) {
++  return env.NOAPI_SSE_TEXT === "1";
++}
+diff --git a/extension/chrome/background.js b/extension/chrome/background.js
+index ef6bbaf..fbaf152 100644
+--- a/extension/chrome/background.js
++++ b/extension/chrome/background.js
+@@ -222,6 +222,11 @@
+         sse: m.sse !== false,
+         // Phase 5: NOAPI_NEW_CHAT=1 asks the tab to open a fresh chat first.
+         newChat: m.new_chat === true,
++        // Task 1: timing knobs the bridge read from its environment and forwarded
++        // because a content script cannot read process.env.
++        tuning: m.tuning && typeof m.tuning === "object" ? m.tuning : null,
++        // Task 5: optional SSE-text fast path (default off).
++        sseText: m.sse_text === true,
+       };
+ 
+       try {
+@@ -314,7 +319,18 @@
+       }
+ 
+       case "noapi_progress": {
+-        if (msg.id) sendWs({ t: "progress", id: msg.id, status: msg.status });
++        // A late-growth report can arrive with no request in flight (the
++        // truncation canary fires ~1s after a turn ended), so forward it even
++        // without an id and let the bridge count it per site.
++        if (msg.id || Number(msg.lateGrowth) > 0) {
++          sendWs({
++            t: "progress",
++            id: msg.id,
++            status: msg.status,
++            site: msg.site,
++            lateGrowth: Number(msg.lateGrowth) || 0,
++          });
++        }
+         sendResponse?.({ ok: true });
+         break;
+       }
+diff --git a/extension/chrome/content.js b/extension/chrome/content.js
+index 6739803..c1f32fc 100644
+--- a/extension/chrome/content.js
++++ b/extension/chrome/content.js
+@@ -20,7 +20,7 @@
+   // Bridge-side fast paths are deliberately NOT here: NOAPI_SSE, NOAPI_TERSE,
+   // NOAPI_NEW_CHAT and the early-return flags are read from the bridge process
+   // environment and forwarded per request. See the README flag table.
+-  const FLAG_DEFAULTS = { observerDriven: true, eagerSend: true, sseObserver: true };
++  const FLAG_DEFAULTS = { observerDriven: true, eagerSend: true, sseObserver: true, sseText: false };
+   const FLAGS = { ...FLAG_DEFAULTS };
+   const applyFlags = (v) => {
+     if (!v || typeof v !== "object") return;
+@@ -269,6 +269,45 @@
+   const SITE = detectSite();
+   if (!SITE) return;
+ 
++  // ---------------- TUNABLE TIMINGS (Task 1) ----------------
++  // The bridge reads these knobs from its environment and forwards them with
++  // every request (see bridge/tuning.js) because a content script cannot read
++  // process.env. With no overrides every value is exactly the shipped default;
++  // this is what lets a latency A/B run change a constant without editing
++  // source or reloading the extension.
++  const TUNING_DEFAULTS = {
++    debounce: null, // null = use the per-site SITE.debounce
++    sseEndReread: 120,
++    earlyReturnReread: 120,
++    extractThrottle: 120,
++    fallbackTick: 400,
++    partialThrottle: 150,
++    earlyReturnHardCap: 1500,
++  };
++  const TUNE = { ...TUNING_DEFAULTS };
++
++  /* @noapi-shared-start tuning */
++  // Merge the bridge's per-request overrides onto the defaults. Only finite,
++  // non-negative numbers are accepted; anything else keeps the default, so a
++  // typo can never wedge the content script.
++  function resolveTuning(defaults, over) {
++    const out = { ...defaults };
++    if (over && typeof over === "object") {
++      for (const k of Object.keys(out)) {
++        if (!(k in over)) continue;
++        const v = Number(over[k]);
++        if (Number.isFinite(v) && v >= 0) out[k] = v;
++      }
++    }
++    return out;
++  }
++  /* @noapi-shared-end tuning */
++
++  // The per-site completion debounce: the bridge override wins over the site's
++  // own value; null/absent means "use SITE.debounce".
++  const debounceMs = () => (TUNE.debounce != null ? TUNE.debounce : Number(SITE.debounce) || 400);
++
++
+   // Cancel-aware sleep: cancelCurrent() wakes every waiter immediately, so a
+   // cancel is noticed during typing/polling instead of only after the current
+   // sleep (which could otherwise keep the tab "busy" for 700ms+ while the bridge
+@@ -366,7 +405,7 @@
+     return i >= 0 ? text.slice(i + tail.length).trim() : text;
+   }
+ 
+-  const state = { bridge: false, busy: false, port: null, cancel: false, reqId: null, justStopped: false };
++  const state = { bridge: false, busy: false, port: null, cancel: false, reqId: null, justStopped: false, lateGrowth: 0 };
+ 
+   // ---------------- SSE OBSERVATION (Phase 3) ----------------
+   // A tiny MAIN-world script (sse-observer.js) watches the page's own fetch for
+@@ -375,7 +414,25 @@
+   // observer is missing, the site never streams over fetch, or the "sseObserver"
+   // flag (or NOAPI_SSE=0) is off, the completion loop behaves exactly as before.
+   const SSE_TOKEN_ATTR = "data-noapi-sse-token";
+-  const SSE = { token: null, started: 0, ended: 0, errored: 0, active: 0, lastAt: 0, wake: null, injected: false };
++  // Task 5: when set to "1", sse-observer.js also decodes the stream body and
++  // posts "delta" events. Default off; the content script sets it per request.
++  const SSE_TEXT_ATTR = "data-noapi-sse-text";
++  const SSE = {
++    token: null,
++    started: 0,
++    ended: 0,
++    errored: 0,
++    active: 0,
++    lastAt: 0,
++    wake: null,
++    injected: false,
++    // Task 5: accumulated reply text decoded from the page's own stream (only
++    // used as an earlier trigger, never as the returned reply) and a debug
++    // counter for how often it disagreed with the DOM.
++    streamText: "",
++    streamAt: 0,
++    textMismatches: 0,
++  };
+ 
+   function injectSseObserver() {
+     if (!FLAGS.sseObserver || SSE.injected) return;
+@@ -402,15 +459,37 @@
+     return SSE.token;
+   }
+ 
++  // Task 5: tell sse-observer.js (MAIN world) whether to decode the stream body
++  // for this request. Set before the page makes its fetch.
++  function setSseText(on) {
++    try {
++      document.documentElement.setAttribute(SSE_TEXT_ATTR, on ? "1" : "0");
++    } catch {}
++  }
++
+   // Always listen: whether the events are USED is decided per request from
+   // FLAGS.sseObserver (so flipping the flag off needs no reload to take effect).
+   window.addEventListener("message", (e) => {
+     const d = e && e.data;
+     if (!d || d.source !== "noapi-sse") return;
+     if (!SSE.token || d.token !== SSE.token) return;
++    if (d.event === "delta") {
++      // Task 5: decoded stream text. Advisory only (an earlier trigger for the
++      // tool-call early return); the reply text still comes from the DOM.
++      if (typeof d.text === "string") {
++        SSE.streamText = d.text;
++        SSE.streamAt = Date.now();
++      }
++      SSE.lastAt = Date.now();
++      try {
++        SSE.wake?.();
++      } catch {}
++      return;
++    }
+     if (d.event === "started") {
+       SSE.started++;
+       SSE.active++;
++      SSE.streamText = "";
+     } else if (d.event === "ended") {
+       SSE.ended++;
+       if (SSE.active > 0) SSE.active--;
+@@ -674,6 +753,7 @@
+     <label title="Wake the completion loop on DOM events instead of polling every 400ms"><input type="checkbox" data-flag="observerDriven"> event loop</label>
+     <label title="Click Send the moment the site enables it instead of after a fixed 150ms"><input type="checkbox" data-flag="eagerSend"> send on enable</label>
+     <label title="Use the page's own SSE stream as a completion signal (bridge NOAPI_SSE=0 also disables it)"><input type="checkbox" data-flag="sseObserver"> SSE signal</label>
++    <label title="Decode the page's SSE stream for an earlier tool-call trigger; the reply text still comes from the DOM. The bridge NOAPI_SSE_TEXT=1 flag is also required."><input type="checkbox" data-flag="sseText"> SSE text</label>
+   </div>
+   <div class="log-box">Ready. Waiting for OpenCode…</div>
+ </div>
+@@ -733,6 +813,43 @@
+     ext.runtime.sendMessage({ type: "noapi_progress", id: state.reqId, status: msg }).catch(() => {});
+   }
+ 
++  // ---- truncation canary (Task 0) -------------------------------------------
++  // After a turn ends, re-read the last reply node once, ~1s later, WITHOUT
++  // blocking the next request. If the page painted more text after we already
++  // returned the reply, that is a truncation event: report the extra character
++  // count so a real A/B run can prove the fast paths never cut an answer. This
++  // value must stay 0; it travels on the next progress message.
++  const LATE_GROWTH_MS = 1000;
++  function flushLateGrowth() {
++    if (!state.lateGrowth) return;
++    const chars = state.lateGrowth;
++    state.lateGrowth = 0;
++    try {
++      ext.runtime
++        .sendMessage({ type: "noapi_progress", id: state.reqId, site: SITE.key, lateGrowth: chars })
++        .catch(() => {});
++    } catch {}
++  }
++  function scheduleLateGrowth() {
++    let node = null;
++    let seen = 0;
++    try {
++      const nodes = replyNodes();
++      node = nodes[nodes.length - 1] || null;
++      seen = node ? extractText(node).length : 0;
++    } catch {}
++    setTimeout(() => {
++      try {
++        if (!node || !node.isConnected) return;
++        const later = extractText(node).length;
++        if (later > seen) {
++          state.lateGrowth += later - seen;
++          flushLateGrowth();
++        }
++      } catch {}
++    }, LATE_GROWTH_MS);
++  }
++
+   function updateStatusUI() {
+     dot.className = "dot" + (state.busy ? " wait" : state.bridge ? " on" : "");
+     miniDot.className = "mini-dot" + (state.bridge ? " on" : "");
+@@ -785,6 +902,8 @@
+         toolNames: msg.toolNames,
+         sse: msg.sse,
+         newChat: msg.newChat,
++        tuning: msg.tuning,
++        sseText: msg.sseText,
+       }).catch(() => {});
+     } else if (msg.type === "noapi_cancel") {
+       if (state.busy && (!msg.id || msg.id === state.reqId)) cancelCurrent();
+@@ -1286,11 +1405,12 @@
+   // sites whose reply lives in a shadow root fire no observer event, and the
+   // timeout / stop-button checks still need a periodic wake-up.
+   const FALLBACK_STABLE_MS = 2200;
+-  const FALLBACK_TICK_MS = 400;
++  // The safety-net tick, the DOM-read throttle, the partial-stream throttle and
++  // the early-return re-read/cap windows are tunable per request; their shipped
++  // defaults live in TUNING_DEFAULTS (top of file) and arrive as bridge env vars.
+   // Kill switch / A/B flag: FLAGS.observerDriven=false goes back to the old
+   // interval-only behaviour (the observer then only marks the DOM dirty and the
+-  // 400ms fallback interval drives every tick).
+-  const EXTRACT_THROTTLE_MS = 120;
++  // fallback interval drives every tick).
+   const UNSEEN_MUTATION_MS = 1000;
+   const STALL_LOG_MS = 20_000;
+ 
+@@ -1325,19 +1445,8 @@
+   // the model is still writing (the next block, or the fence) the tail is not a
+   // finished block, and the quiet timer keeps resetting anyway.
+   const DEFAULT_EARLY_RETURN_MS = 400;
+-  // If the site is still generating after a complete block, wait at most this
+-  // long for a possible second block before stopping. Trade-off: batching many
+-  // calls wins up to this point, and a very late block after it is treated as
+-  // trailing narration (it is dropped in exchange for not adding dead time).
+-  const EARLY_RETURN_HARD_CAP_MS = 1500;
+-  // One re-read after clicking stop, to catch a block that was mid-write.
+-  const EARLY_RETURN_REREAD_MS = 120;
+-  // One re-read after the page's SSE stream closes, to catch a final DOM paint
+-  // that lands just after the stream ends (the site decodes the last chunk and
+-  // repaints a frame later). Without it the turn could return a truncated reply.
+-  const SSE_END_REREAD_MS = 120;
+-  // How often the still-growing reply is forwarded to OpenCode while it streams.
+-  const PARTIAL_THROTTLE_MS = 150;
++  // The early-return hard cap, the post-stop / post-SSE re-read windows and the
++  // partial-stream throttle are all tunable per request; see TUNING_DEFAULTS.
+ 
+   // Pure decision functions, delimited so tools/test-content-logic.js can lift
+   // them out of this file and unit-test them without a browser. Keep them
+@@ -1525,7 +1634,7 @@
+   }
+   /* @noapi-shared-end tickScheduler */
+ 
+-  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, baseline = null, typedLen, toolsEnabled = false, earlyReturn = true, earlyReturnMs = DEFAULT_EARLY_RETURN_MS, toolNames = [], pipelineT0 = null, timings = null, sseEnabled = true }) {
++  async function waitForResponse({ timeoutMs, composer, prompt, before, beforeLast, scope, baseline = null, typedLen, toolsEnabled = false, earlyReturn = true, earlyReturnMs = DEFAULT_EARLY_RETURN_MS, toolNames = [], pipelineT0 = null, timings = null, sseEnabled = true, sseTextOn = false }) {
+     const t0 = Date.now();
+     return new Promise((resolve, reject) => {
+       let lastText = "";
+@@ -1590,7 +1699,7 @@
+       const sendPartial = (text) => {
+         if (!state.reqId || !text || text === lastPartialText) return;
+         const now = Date.now();
+-        if (now - lastPartialAt < PARTIAL_THROTTLE_MS) return;
++        if (now - lastPartialAt < TUNE.partialThrottle) return;
+         lastPartialAt = now;
+         lastPartialText = text;
+         try {
+@@ -1708,7 +1817,7 @@
+ 
+           // Only read the DOM when it changed (or, at most once a second, in case
+           // mutations happen somewhere we cannot observe).
+-          if ((dirty || now - lastExtractAt >= UNSEEN_MUTATION_MS) && now - lastExtractAt >= EXTRACT_THROTTLE_MS) {
++          if ((dirty || now - lastExtractAt >= UNSEEN_MUTATION_MS) && now - lastExtractAt >= TUNE.extractThrottle) {
+             dirty = false;
+             lastExtractAt = now;
+             const text = await readText(generating);
+@@ -1734,7 +1843,28 @@
+               // turn does not wait for the next fallback interval to notice that
+               // the reply stopped changing.
+               if (completionTimer) clearTimeout(completionTimer);
+-              completionTimer = setTimeout(() => scheduler?.schedule(), (Number(SITE.debounce) || 400) + 30);
++              completionTimer = setTimeout(() => scheduler?.schedule(), debounceMs() + 30);
++            }
++          }
++
++          // Task 5: the decoded stream can end with a complete TOOL_CALL block a
++          // frame before the DOM paints it. Use it ONLY as an earlier trigger for
++          // one fresh DOM read; the returned text is always the DOM's, so a
++          // parser mismatch can never truncate a reply. streamText stays empty
++          // unless the sseText flag and NOAPI_SSE_TEXT are both on (and the
++          // ChatGPT parser is not shipped yet).
++          if (sseTextOn && SSE.streamText && lastText) {
++            if (SSE.streamText !== lastText && timings && !timings.sseTextMismatch) {
++              SSE.textMismatches += 1;
++              timings.sseTextMismatch = true;
++            }
++            if (toolBlockAtEnd(SSE.streamText, toolNames) && !toolBlockAtEnd(lastText, toolNames)) {
++              const fresh = await readText(generating);
++              if (fresh && fresh.length >= lastText.length) {
++                lastText = fresh;
++                lastTextAt = now;
++              }
++              if (timings) timings.sseTextTriggers = (timings.sseTextTriggers || 0) + 1;
+             }
+           }
+ 
+@@ -1760,7 +1890,7 @@
+               earlyReturnMs,
+               generating,
+               sinceBlockMs: earlyBlockAt ? now - earlyBlockAt : 0,
+-              hardCapMs: EARLY_RETURN_HARD_CAP_MS,
++              hardCapMs: TUNE.earlyReturnHardCap,
+               toolNames,
+             })
+           ) {
+@@ -1772,7 +1902,7 @@
+             // was being written when we clicked is not cut off.
+             let finalText = lastText;
+             if (stopped) {
+-              await sleep(EARLY_RETURN_REREAD_MS);
++              await sleep(TUNE.earlyReturnReread);
+               const nodes = replyNodes();
+               const after = nodes.length ? extractText(nodes[nodes.length - 1]) : "";
+               if (after && toolBlockCount(after, toolNames) > toolBlockCount(lastText, toolNames)) finalText = after;
+@@ -1801,7 +1931,7 @@
+               // The site may paint the last tokens just after the stream closes.
+               // Re-read once after a short grace and keep the longer text, so a
+               // late DOM update can never be lost (reply truncated).
+-              await sleep(SSE_END_REREAD_MS);
++              await sleep(TUNE.sseEndReread);
+               if (state.cancel) {
+                 fail(new Error("Cancelled."));
+                 return;
+@@ -1818,7 +1948,7 @@
+           }
+ 
+           // Completion. Needs a non-trivial reply and no stop button right now.
+-          if (completionDecision(lastText.length, generating, stopSeen, now - (lastTextAt || now), Number(SITE.debounce) || 400, FALLBACK_STABLE_MS)) {
++          if (completionDecision(lastText.length, generating, stopSeen, now - (lastTextAt || now), debounceMs(), FALLBACK_STABLE_MS)) {
+             finish(lastText);
+           }
+         } catch (err) {
+@@ -1832,7 +1962,7 @@
+       // cannot see (shadow DOM) and keeps the timeout / stop-button checks alive.
+       scheduler = createTickScheduler(tick, (fn) => queueMicrotask(fn));
+       SSE.wake = () => scheduler?.schedule();
+-      timer = setInterval(() => scheduler?.schedule(), FALLBACK_TICK_MS);
++      timer = setInterval(() => scheduler?.schedule(), TUNE.fallbackTick);
+       scheduler.schedule();
+     });
+   }
+@@ -1849,6 +1979,12 @@
+     // Phase 3: NOAPI_SSE=0 in the bridge environment is forwarded as sse:false and
+     // disables the SSE completion signal for this request (the DOM paths remain).
+     const sseEnabled = opts.sse !== false;
++    // Task 1: per-request timing overrides read from the bridge environment.
++    Object.assign(TUNE, resolveTuning(TUNING_DEFAULTS, opts.tuning));
++    // Task 5: optional SSE-text fast path (panel flag AND bridge env), default off.
++    const sseTextOn = Boolean(opts.sseText) && FLAGS.sseText;
++    setSseText(sseTextOn);
++    SSE.streamText = "";
+     if (state.busy) {
+       if (reqId) {
+         ext.runtime
+@@ -1862,6 +1998,7 @@
+     state.reqId = reqId || null;
+     lastProgress = "";
+     lastProgressAt = 0;
++    flushLateGrowth();
+     updateStatusUI();
+ 
+     // Per-stage timings (milliseconds since the request reached this tab). Sent to
+@@ -1925,11 +2062,14 @@
+       timings.sent = Date.now() - t0;
+ 
+       setLog("Waiting for " + SITE.name + " to answer…", true);
+-      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, baseline, typedLen, toolsEnabled, earlyReturn, earlyReturnMs, toolNames, pipelineT0: t0, timings, sseEnabled });
++      const text = await waitForResponse({ timeoutMs: 590_000, composer: composerNow, prompt, before, beforeLast, scope, baseline, typedLen, toolsEnabled, earlyReturn, earlyReturnMs, toolNames, pipelineT0: t0, timings, sseEnabled, sseTextOn });
+       timings.complete = Date.now() - t0;
+ 
+       setLog(`✓ Response captured (${text.length} chars). Sent to OpenCode.`);
+       if (reqId) ext.runtime.sendMessage({ type: "noapi_reply", id: reqId, text, timings: { ...timings, total: Date.now() - t0 } }).catch(() => {});
++      // Truncation canary: re-read the reply node once after the turn, without
++      // blocking anything. Any growth means a completion fast path cut a reply.
++      scheduleLateGrowth();
+       return text;
+     } catch (err) {
+       setLog("Error: " + err.message);
+diff --git a/extension/chrome/sse-observer.js b/extension/chrome/sse-observer.js
+index e38e8ec..2551120 100644
+--- a/extension/chrome/sse-observer.js
++++ b/extension/chrome/sse-observer.js
+@@ -1,12 +1,19 @@
+-// NOAPI? SSE observer. OBSERVATION ONLY.
++// NOAPI? SSE observer.
+ //
+ // This file runs in the page's MAIN world so it can see the page's own
+-// window.fetch. It wraps fetch for exactly one reason: to learn when the website
+-// starts and finishes a text/event-stream (SSE) response, so the content script
+-// can treat "the site's stream ended" as "the answer is complete" instead of
+-// waiting for the debounce. It never reads or parses the body, never changes a
+-// request or a response, never calls a site API, and never hardcodes a URL - it
+-// only watches the traffic the page already makes by itself.
++// window.fetch. It wraps fetch for two reasons:
++//
++//   1. (always) learn when the website starts and finishes a text/event-stream
++//      (SSE) response, so the content script can treat "the site's stream ended"
++//      as "the answer is complete" instead of waiting for the debounce. It never
++//      changes a request or a response, never calls a site API, and never
++//      hardcodes a URL - it only watches the traffic the page already makes.
++//
++//   2. (only when the page sets data-noapi-sse-text="1", default off) decode the
++//      stream body to extract the reply text as it arrives and post it as an
++//      earlier trigger for the content script. This is opt-in per request: with
++//      the flag off, the body is never read, exactly as before. The content
++//      script still uses the DOM text as the authoritative reply.
+ //
+ // Events posted to the content script:
+ //   "started" - an SSE response just began.
+@@ -14,6 +21,7 @@
+ //   "error"   - the stream errored, was aborted, or its end cannot be observed.
+ //               This is deliberately NOT "ended": an errored/aborted stream must
+ //               not be reported as a complete answer (it could truncate a reply).
++//   "delta"   - (only with the text flag) the accumulated reply text so far.
+ //
+ // Chrome loads this as a "world": "MAIN" content script (see manifest.json).
+ // Firefox does not support MAIN-world content scripts on our minimum version, so
+@@ -48,12 +56,33 @@
+     else el.setAttribute(ATTR, token);
+   } catch {}
+ 
+-  const post = (event) => {
++  const post = (event, extra) => {
+     try {
+-      window.postMessage({ source: "noapi-sse", token, event, at: Date.now() }, location.origin);
++      window.postMessage({ source: "noapi-sse", token, event, at: Date.now(), ...(extra || {}) }, location.origin);
+     } catch {}
+   };
+ 
++  // Task 5: opt-in stream-body decoding. "1" means the content script wants
++  // "delta" events for this request; anything else leaves the body untouched.
++  const TEXT_ATTR = "data-noapi-sse-text";
++  const textEnabled = () => {
++    try {
++      return document.documentElement.getAttribute(TEXT_ATTR) === "1";
++    } catch {
++      return false;
++    }
++  };
++
++  // ChatGPT stream parser placeholder. The stream format is undocumented, so the
++  // parser must be written against a captured sample
++  // (tools/fixtures/chatgpt-stream.txt). That sample is not present in this
++  // checkout, so this returns null and no "delta" events are posted; everything
++  // else (UTF-8 decoding, SSE frame splitting, token-guarded posting, content
++  // script handling) is wired and ready for the parser.
++  function extractChatGptText(_frame) {
++    return null;
++  }
++
+   const origFetch = window.fetch;
+   if (typeof origFetch !== "function") return;
+   window.fetch = function (...args) {
+@@ -72,11 +101,41 @@
+             // Drain a clone in the background so we can tell when the stream
+             // ends. The page keeps its own body untouched, byte for byte.
+             const clone = res.clone ? res.clone() : null;
++            const wantText = textEnabled() && typeof TextDecoder === "function";
++            const decoder = wantText ? new TextDecoder() : null;
++            let sseBuf = "";
++            let acc = "";
+             if (clone && clone.body && typeof clone.body.getReader === "function") {
+               const reader = clone.body.getReader();
+               const pump = () =>
+                 reader.read().then(
+-                  ({ done }) => (done ? post("ended") : pump()),
++                  ({ done, value }) => {
++                    if (done) {
++                      post("ended");
++                      return;
++                    }
++                    if (decoder && value) {
++                      try {
++                        sseBuf += decoder.decode(value, { stream: true });
++                        let idx;
++                        while ((idx = sseBuf.indexOf("\n\n")) !== -1) {
++                          const frame = sseBuf.slice(0, idx);
++                          sseBuf = sseBuf.slice(idx + 2);
++                          const t = extractChatGptText(frame);
++                          if (t) {
++                            acc += t;
++                            post("delta", { text: acc });
++                          }
++                        }
++                      } catch {
++                        // A decode/parse failure must never turn into an "ended":
++                        // fall back to the DOM path for the rest of the turn.
++                        post("error");
++                        return;
++                      }
++                    }
++                    pump();
++                  },
+                   // A rejected read means the stream errored or the user
+                   // aborted it. The answer is NOT complete: report an error so
+                   // the content script falls back to the DOM path instead of

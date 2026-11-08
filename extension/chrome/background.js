@@ -1,3 +1,8 @@
+// Phase 3: keeps AI tabs from being discarded, the computer awake and this worker
+// alive (see keepalive.js). Guarded so Firefox event pages, which have no
+// importScripts, simply skip it.
+if (typeof importScripts === "function") importScripts("keepalive.js");
+
 // NOAPI? background (service worker / event page).
 // Maintains WebSocket connection to ws://127.0.0.1:8787, keeps service worker
 // alive via heartbeats and port connections, and routes requests to active AI tabs.
@@ -5,11 +10,30 @@
   "use strict";
   const ext = globalThis.browser || globalThis.chrome;
 
+  // Connection timings (ms). Overridable for tests only.
+  const CFG = Object.assign(
+    {
+      baseDelay: 1000, // first retry delay; doubles per failed attempt
+      maxDelay: 30_000, // retry delay ceiling
+      minGap: 1000, // never open two sockets less than this apart
+      pingEvery: 10_000, // heartbeat + ping period
+      deadAfter: 30_000, // no message from the bridge for this long = connection dead
+      forceWait: 4000, // how long the Reconnect button waits for the result
+      connectTimeout: 8000, // a socket still CONNECTING after this long is abandoned
+    },
+    globalThis.__NOAPI_CFG__ || {}
+  );
+
   const state = {
     ws: null,
+    gen: 0, // id of the current socket; events of older sockets are ignored
     url: "ws://127.0.0.1:8787",
     connected: false,
-    reconnectDelay: 1000,
+    attempt: 0, // failed attempts since the last good connection
+    reconnectTimer: null, // the ONE pending retry timer (never more than one)
+    lastAttemptAt: 0,
+    lastRx: 0, // when the bridge last sent us anything
+    forcing: null, // in-flight manual reconnect
     tabs: new Map(), // tabId -> { site, url, port }
     pending: new Map(), // reqId -> tabId
     cancelling: new Map(), // reqId -> tabId (cancel sent, waiting for the tab's terminal message)
@@ -46,14 +70,71 @@
     }
   }
 
-  function connect() {
-    if (state.ws) {
-      if (state.ws.readyState === 0 || state.ws.readyState === 1) return;
+  // ---- connection management --------------------------------------------
+  // Rules this section enforces (each one was a bug):
+  //  * at most one socket and one retry timer exist at any time;
+  //  * a late event of an OLD socket never touches the current one (gen check);
+  //  * "connected" means the bridge answered recently (ping/pong), not merely
+  //    that the socket object says OPEN, so a dead or stale link is noticed;
+  //  * retries back off exponentially with jitter and never burst.
+  const isLive = () => state.connected && state.ws?.readyState === 1 && Date.now() - state.lastRx < CFG.deadAfter;
+
+  function stopLiveness() {
+    clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = null;
+  }
+
+  function discardSocket() {
+    const ws = state.ws;
+    state.ws = null;
+    state.gen++; // invalidates every handler of that socket
+    stopLiveness();
+    if (ws) {
+      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
       try {
-        state.ws.close();
+        ws.close();
       } catch {}
-      state.ws = null;
     }
+  }
+
+  function markDisconnected(why) {
+    const was = state.connected;
+    state.connected = false;
+    if (was) {
+      log(`bridge connection lost (${why})`);
+      updateAction();
+      broadcastToTabs({ type: "noapi_bridge_status", connected: false });
+    }
+  }
+
+  function scheduleReconnect(delay) {
+    if (state.reconnectTimer) return; // one timer only
+    if (delay === undefined) {
+      const base = Math.min(CFG.maxDelay, CFG.baseDelay * 2 ** state.attempt);
+      delay = Math.round(base * (0.8 + Math.random() * 0.4)); // jitter
+      state.attempt++;
+    }
+    state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = null;
+      connect();
+    }, Math.max(0, delay));
+  }
+
+  function connect() {
+    if (state.reconnectTimer) {
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
+    if (state.ws) {
+      if (state.ws.readyState === 0 || state.ws.readyState === 1) return; // already connecting/open
+      discardSocket();
+    }
+    const wait = state.lastAttemptAt + CFG.minGap - Date.now();
+    if (wait > 0) {
+      scheduleReconnect(wait);
+      return;
+    }
+    state.lastAttemptAt = Date.now();
 
     log("connecting to", state.url);
     let ws;
@@ -64,12 +145,14 @@
       scheduleReconnect();
       return;
     }
-
+    const gen = ++state.gen;
     state.ws = ws;
 
     ws.onopen = () => {
+      if (gen !== state.gen) return;
       state.connected = true;
-      state.reconnectDelay = 1000;
+      state.attempt = 0;
+      state.lastRx = Date.now();
       log("✓ connected to bridge at", state.url);
 
       // Identify this extension client
@@ -89,16 +172,15 @@
       updateAction();
       broadcastToTabs({ type: "noapi_bridge_status", connected: true });
 
-      // Start periodic keepalive heartbeat (resets Chrome MV3 idle timer)
-      clearInterval(state.heartbeatTimer);
-      state.heartbeatTimer = setInterval(() => {
-        if (state.connected) {
-          sendWs({ t: "heartbeat" });
-        }
-      }, 10_000);
+      // Heartbeat + ping: keeps the MV3 worker alive AND proves the bridge is
+      // still there (it answers ping with pong; see livenessTick).
+      stopLiveness();
+      state.heartbeatTimer = setInterval(livenessTick, CFG.pingEvery);
     };
 
     ws.onmessage = (e) => {
+      if (gen !== state.gen) return;
+      state.lastRx = Date.now();
       let m;
       try {
         m = JSON.parse(e.data);
@@ -108,33 +190,77 @@
       handleBridgeMessage(m);
     };
 
-    ws.onclose = () => onDrop();
-    ws.onerror = (err) => {
-      log("ws error:", err);
+    // Browsers fire error and then close; some engines fire only error. drop()
+    // ignores whichever arrives second (the generation has changed by then).
+    ws.onclose = () => drop(gen, "socket closed");
+    ws.onerror = () => {
+      if (gen === state.gen) log("ws error");
+      drop(gen, "socket error");
     };
+    // A server that accepts the TCP connection but never completes the
+    // handshake would leave the socket CONNECTING forever, with no retry.
+    setTimeout(() => {
+      if (gen === state.gen && ws.readyState === 0) drop(gen, "connect timeout");
+    }, CFG.connectTimeout);
   }
 
-  function onDrop() {
-    const wasConnected = state.connected;
-    state.connected = false;
-    clearInterval(state.heartbeatTimer);
-    try {
-      state.ws?.close();
-    } catch {}
-    state.ws = null;
-
-    if (wasConnected) {
-      log("bridge connection closed");
-      updateAction();
-      broadcastToTabs({ type: "noapi_bridge_status", connected: false });
-    }
+  // The socket for generation `gen` ended (or was found dead).
+  function drop(gen, why) {
+    if (gen !== state.gen) return; // stale event of an older socket
+    discardSocket();
+    markDisconnected(why);
     scheduleReconnect();
   }
 
-  function scheduleReconnect() {
-    setTimeout(connect, state.reconnectDelay);
-    state.reconnectDelay = Math.min(state.reconnectDelay * 1.5, 10_000);
+  function livenessTick() {
+    const ws = state.ws;
+    if (!ws || ws.readyState !== 1) return;
+    if (Date.now() - state.lastRx > CFG.deadAfter) {
+      drop(state.gen, "bridge stopped answering");
+      return;
+    }
+    sendWs({ t: "heartbeat" });
+    sendWs({ t: "ping" });
   }
+
+  // Manual "Reconnect" (the panel button). Tears down the current socket,
+  // resets the backoff, connects at once and reports the REAL outcome.
+  function forceReconnect() {
+    if (state.forcing) return state.forcing;
+    state.forcing = (async () => {
+      if (isLive() && state.pending.size) return true; // do not cut a request in flight
+      if (state.reconnectTimer) {
+        clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = null;
+      }
+      if (state.ws) {
+        discardSocket();
+        markDisconnected("manual reconnect");
+      }
+      state.attempt = 0;
+      state.lastAttemptAt = 0;
+      connect();
+      const until = Date.now() + CFG.forceWait;
+      while (Date.now() < until && !isLive()) await new Promise((r) => setTimeout(r, 100));
+      return isLive();
+    })().finally(() => {
+      state.forcing = null;
+    });
+    return state.forcing;
+  }
+
+  // Watchdog: a suspended MV3 worker loses its timers, an alarm wakes it. Check
+  // the link and make sure a retry is scheduled when it is down.
+  function watchdog() {
+    livenessTick();
+    if (!isLive() && !state.reconnectTimer && state.ws?.readyState !== 0) scheduleReconnect(0);
+  }
+  try {
+    ext.alarms?.create?.("noapi-bg-watch", { periodInMinutes: 0.5 });
+    ext.alarms?.onAlarm?.addListener?.((a) => {
+      if (a.name === "noapi-bg-watch" || a.name === "noapi-keepalive") watchdog();
+    });
+  } catch {}
 
   function handleBridgeMessage(m) {
     if (m.t === "welcome") {
@@ -276,7 +402,7 @@
 
         port.postMessage({
           type: "noapi_bridge_status",
-          connected: state.connected,
+          connected: isLive(),
         });
       }
     }
@@ -309,12 +435,12 @@
           }
           log(`tab ${tabId} registered on ${msg.site}`);
         }
-        sendResponse?.({ connected: state.connected, url: state.url });
+        sendResponse?.({ connected: isLive(), url: state.url });
         break;
       }
 
       case "noapi_status_req": {
-        sendResponse?.({ connected: state.connected, url: state.url });
+        sendResponse?.({ connected: isLive(), url: state.url });
         break;
       }
 
@@ -379,10 +505,7 @@
       }
 
       case "noapi_test_bridge": {
-        connect();
-        setTimeout(() => {
-          sendResponse?.({ connected: state.connected });
-        }, 500);
+        forceReconnect().then((connected) => sendResponse?.({ connected }));
         break;
       }
     }
@@ -426,7 +549,7 @@
       ext.action?.setBadgeText?.({ text: n ? String(n) : "" });
       ext.action?.setBadgeBackgroundColor?.({ color: "#f59e0b" });
       ext.action?.setTitle?.({
-        title: state.connected
+        title: isLive()
           ? "NOAPI? — Bridge Connected (127.0.0.1:8787)"
           : "NOAPI? — Bridge Offline (run: node bridge/index.js)",
       });

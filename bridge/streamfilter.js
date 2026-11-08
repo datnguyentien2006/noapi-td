@@ -12,6 +12,7 @@
 // code. We always hold back a small tail so a fence, the marker, or a tool name
 // split across two updates is not emitted before we can recognise it.
 import { toolList } from "./toolproto.js";
+import { detectRefusal, GUARD_HOLD } from "./guard.js";
 
 const MARKER = "TOOL_CALL";
 // Enough to cover "```" + a short language tag + newline + the marker, and the
@@ -56,7 +57,13 @@ export function unsafeStart(text, names = []) {
 }
 
 export class StreamFilter {
-  constructor({ tools = [], enabled = true } = {}) {
+  // guard: on a first turn (no tool result yet) withhold the first GUARD_HOLD
+  // chars, and keep withholding while the text reads like a refusal, so a
+  // "I cannot access your files" reply never reaches OpenCode before the bridge
+  // has had the chance to correct it. Short final answers are released by finish().
+  constructor({ tools = [], enabled = true, guard = false } = {}) {
+    this.guard = Boolean(guard);
+    this.released = false;
     this.names = toolList(tools).map((f) => f.name);
     // With tools disabled nothing can be a tool call: stream everything so the
     // model can talk about the protocol without being censored.
@@ -69,6 +76,10 @@ export class StreamFilter {
   push(full) {
     const s = typeof full === "string" ? full : "";
     if (!this.enabled) return this._take(s);
+    if (this.guard && !this.released) {
+      if (s.length < GUARD_HOLD || detectRefusal(s).refused) return "";
+      this.released = true;
+    }
     const start = unsafeStart(s, this.names);
     const end = start === -1 ? Math.max(0, s.length - HOLDBACK) : start;
     return this._take(s.slice(0, end));
